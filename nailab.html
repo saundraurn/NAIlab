@@ -1,0 +1,1267 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="ritrotheme">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NAI Tag Tester</title>
+    
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.2/dist/full.min.css" rel="stylesheet"  >
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {'cardboard': '#d2b48c'},
+            keyframes: {gradientShift: {'0%, 100%': {backgroundPosition: '0% 50%'}, '50%': {backgroundPosition: '100% 50%'}}},
+            animation: {gradientShift: 'gradientShift 25s ease infinite'} 
+          }
+        }
+      }
+    </script>    
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/vue-router@4"></script>
+    <script src="https://unpkg.com/@vueuse/shared"></script>
+    <script src="https://unpkg.com/@vueuse/core"></script>
+    <script src="https://unpkg.com/fflate/umd/index.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js"></script>
+    <script src="https://unpkg.com/textarea-caret@3.1.0/index.js"></script>
+
+    <link href="https://fonts.googleapis.com/css2?family=Raleway:wght@300;400;500;600;700&family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+    <style>[data-theme="ritrotheme"]{color-scheme:dark;--p:0.65 0.15 254;--pc:95% 0.05 205;--s:70% 0.25 280;--sc:0.94 0.0114 203;--a:65% 0.35 60;--ac:20% 0.1 60;--n:30% 0.05 240;--nc:90% 0.02 240;--b1:18% 0.04 240;--b2:25% 0.05 240;--b3:0.69 0.05 240;--bc:90% 0.02 240;--in:55% 0.15 220;--inc:95% 0.05 220;--su:60% 0.2 130;--suc:20% 0.1 130;--wa:70% 0.25 75;--wac:25% 0.1 75;--er:55% 0.28 10;--erc:90% 0.05 10;--radius-selector:0.5rem;--radius-field:2rem;--radius-box:0.5rem;--size-selector:0.25rem;--size-field:0.1875rem;--border:0.5px;--depth:1;--noise:0}</style>
+
+    <style type="text/tailwindcss">
+        * { font-family: 'Raleway', sans-serif; }
+        body { margin: 0; padding: 0; overflow: hidden; }
+        
+            /* Deep Nebula Gradient (Independent of theme) */
+            .animated-bg {
+                background: linear-gradient(-45deg, #0f172a, #1e1b4b, #2e1065);
+                background-size: 400% 400%;
+            }
+            
+        .fade-enter-active, .fade-leave-active { transition: opacity .1s ease; }
+        .fade-enter-from, .fade-leave-to { opacity: 0; }
+        .list-move, .list-enter-active, .list-leave-active { transition: all .5s ease; }
+        .list-enter-from, .list-leave-to { opacity: 0; transform: translateY(-30px); }
+        select option { background: oklch(var(--b2)); color: oklch(var(--bc)); }
+        .masonry-grid { display: grid-lanes; gap: 8px; }
+        .masonry-grid .grid-item { position: relative; box-sizing: border-box; border-radius: .5rem; }
+        .masonry-grid .grid-item .image-container,
+        .masonry-grid .grid-item img { border-radius: inherit; display: block; width: 100%; transition: transform .3s ease; }
+        .masonry-grid .grid-item:hover { z-index: 10; }
+        .masonry-grid .grid-item:hover img { transform: scale(1.05); will-change: transform; }
+        
+        .material-symbols-rounded {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+            user-select: none;
+            vertical-align: middle;
+            line-height: 1;
+        }
+
+        @layer utilities {
+            .glass-nested {background-color:oklch(var(--b3)/0.15);backdrop-filter:blur(8px);border:1px solid oklch(var(--b3)/0.35);box-shadow:0 0 0.5rem oklch(var(--b3)/0.15) inset,0 0 1rem oklch(var(--b3)/0.25);}
+            .custom-scroll { overflow-y: auto; scrollbar-width: thin; scrollbar-color: oklch(var(--p)) oklch(var(--b1) / 0.1); }
+        }
+        @layer components {
+            .bubble-user { background-color: oklch(var(--p)/0.12); border: 1px solid oklch(var(--p)/0.20); color: oklch(var(--bc)); border-radius: 1rem; }
+            .bubble-model { background-color: oklch(var(--b2)/0.50); border: 1px solid oklch(1 0 0/0.10); color: oklch(var(--bc)); border-radius: 1rem; }
+        }
+    </style>
+</head>
+<body>
+    <div id="app"></div>
+
+    <script>
+        const {createApp, ref, shallowRef, reactive, computed, onMounted, watch, nextTick, toRefs, toRef, provide, inject, onActivated, onDeactivated, onBeforeUnmount, getCurrentInstance, onScopeDispose} = Vue;
+        const {createRouter, createWebHashHistory, useRoute, useRouter} = VueRouter;
+        const {useLocalStorage, useSessionStorage, useFetch, createGlobalState, useAsyncState, useDebounceFn, onKeyStroke, useInfiniteScroll, useTextareaAutosize, useScroll, onClickOutside, useEventListener} = VueUse;
+        
+        const OPUS_DIMENSIONS=Object.freeze([[1024,1024],[960,1088],[1088,960],[896,1152],[1152,896],[832,1216],[1216,832],[768,1344],[1344,768],[704,1472],[1472,704],[640,1600],[1600,640],[576,1792],[1792,576],[512,2048],[2048,512]].map(([width,height])=>({width,height})));
+        const DANBOORU_LIMIT = 100;
+        const formatDisplayNum = (num) => num >= 1e6 ? +(num/1e6).toFixed(1)+'m' : num >= 1e3 ? +(num/1e3).toFixed(1)+'k' : (num || 0);
+        const updateItemNum = (list, idRef, inc, max = 10) => inc > 0 && list.length < max ? list.push({id: idRef.value++, val: ''}) : inc < 0 && list.length > 1 && list.pop();
+        const parsePrompt = (txt) => { const [p, n] = (txt || '').split('--'); return {positive: (p || '').trim(), negative: (n || '').trim()}; };
+        const prepareGenConfig = (cfg) => (!cfg.isOpus || !cfg.shouldUseRandomOpusDimensions) ? {...cfg} : {...cfg, ..._.sample(OPUS_DIMENSIONS.filter(d => d.width <= cfg.width && d.height <= cfg.height))};
+
+        // --- Global Utilities ---
+        const uid = () => crypto.randomUUID();
+        const imgSrc = (img) => img ? `data:${img.mimeType};base64,${img.data}` : '';
+        const fmtTokens = (n) => !n ? '0' : n >= 1000 ? (n/1000).toFixed(1)+'k' : String(n);
+        const markdownCache = new Map();
+        const markdownParse = (text) => {
+            if (!text) return '';
+            if (markdownCache.has(text)) return markdownCache.get(text);
+            try { const r = window.marked ? window.marked.parse(text) : text; markdownCache.set(text, r); return r; } catch { return text; }
+        };
+        const readBase64 = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res({data: r.result.split(',')[1], mimeType: file.type, name: file.name}); r.onerror = rej; r.readAsDataURL(file); });
+        const downloadImage = (src, name) => { const a = document.createElement('a'); a.href = src; a.download = name || 'gemini-'+Date.now()+'.png'; document.body.appendChild(a); a.click(); a.remove(); };
+        const abortableSleep = (ms, signal) => new Promise((resolve, reject) => {
+            if (signal?.aborted) return reject(new DOMException('', 'AbortError'));
+            const t = setTimeout(resolve, ms);
+            signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('', 'AbortError')); }, {once: true});
+        });
+
+        // --- Unified Application Store ---
+        const useAppStore = createGlobalState(() => {
+            const config = useLocalStorage('nai-app-settings', {
+                tagTest: {iterations:1, isInfinite:false, isControl:true, prompts:[{id:1, val:'1girl, solo, wearing casual clothes'}], nextPromptId:2, unwantedContent:'multiple views, monochrome, black and white, looking at viewer, pov', tagsToTest:'sunset lighting\nwarm colors\nnight scene\nfog\nrain', tagPos:'beginning', tagTarget:'prompt', tagStrength:1.0, hasExtendedRange:false, areTagsVisible:false, shouldFilterMiddleResults:false},
+                genConfig: {steps:28, width:768, height:1344, scale:5.7, sampler:'k_euler_ancestral', cfgRescale:0, noiseSchedule:'karras', skipCfgAboveSigma:0, isOpus:false, shouldUseRandomOpusDimensions:false},
+                ui: {splitSizes:[60,40], splitSizesDanbooru:[40,60], splitSizesGen:[40,60], splitSizesBanana:[100,0], collapsibleStates:{'tag-test-settings':true, 'prompts-uc':true, 'tags-to-test':true, 'gen-settings':true, 'api-config':true, 'app-settings':true, 'img-comparison':true, 'results-panel':true, 'danbooru-search':true, 'danbooru-folders':true, 'nai-main-prompt':true, 'nai-char-prompts':true, 'nai-last-img':true, 'banana-settings':false}},
+                app: {apiKey:'', model:'nai-diffusion-4-5-full'},
+                gemini: {apiKey:'', thinkingLevel:'MINIMAL', aspectRatio:'1:1', imageSize:'1K', autoRetry:false},
+                danbooru: {folders:[], nextFolderId:1, gridCols:4, lastPath:'/danbooru', blacklist:'', sortOrder:'id', ratingFilters:{g:true, s:true, q:true, e:true}, savedSearches:[{name:'Trending', prompt:'order:rank'}]},
+                genState: {prompt:'1girl, solo, wearing casual clothes', uc:'multiple views, monochrome, black and white, looking at viewer, pov', charPrompts:[{id:1, val:''}], nextCharPromptId:2}
+            }, {mergeDefaults: true});
+
+            const toasts = ref([]), notifications = reactive({}), queue = ref([]), isDispatcherRunning = ref(false), isApiHalted = ref(false);
+            let uniqueIdCounter = 0;
+
+            const removeToast = (id) => _.remove(toasts.value, {id}).forEach(t => clearTimeout(t.timerId));
+            const addToast = ({id, msg, type='info', source='default', duration=5000, persistent=false}) => {
+                let item = id ? _.find(toasts.value, {id}) : (type === 'error' && _.findLast(toasts.value, {type, msg, source}));
+                if (!item) toasts.value.push(item = reactive({id: id || ++uniqueIdCounter, count: 0}));
+                Object.assign(item, {msg, type, source, persistent, duration, count: item.count + 1});
+                clearTimeout(item.timerId); if (!persistent) item.timerId = setTimeout(() => removeToast(item.id), duration);
+                return item.id;
+            };
+            
+            const updateNotification = (src, n) => src && (notifications[src] = Math.max(0, n ? (notifications[src] || 0) + n : 0));
+            const addReqs = (reqs) => {queue.value.push(...reqs.map(r => ({...r, id: ++uniqueIdCounter}))); startDispatcher();};
+            const clearQueueBySource = (src) => _.remove(queue.value, {source: src});
+
+            const generateImage = async (req, toastId) => {
+                const {app} = config.value, {prompt, uc, seed, genConfig: cfg, charCaptions: cc, negativeCharCaptions: ncc, onStatusUpdate: upd} = req;
+                if (!app.apiKey) return {success: false, msg: upd?.('Error: API Key is missing.')};
+                const cleanKey = (app.apiKey || '').trim();
+                const v4 = (base, c, o) => ({caption: {base_caption: base, char_captions: c||[]}, use_coords: false, use_order: o});
+                const parameters = {...cfg, skip_cfg_above_sigma: +cfg.skipCfgAboveSigma || null, seed, uncond_scale: 0, n_samples: 1, v4_prompt: v4(prompt, cc, true), v4_negative_prompt: v4(uc, ncc, false), request_type: "PromptGenerateRequest", version: 1};
+                
+                for (let i = 1; i <= 5; i++) {
+                    try {
+                        const controller = new AbortController();
+                        const id = setTimeout(() => controller.abort(), 90000);
+                        const res = await fetch('https://image.novelai.net/ai/generate-image', {
+                            method: 'POST',
+                            headers: {'Authorization': `Bearer ${cleanKey}`, 'Content-Type': 'application/json'},
+                            body: JSON.stringify({input: prompt, model: app.model, action: "generate", parameters}),
+                            signal: controller.signal
+                        });
+                        clearTimeout(id);
+
+                        if (res.ok) {
+                            try { const u = fflate.unzipSync(new Uint8Array(await res.arrayBuffer())); return {success: true, blob: new Blob([u[Object.keys(u).find(f=>f.endsWith('.png'))]], {type: 'image/png'})}; } 
+                            catch (e) { return {success: false, msg: upd?.(`Error: ${e.message}`)}; }
+                        }
+                        
+                        if (res.status === 401) {isApiHalted.value = true; req.source && clearQueueBySource(req.source); return {success: false, msg: 'Invalid API Key.'};}
+                        if (![429, 502, 503, 504].includes(res.status)) return {success: false, msg: upd?.(`Error ${res.status}`)};
+                        
+                        if (i === 5) return {success: false, msg: upd?.('Request timed out.')};
+                        upd?.(`${res.status === 429 ? "Busy" : "Error"}, retrying... (${i}/5)`); toastId && addToast({id: toastId, msg: 'Retrying...', type: 'warning', persistent: true});
+                        await new Promise(r => setTimeout(r, (2 ** (i - 1)) * 500 + Math.random() * 1500));
+                    } catch (e) {
+                        if (i === 5) return {success: false, msg: upd?.(e.name === 'AbortError' ? 'Request timed out.' : `Error: ${e.message}`)};
+                        upd?.(`Network Error, retrying... (${i}/5)`); 
+                        await new Promise(r => setTimeout(r, (2 ** (i - 1)) * 500 + Math.random() * 1500));
+                    }
+                }
+            };
+
+            const startDispatcher = async () => {
+                if (isDispatcherRunning.value) return; isDispatcherRunning.value = true;
+                try {
+                    while (queue.value.length > 0 && !isApiHalted.value) {
+                        const act = router?.currentRoute?.value?.meta?.genSource, idx = Math.max(0, act ? _.findIndex(queue.value, {source: act}) : -1), req = queue.value.splice(idx, 1)[0]; if (!req) continue;
+                        const tId = addToast({msg: 'Generating...', type: 'loading', source: req.source, persistent: true});
+                        const res = await generateImage(req, tId);
+                        if (router?.currentRoute?.value?.meta?.genSource !== req.source && res.success) updateNotification(req.source, 1);
+                        addToast({id: tId, msg: res.success ? 'Generated successfully!' : (res.msg || 'Gen failed'), type: res.success ? 'success' : 'error', persistent: false, duration: res.success ? 3000 : 6000});
+                        req.callback?.(res.success ? null : new Error(res.msg), res.success ? {blob: res.blob, context: req.context} : {context: req.context});
+                    }
+                } finally {isDispatcherRunning.value = false;}
+            };
+
+            return {config, toasts, addToast, removeToast, notifications, resetNotificationNum: (src) => updateNotification(src, 0), queue, isDispatcherRunning, isApiHalted, addReqs, clearQueueBySource, startDispatcher};
+        });
+
+        // --- Primitives ---
+        const TAG_COLORS={artist:['badge-warning','bg-warning/20'],character:['badge-success','bg-success/20'],copyright:['badge-accent','bg-accent/20'],meta:['badge-info','bg-info/20'],default:['badge-primary','bg-primary/20']};
+        const useDropdown=()=>{const isOpen=ref(false),root=ref(null);return{isOpen,root,close:()=>{isOpen.value=false;if(document.activeElement&&root.value?.contains(document.activeElement))document.activeElement.blur();}};};
+        const MaterialIcon={props:['icon','size'],template:`<span class="material-symbols-rounded select-none" :style="{fontSize:(size||24)+'px'}">{{icon}}</span>`};
+        const FloatingLabel={props:['label','color'],template:`<div v-if="label" class="absolute -top-2.5 left-2 z-10 pointer-events-none"><span class="badge badge-sm shadow-sm border-white/10 font-bold text-[10px] tracking-widest uppercase" :class="color||'badge-primary'">{{label}}</span></div>`};
+        const TagCountBadge={props:['count','source'],setup:()=>({formatDisplayNum}),template:`<span class="badge badge-sm border shrink-0 flex gap-1 h-5" :class="source==='danbooru'?'border-cardboard/50 bg-cardboard/20 text-cardboard':'bg-secondary/20 text-secondary border-secondary/50'"><material-icon :icon="source==='danbooru'?'package_2':'stylus_fountain_pen'" :size="12"></material-icon>{{formatDisplayNum(count)}}</span>`};
+        const Placeholder={props:['icon','text'],template:`<div class="flex flex-col items-center justify-center h-full p-4 text-center text-neutral-400"><material-icon :icon="icon" :size="48" class="mb-2 opacity-50"></material-icon><p class="text-sm font-medium">{{text}}</p></div>`};
+        const ImageViewer={props:['src','alt','text'],template:`<transition name="fade" mode="out-in"><placeholder v-if="!src" key="p" icon="image" :text="text"></placeholder><img v-else :key="src" :src="src" :alt="alt" class="max-w-full max-h-full object-contain rounded"></transition>`};
+        const ChecklistDropdown={
+            props:{items:Array,isChecked:Function,onToggle:Function,getLabel:{type:Function,default:i=>i.name},getCount:Function,icon:{type:String,default:'star_border'},activeIcon:{type:String,default:'star'},activeColor:{type:String,default:'text-yellow-400'},defaultColor:{type:String,default:'opacity-50'},emptyText:{type:String,default:'No items'},btnClass:{type:String,default:'btn-ghost btn-xs btn-circle min-h-0 h-5 w-5 hover:bg-base-content/10'},iconSize:{type:Number,default:14},menuClass:{type:String,default:'dropdown-bottom'}},
+            setup:(props)=>{const {isOpen,root,close}=useDropdown();return{hasChecked:computed(()=>props.items?.some(props.isChecked)),isOpen,root,close};},
+            template:`<div ref="root" class="dropdown" :class="[menuClass,{'dropdown-open':isOpen}]" @mouseenter="isOpen=true" @mouseleave="close" @click.stop @mousedown.stop><div tabindex="0" role="button" class="btn" :class="btnClass"><material-icon :icon="hasChecked?activeIcon:icon" :size="iconSize" :class="hasChecked?[activeColor,'opacity-100']:defaultColor"></material-icon></div><ul tabindex="0" class="dropdown-content z-[100] menu menu-sm p-2 shadow-xl bg-base-200 border border-white/5 rounded-box w-52 max-h-60 custom-scroll"><li v-if="!items?.length" class="disabled"><a class="text-neutral-500 justify-center text-xs">{{emptyText}}</a></li><li v-for="(item,idx) in items" :key="idx"><label class="label cursor-pointer justify-start gap-3 active:bg-base-300"><input type="checkbox" class="checkbox checkbox-xs checkbox-primary rounded-sm" :checked="isChecked(item)" @change="onToggle(item)"/><span class="label-text truncate flex-1 text-left">{{getLabel(item)}}</span><span v-if="getCount" class="badge badge-sm badge-ghost font-normal text-xs">{{getCount(item)}}</span></label></li></ul></div>`
+        };
+        const TagPill={
+            props:['tag','knowledge'],setup(p){const c=TAG_COLORS,{onSearch:s,onSingle:S,savedSearches:ss,onToggleSearch:ts,isTagIn:i}=inject('danbooruSearch');return{c,isInSearch:k=>i(k.prompt,p.tag.name),s,S,ss,ts};},
+            template:`<div class="badge badge-lg gap-1.5 h-auto py-1 pl-1 pr-3 cursor-default hover:scale-105 transition-transform badge-outline hover:z-[100] focus-within:z-[100]" :class="c[tag.type]||c.default"><checklist-dropdown :items="ss" :is-checked="isInSearch" :on-toggle="(s)=>ts(tag.name,s)" empty-text="No saved searches"></checklist-dropdown><span class="font-bold text-xs text-left whitespace-normal leading-tight cursor-pointer select-none" @click.stop="s(tag.name)" @dblclick.stop.prevent="S(tag.name)">{{tag.name.replace(/_/g,' ')}}</span><tag-count-badge v-if="knowledge?.count>0" :count="knowledge.count" :source="knowledge.source" class="cursor-pointer" @click.stop="s(tag.name)"></tag-count-badge><material-icon v-else-if="knowledge" icon="visibility_off" :size="12" class="opacity-50"></material-icon></div>`
+        };
+        const IconBtn = {props:['icon','size','color','tooltip','active'], template:`<button class="btn btn-square" :class="[size||'btn-sm',active?'btn-active':(color||'btn-ghost'),tooltip&&'tooltip']" :data-tip="tooltip"><material-icon :icon="icon" :size="(size==='btn-xs'?16:20)"></material-icon></button>`};        const SettingInput={
+            props:['label','labelColor','type','options','min','max','step','disabled','modelValue','number'],emits:['update:modelValue'],
+            setup:(p,{emit})=>({val:computed({get:()=>p.modelValue,set:v=>emit('update:modelValue',v)})}),
+            template:`<div class="relative"><floating-label :label="label" :color="labelColor"></floating-label><div v-if="type==='range'" class="input input-sm input-bordered flex items-center gap-2 px-2 bg-base-100/50"><slot name="prefix"></slot><input type="range" v-model.number="val" v-bind="$attrs" :step="step" :min="min" :max="max" class="range range-xs range-primary flex-1"><input v-if="number" v-model.number="val" type="number" :step="step" :min="min" :max="max" class="input input-xs input-ghost w-12 text-right text-sm p-0 h-auto focus:outline-none focus:bg-transparent border-none"><span v-else class="text-[10px] w-8 text-right">{{(val||0).toFixed(2)}}</span></div><select v-else-if="type==='select'" v-model="val" v-bind="$attrs" class="select select-sm select-bordered w-full pt-2 text-xs" :disabled="disabled"><option v-for="o in options" :key="o.val??o" :value="o.val??o">{{o.text??o}}</option></select><input v-else v-model="val" v-bind="$attrs" :type="type||'number'" :step="step" :min="min" :max="max" :disabled="disabled" class="input input-sm input-bordered w-full pt-2 text-sm"></div>`
+        };
+        const Counter={props:{count:Number,onUpdate:Function},template:`<div class="flex items-center glass-nested rounded-lg h-8 overflow-hidden select-none"><div class="pl-2 text-neutral-400 flex items-center justify-center empty:hidden"><slot name="icon"></slot></div><div class="flex-1 flex items-center justify-center px-2 text-xs font-bold text-neutral-200 min-w-[1.5rem]">{{count}}</div><div class="flex flex-col h-full border-l border-white/10"><button @click.stop="onUpdate(1)" class="flex items-center justify-center h-4 w-5 hover:bg-white/10 text-neutral-400 hover:text-white transition-colors active:bg-white/20"><material-icon icon="keyboard_arrow_up" size="14"></material-icon></button><button @click.stop="onUpdate(-1)" class="flex items-center justify-center h-4 w-5 hover:bg-white/10 text-neutral-400 hover:text-white transition-colors active:bg-white/20"><material-icon icon="keyboard_arrow_down" size="14"></material-icon></button></div></div>`};
+        const SegmentedControl={
+            props:{options:Array,height:{type:String,default:'h-10'},fontSize:{type:String,default:''},inactiveClass:{type:String,default:'glass-nested text-neutral-400 hover:bg-white/5 hover:text-neutral-200'}},
+            template:`<div class="join w-full grid shadow-sm" :class="height" :style="{'grid-template-columns':'repeat('+options.length+', minmax(0, 1fr))'}"><button v-for="(o,i) in options" :key="i" @click="!o.disabled&&o.onClick($event)" class="join-item btn btn-sm min-h-0 h-full transition-all duration-200 border-white/10" :class="[fontSize,o.disabled?'opacity-30 cursor-not-allowed':'',o.active?(o.activeClass||'btn-primary text-white shadow-md'):inactiveClass]">{{o.label}}</button></div>`
+        };
+        const SplitPane={
+            props:{configKey:String,minSize:{type:Array,default:()=>[300,300]},leftClass:{type:String,default:'custom-scroll p-4 space-y-4'},rightClass:{type:String,default:'custom-scroll p-4 space-y-4'}},
+            setup(p){
+                const s=useAppStore();
+                const leftKey = p.configKey + '_leftOpen';
+                const isLeftOpen = computed({
+                    get: () => s.config.value.ui[leftKey] !== false,
+                    set: v => s.config.value.ui[leftKey] = v
+                });
+                return {isLeftOpen};
+            },
+            template:`<div class="h-full flex overflow-hidden">
+                <div class="shrink-0 flex flex-col border-r border-white/10 transition-all duration-200 overflow-hidden" :style="isLeftOpen ? 'width:380px' : 'width:0px'">
+                    <div class="w-[380px] h-full" :class="leftClass"><slot name="left"></slot></div>
+                </div>
+                <button @click="isLeftOpen=!isLeftOpen" class="shrink-0 w-5 flex items-center justify-center bg-base-200/20 hover:bg-primary/15 border-r border-white/10 text-neutral-600 hover:text-primary transition-colors z-10" :title="isLeftOpen ? 'Collapse panel' : 'Expand panel'">
+                    <material-icon :icon="isLeftOpen ? 'chevron_left' : 'chevron_right'" :size="16"></material-icon>
+                </button>
+                <div class="flex-1 overflow-hidden" :class="rightClass"><slot name="right"></slot></div>
+            </div>`
+        };
+        const LazyImage={
+            props:{src:String,alt:String,aspectRatio:[Number,String]},setup:()=>({ready:ref(false)}),
+            template:`<div class="image-container bg-neutral-900/50" :class="{skeleton:!ready}" :style="{aspectRatio}"><img :src="src" :alt="alt" loading="lazy" class="transition-opacity duration-500 w-full rounded-lg" :class="ready?'opacity-100':'opacity-0'" @load="ready=true" @error="ready=true"><slot></slot></div>`
+        };
+        const PromptInput={props:['label','modelValue','isUc','placeholder'],emits:['update:modelValue'],template:`<autocomplete-field :label="label" :label-class="isUc?'badge-error text-white':undefined" :model-val="modelValue" @update:model-val="$emit('update:modelValue',$event)" class="textarea textarea-bordered w-full resize-none text-sm leading-relaxed p-3 shadow-inner" :class="isUc?'min-h-[3.5rem] text-neutral-400 focus:text-neutral-200':'min-h-[6rem] focus:min-h-[8rem] transition-[min-height]'" :rows="isUc?2:3" :placeholder="placeholder" v-bind="$attrs"></autocomplete-field>`};
+        const FolderDropdown={props:['post','iconSize','menuClass'],setup(){const{folders,isPostInFolder,togglePostInFolder}=inject('danbooruFolders');return{folders,isPostInFolder,togglePostInFolder}},template:`<checklist-dropdown :items="folders" :is-checked="f=>isPostInFolder(post.id,f.id)" :on-toggle="f=>togglePostInFolder(post,f)" :get-count="f=>f.postIds.length" empty-text="No folders" btn-class="bg-black/50 hover:bg-black/75 border-none text-white btn-circle btn-sm" icon="create_new_folder" active-icon="create_new_folder" :icon-size="iconSize||16" :menu-class="menuClass"></checklist-dropdown>`};
+        const NavLink={props:['to','icon','notification'],template:`<router-link :to="to" custom v-slot="{href,navigate,isActive}"><a :href="href" @click="navigate" class="indicator p-0 flex justify-center items-center w-14 h-14" :class="{'active':isActive}"><span v-if="notification>0" class="indicator-item badge badge-primary badge-sm">{{notification}}</span><material-icon :icon="icon"></material-icon></a></router-link>`};
+
+        // --- Autocomplete Field Component ---
+        const AutocompleteField={
+            props:{modelVal:String,tag:{type:String,default:'textarea'},label:String,labelClass:String},emits:['update:modelVal'],inheritAttrs:false,
+            setup(p,{emit}){
+                const inputRef=ref(),dropdownRef=ref(null),suggestions=ref([]),selectedIdx=ref(0),show=ref(false),dPos=ref({}),lastKey=ref('');
+                const {getAutocomplete}=useNAIAutocomplete(),isTA=p.tag==='textarea',close=()=>show.value=false;
+                if(isTA) useTextareaAutosize({element:inputRef,input:toRef(p,'modelVal')});
+                onDeactivated(close);onBeforeUnmount(close);onClickOutside(dropdownRef,close,{ignore:[inputRef]});
+                const updatePos=()=>{
+                    if(!inputRef.value||!show.value)return; const r=inputRef.value.getBoundingClientRect();
+                    if(!isTA) return(dPos.value={top:r.bottom,left:r.left,width:`${r.width}px`});
+                    const {top,left,height}=getCaretCoordinates(inputRef.value,inputRef.value.selectionStart);
+                    dPos.value={top:r.top+top+height-inputRef.value.scrollTop,left:r.left+left,width:'auto'};
+                };
+                const trig=useDebounceFn(async()=>{
+                    if(!inputRef.value||['Backspace','Enter'].includes(lastKey.value))return close();
+                    const txt=p.modelVal||'',curs=inputRef.value.selectionStart;
+                    if(curs>0&&/\s/.test(txt.charAt(curs-1)))return close();
+                    const {suggestions:res}=await getAutocomplete(txt,curs);
+                    if((suggestions.value=res).length>0){selectedIdx.value=0;show.value=true;updatePos();}else close();
+                },300);
+                useEventListener(document,'scroll',updatePos,{capture:true});useEventListener(window,'resize',updatePos);
+                const apply=()=>{
+                    if(!suggestions.value.length||!inputRef.value)return; const s=suggestions.value[selectedIdx.value];
+                    inputRef.value.focus();inputRef.value.setSelectionRange(s.fragmentStartPos,s.fragmentEndPos);
+                    document.execCommand('insertText',false,s.text);close();
+                };
+                return{inputRef,dropdownRef,suggestions,selectedIdx,show,dPos,trig,apply,onKey:(e)=>{
+                    lastKey.value=e.key;if(!show.value)return;
+                    if(['ArrowDown','ArrowUp'].includes(e.key)){e.preventDefault();selectedIdx.value=(selectedIdx.value+(e.key==='ArrowDown'?1:-1)+suggestions.value.length)%suggestions.value.length;}
+                    else if((e.key==='Enter'&&e.ctrlKey)||(p.tag==='input'&&e.key==='Tab')){e.preventDefault();apply();}
+                    else if(e.key==='Enter'||e.key==='Escape'){e.preventDefault();close();}
+                }};
+            },
+            template:`<div class="relative"><floating-label :label="label" :color="labelClass"></floating-label><component :is="tag" ref="inputRef" :class="{'overflow-hidden':tag==='textarea'}" :value="modelVal" @input="$emit('update:modelVal',$event.target.value);trig()" @keydown="onKey" v-bind="$attrs"></component><teleport to="body"><div ref="dropdownRef" v-if="show&&suggestions.length" class="fixed z-[9999] bg-base-200 rounded-box shadow-2xl border border-base-300 max-h-64 custom-scroll" :style="{top:dPos.top+'px',left:dPos.left+'px',width:dPos.width,minWidth:'300px',maxWidth:'500px'}"><ul class="menu menu-sm w-full p-0"><li v-for="(s,i) in suggestions" :key="i"><a @click="selectedIdx=i;apply()" :class="{'active':i===selectedIdx}" class="flex justify-between gap-4 rounded-none"><span class="font-medium truncate">{{s.text}}</span><tag-count-badge :count="s.count" :source="s.source"></tag-count-badge></a></li></ul></div></teleport></div>`
+        };
+
+        // --- Composables ---
+        const useObjectURLManager = () => {
+            const urls = new Set();
+            const revokeAll = () => {urls.forEach(URL.revokeObjectURL); urls.clear();};
+            getCurrentInstance() && onScopeDispose(revokeAll);
+            return {create: (b) => b ? (urls.add(URL.createObjectURL(b)), Array.from(urls).pop()) : null, revokeAll};
+        };
+
+        // --- NovelAI Autocomplete Composable ---
+        const useNAIAutocomplete = () => {
+            const store = useAppStore(), abortController = ref(null);
+            const getAutocomplete = async (text, cursorPos) => {
+                abortController.value?.abort(); abortController.value = new AbortController();
+                const signal = abortController.value.signal, sub = text.slice(0, cursorPos), start = Math.max(sub.lastIndexOf('.'), sub.lastIndexOf(','), sub.lastIndexOf('|')) + 1;
+                const words = sub.slice(start).trim().split(/\s+/), lastWord = _.last(words);
+                if (!words[0]) return {suggestions: []};
+
+                const fetchTags = async (url, map) => { try { return map(await (await fetch(url, {signal})).json()) || []; } catch { return []; } };
+                try {
+                    const {model} = store.config.value.app, frags = Array.from({length: Math.min(3, words.length)}, (_, i) => ({txt: words.slice(-(i+1)).join(' '), s: start + sub.slice(start).lastIndexOf(words.slice(-(i+1)).join(' '))}));
+                    const [nai, dan] = await Promise.all([
+                        Promise.all(frags.map(f => !model ? [] : fetchTags(`https://image.novelai.net/ai/generate-image/suggest-tags?model=${model}&prompt=${encodeURIComponent(f.txt)}`, d => d.tags?.map(t => ({...t, text: t.tag, fragmentStartPos: f.s, fragmentEndPos: cursorPos, source: 'nai', sortScore: t.count}))))).then(r => r.flat()),
+                        (!lastWord || lastWord.length < 2) ? [] : fetchTags(`https://danbooru.donmai.us/tags.json?search[name_matches]=${encodeURIComponent(lastWord)}*&search[order]=count&limit=10&search[hide_empty]=yes`, d => d.map(t => ({text: t.name.replace(/_/g, ' '), count: t.post_count, category: t.category, fragmentStartPos: start + sub.slice(start).lastIndexOf(lastWord), fragmentEndPos: cursorPos, source: 'danbooru', sortScore: Math.log10(Math.max(1, t.post_count)) * (t.category === 1 ? 5000 : 2600) - (t.category === 1 ? 5000 : 3200)})))
+                    ]);
+                    return {suggestions: _.uniqBy(_.orderBy([...nai, ...dan], 'sortScore', 'desc'), 'text')};
+                } catch {return {suggestions: []};}
+            };
+            onScopeDispose(() => abortController.value?.abort()); return {getAutocomplete};
+        };
+
+        // --- Components ---
+        const CollapsiblePanel={
+            props:{title:{type:String,default:''},storageKey:{type:String,required:true},flush:{type:Boolean,default:false}},
+            setup(p){const s=useAppStore();return{isOpen:computed({get:()=>s.config.value.ui.collapsibleStates[p.storageKey],set:v=>s.config.value.ui.collapsibleStates[p.storageKey]=v})};},
+            template:`<div class="collapse collapse-arrow overflow-visible !transition-none !duration-0" :class="[flush?'glass rounded-none border-b border-white/20':'glass-nested rounded-xl border border-white/20',{'collapse-open':isOpen,'collapse-close':!isOpen}]"><div class="collapse-title flex items-center text-lg font-semibold text-neutral-100 cursor-pointer hover:text-primary transition-colors select-none pr-12 after:!transition-none after:!duration-0" @click="isOpen=!isOpen"><div class="flex-1 min-w-0 flex items-center gap-2 mr-4"><slot name="header">{{title}}</slot></div><div class="ml-auto flex-none flex items-center gap-2 relative z-10" @click.stop><slot name="actions"></slot></div></div><div class="collapse-content px-4 space-y-3 !overflow-visible !transition-none !duration-0"><slot></slot></div></div>`
+        };
+
+        const PromptList={
+            props:{title:String,storageKey:String,items:Array,idRef:Object,icon:String,placeholder:String},
+            setup:(p)=>({updateList:(inc)=>updateItemNum(p.items,p.idRef,inc)}),
+            template:`<collapsible-panel :title="title" :storage-key="storageKey"><template #actions><counter :count="items.length" :on-update="updateList"><template #icon><material-icon :icon="icon" size="16"></material-icon></template></counter></template><transition-group tag="div" name="list" class="space-y-3 pt-2"><prompt-input v-for="(p,i) in items" :key="p.id" :label="'#'+(i+1)" v-model="p.val" class="!min-h-[3.5rem] py-2" rows="1" :placeholder="placeholder"></prompt-input></transition-group><slot name="footer"></slot></collapsible-panel>`
+        };
+
+        const ToastContainer = {
+            setup() {
+                const {toasts, removeToast} = useAppStore();
+                const toastConfig = {loading: 'alert-info', success: 'alert-success', error: 'alert-error', warning: 'alert-warning'};
+                return {toasts, removeToast, toastConfig};
+            },
+            template: `
+                <div class="toast toast-bottom toast-end z-[1000] p-4">
+                    <transition-group name="list" tag="div" class="flex flex-col items-end space-y-2">
+                        <div v-for="toast in toasts" :key="toast.id"
+                             class="alert shadow-lg w-fit max-w-md cursor-pointer flex border border-white/10 text-white"
+                             :class="[toastConfig[toast.type] || '', 'bg-opacity-80 backdrop-blur-md']"
+                             @click="removeToast(toast.id)">
+                            <span>
+                                {{toast.msg}}
+                                <span v-if="toast.count > 1" class="font-bold text-sm"> (x{{toast.count}})</span>
+                                <span v-if="toast.source && toast.source !== 'default'" class="text-xs opacity-75 ml-1">(from {{toast.source}})</span>
+                            </span>
+                        </div>
+                    </transition-group>
+                </div>
+            `
+        };
+        
+        const GenerationSettingsPanel = {
+            props: {config: {type: Object, required: true}},
+            setup(props) {
+                const {config} = props, snap = (key, value) => {
+                    const dimValue = parseInt(value, 10) || 0;
+                    if (config.isOpus && !config.shouldUseRandomOpusDimensions) Object.assign(config, _.minBy(OPUS_DIMENSIONS, dim => Math.abs(dim[key] - dimValue)));
+                    else config[key] = Math.max(64, Math.round(dimValue / 64) * 64);
+                };
+                watch(() => config.isOpus, (isOpusEnabled) => { if(isOpusEnabled) config.steps=28; else config.shouldUseRandomOpusDimensions=false; ['width','height'].forEach(key=>snap(key, config[key])); }, {immediate:true});
+                const opts = computed(() => [
+                    {label: 'Opus Mode', active: config.isOpus, onClick: () => config.isOpus = !config.isOpus},
+                    {label: 'Random Dims', active: config.shouldUseRandomOpusDimensions, activeClass: 'btn-secondary text-white shadow-md', disabled: !config.isOpus, onClick: () => config.shouldUseRandomOpusDimensions = !config.shouldUseRandomOpusDimensions}
+                ]);
+                return {
+                    swap: () => [config.width, config.height] = [config.height, config.width],
+                    snapW: useDebounceFn((event) => snap('width', event.target.value), 500),
+                    snapH: useDebounceFn((event) => snap('height', event.target.value), 500),
+                    opts,
+                    samplers: ['k_euler_ancestral', 'k_euler', 'k_dpmpp_2s_ancestral', 'k_dpmpp_2m_sde', 'k_dpmpp_2m', 'k_dpmpp_sde', 'ddim_v3', 'ddim'],
+                    schedulers: [{val: 'karras', text: 'Karras'}, {val: 'exponential', text: 'Exponential'}, {val: 'polyexponential', text: 'Polyexponential'}]
+                };
+            },
+            template: `
+                <collapsible-panel title="Generation Settings" storage-key="gen-settings">
+                    <div class="space-y-4 pt-2">
+                        <segmented-control :options="opts"></segmented-control>
+                        <div class="join w-full">
+                            <input :value="config.width" @input="snapW" type="number" step="64" min="64" placeholder="Width" class="join-item input input-sm input-bordered w-full text-center text-sm">
+                            <icon-btn icon="swap_horiz" class="join-item border-white/20 text-neutral-400" @click="swap" :disabled="config.shouldUseRandomOpusDimensions"></icon-btn>
+                            <input :value="config.height" @input="snapH" type="number" step="64" min="64" placeholder="Height" class="join-item input input-sm input-bordered w-full text-center text-sm">
+                        </div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <setting-input v-model="config.steps" label="Steps" :max="50" :disabled="config.isOpus"></setting-input>
+                            <setting-input v-model="config.scale" label="Scale" :step="0.1" :max="30"></setting-input>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <setting-input v-model="config.skipCfgAboveSigma" label="Variety+ σ" :step="0.1"></setting-input>
+                            <setting-input v-model="config.cfgRescale" label="CFG Rescale" type="range" :max="1" :step="0.01"></setting-input>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <setting-input v-model="config.sampler" label="Sampler" type="select" :options="samplers"></setting-input>
+                            <setting-input v-model="config.noiseSchedule" label="Scheduler" type="select" :options="schedulers"></setting-input>
+                        </div>
+                    </div>
+                </collapsible-panel>
+            `
+        };
+        
+        const NAIImageGenerator = {
+            setup() {
+                const store = useAppStore();
+                const {genState, genConfig} = toRefs(store.config.value);
+                const urlManager = useObjectURLManager();
+                const statusMsg = ref('Ready to generate.'), genHistory = shallowRef([]), viewedImg = ref(null);
+                const createCaptions = (key) => genState.value.charPrompts.flatMap(p => { const val = parsePrompt(p.val)[key]?.trim(); return val ? [{char_caption: val, centers: [{x: 0.5, y: 0.5}]}] : []; });
+                const generate = () => {
+                    const seed = _.random(9007199254740990);
+                    store.addReqs([{
+                        source: 'gen', prompt: genState.value.prompt, uc: genState.value.uc, seed, char_captions: createCaptions('positive'), negative_char_captions: createCaptions('negative'), genConfig: prepareGenConfig(genConfig.value),
+                        callback: (error, {blob, context} = {}) => { if (error) return statusMsg.value = `Error: ${error.message}`; const newImage = {id: Date.now(), url: urlManager.create(blob), seed: context.seed}; genHistory.value.unshift(newImage); viewedImg.value = newImage; statusMsg.value = `Image generated with seed ${context.seed}.`; },
+                        onStatusUpdate: (message) => statusMsg.value = message, context: {seed}
+                    }]);
+                    statusMsg.value = 'Queued for generation...';
+                };
+                return {genState, genConfig, toRef, generate, statusMsg, viewedImg, setViewedImg: (image) => viewedImg.value = image, genHistory};
+            },
+            template:`
+                <div class="flex flex-col h-full"><div class="z-10 shrink-0"><collapsible-panel flush storage-key="gen-header"><template #header><span>NovelAI Generator</span><button @click.stop="generate" class="btn btn-sm btn-primary flex-1 mx-4 shadow-lg min-w-0"><material-icon icon="auto_awesome" class="mr-2"></material-icon><span class="truncate">{{statusMsg}}</span></button></template></collapsible-panel></div>
+                    <div class="flex-1 min-h-0 relative"><split-pane config-key="splitSizesGen" :min-size="[400, 300]">
+                            <template #left>
+                                <collapsible-panel title="Main Prompt & UC" storage-key="nai-main-prompt"><div class="flex flex-col gap-4 pt-2">
+                                        <prompt-input label="Positive" v-model="genState.prompt" placeholder="Masterpiece, best quality..."></prompt-input>
+                                        <prompt-input label="Negative" v-model="genState.uc" is-uc placeholder="Lowres, bad anatomy, text, error..."></prompt-input>
+                                </div></collapsible-panel>
+                                <prompt-list title="Character Prompts" storage-key="nai-char-prompts" :items="genState.charPrompts" :id-ref="toRef(genState, 'nextCharPromptId')" icon="person_add" placeholder="1girl, blue hair... Use '--' for char-specific UCs"></prompt-list>
+                                <generation-settings-panel :config="genConfig"></generation-settings-panel>
+                            </template>
+                            <template #right>
+                                <collapsible-panel title="View Image" storage-key="nai-last-img"><div class="p-4 rounded-lg glass-nested aspect-w-1 aspect-h-1 grid place-items-center"><image-viewer :src="viewedImg?.url" alt="Generated Image" text="Your generated image will appear here."></image-viewer></div></collapsible-panel>
+                                <div class="divider">Generation History</div><div v-if="genHistory.length === 0" class="rounded-xl glass-nested"><placeholder icon="collections" text="Image history will be displayed here."></placeholder></div>
+                                <div v-show="genHistory.length > 0" class="w-full masonry-grid"><div v-for="img in genHistory" :key="img.id" class="cursor-pointer grid-item" @click="setViewedImg(img)"><lazy-image :src="img.url" :alt="'Generated image ' + img.seed"></lazy-image></div></div>
+                            </template>
+                        </split-pane></div></div>`
+        };
+
+        const DanbooruBrowser = {
+            setup() {
+                const store = useAppStore(), {config, addToast} = store, {danbooru, app} = toRefs(config.value);
+                _.defaultsDeep(danbooru.value, {savedSearches: [{name: 'Trending', prompt: 'order:rank'}], blacklist: '', sortOrder: 'id', ratingFilters: {g: true, s: true, q: true, e: true}});
+                const route = useRoute(), router = useRouter(), gridRoutes = ['danbooru-grid', 'danbooru-folder'], ratingMeta = [['g','success'],['s','info'],['q','warning'],['e','error']].map(([k,c])=>({k,label:k.toUpperCase(),active:`btn-${c} text-white`,inactive:`glass-nested text-${c}/50 hover:bg-${c}/10`}));
+                const naiTagKnowledge = useSessionStorage('danbooru-tag-knowledge', {}), tagQueues = {nai: [], danbooru: []}, activeReqs = {nai: 0, danbooru: 0}, queuedTags = new Set();
+                const processQueues = () => {
+                    const run = (k, url, cb, lim=1) => { if (activeReqs[k] >= lim || !tagQueues[k].length) return; const tag = tagQueues[k].shift(); activeReqs[k]++; fetch(url(tag)).then(r=>r.json()).then(d=>cb(tag, d)).catch(()=>k==='nai'&&tagQueues.danbooru.push(tag)).finally(()=>{ activeReqs[k]--; setTimeout(processQueues, k==='danbooru'?200:0); }); };
+                    run('nai', t=>`https://image.novelai.net/ai/generate-image/suggest-tags?model=${app.value.model}&prompt=${encodeURIComponent(t.replace(/_/g,' '))}`, (t,d)=>{ d.tags?.forEach(s=>naiTagKnowledge.value[s.tag.replace(/ /g,'_')]={count:s.count,source:'nai'}); !naiTagKnowledge.value[t]&&tagQueues.danbooru.push(t); }, 5);
+                    run('danbooru', t=>`https://danbooru.donmai.us/tags.json?search[name]=${encodeURIComponent(t)}`, (t,d)=>naiTagKnowledge.value[t]={count:d.find(i=>i.name===t)?.post_count||0,source:d.length?'danbooru':'none'});
+                };
+                const {sortOrder, blacklist, ratingFilters, savedSearches} = toRefs(danbooru.value), posts = shallowRef([]), pageNum = ref(1), hasMorePages = ref(true), currentSearchTags = ref(''), hoveredImage = ref(null), searchQueryInput = ref(''), rightPanelRef = ref(null), lastScrollPos = ref(0), lastFetchedQuery = ref(null), folderName = ref(''), isEditing = ref(false), {y: scrollTop} = useScroll(rightPanelRef);
+                const restoreScroll = () => { if (gridRoutes.includes(route.name) && rightPanelRef.value) rightPanelRef.value.scrollTop = lastScrollPos.value; };
+                watch(scrollTop, useDebounceFn(() => { if (gridRoutes.includes(route.name)) lastScrollPos.value = scrollTop.value; }, 150));
+                onActivated(() => nextTick(restoreScroll));
+                watch(() => route.fullPath, (path) => { if (['danbooru-grid', 'danbooru-single', 'danbooru-folder'].includes(route.name)) danbooru.value.lastPath = path; });
+
+                let abortController = null;
+                const {isLoading, error: err, execute} = useAsyncState(async (tags, page = 1, append = false, signal, clientFilters = []) => {
+                    try {
+                        const sub = (tags || '').split('|').map(t => t.trim()).filter(Boolean); if (!sub.length) sub.push('');
+                        const results = await Promise.all(sub.map(async t => { const res = await fetch(`https://danbooru.donmai.us/posts.json?tags=${encodeURIComponent(t)}&limit=${Math.ceil(DANBOORU_LIMIT / sub.length)}&page=${page}`, {signal}); return res.ok ? (await res.json()) || [] : []; }));
+                        return {data: _.uniqBy(results.flat(), 'id'), page, append, tags, clientFilters, error: null};
+                    } catch (e) {if (e.name !== 'AbortError') throw e; return {aborted: true};}
+                }, null, {
+                    immediate: false,
+                    onError: (e) => !e?.name?.includes('Abort') && addToast({msg: `Search failed: ${e.message}`, type: 'error', source: 'danbooru'}),
+                    onSuccess: ({data, page, append, tags, clientFilters = [], aborted, error}) => {
+                        if (aborted || error) return error && addToast({msg: error, type: 'error', source: 'danbooru'});
+                        const bl = blacklist.value.split(',').map(t => t.trim()).filter(Boolean), results = data.filter(p => p.large_file_url && !p.is_banned && p.image_width > 0 && /png|jpe?g|gif/.test(p.file_ext) && !bl.some(b => (p.tag_string||'').includes(b)) && (!clientFilters.length || clientFilters.every(f => (` ${p.tag_string||''} `).includes(` ${f} `))));
+                        results.forEach(p => ['artist', 'general', 'character', 'copyright', 'meta'].forEach(t => (p[`tag_string_${t}`]||'').split(' ').forEach(tag => { if (tag && !naiTagKnowledge.value[tag] && !queuedTags.has(tag)) { tagQueues[t === 'artist' ? 'danbooru' : 'nai'].push(tag); queuedTags.add(tag); processQueues(); } })));
+                        posts.value = append ? posts.value.concat(results) : results; hasMorePages.value = data.length >= (tags.includes('|') ? (DANBOORU_LIMIT / 2) : DANBOORU_LIMIT); pageNum.value = page; currentSearchTags.value = tags;
+                        if (page === 1) addToast({msg: `Found ${results.length} posts.`, type: 'success', source: 'danbooru', duration: 2000});
+                    }
+                });
+                const fetchPosts = (tags, page = 1, append = false, filters = []) => { if (abortController) abortController.abort(); abortController = new AbortController(); if (!append) posts.value = []; return execute(0, tags, page, append, abortController.signal, filters); };
+                const sortedPosts = computed(() => { const {g, s, q, e} = ratingFilters.value, p = (g && s && q && e) ? posts.value : _.filter(posts.value, post => ratingFilters.value[post.rating]); return _.orderBy(p, sortOrder.value === 'score' ? ['score', 'id'] : ['id'], ['desc', 'desc']); });
+                const displayedImage = computed(() => _.find(posts.value, {id: Number(route.params.id)}) || hoveredImage.value), foldersById = computed(() => _.keyBy(danbooru.value.folders, 'id')), activeFolderId = computed(() => route.name === 'danbooru-folder' ? route.params.folderId : null);
+                watch(() => [isLoading.value, sortedPosts.value.length], ([loading, len]) => { if (!loading && len < 15 && hasMorePages.value && gridRoutes.includes(route.name) && Object.values(ratingFilters.value).some(Boolean)) fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []); });
+
+                const executeSearch = (query) => {
+                    lastFetchedQuery.value = query; let effective = query || '', apiTags, clientFilters = [];
+                    if ((effective).includes('|')) apiTags = effective.split('|').map(p => p.split(/\s*,\s*/).map(t => t.trim().replace(/\s+/g, '_')).filter(Boolean).join(' ')).join('|');
+                    else { const tags = _.compact((effective).split(/\s*,\s*/).map(tag => tag.trim().replace(/\s+/g, '_'))); apiTags = _.take(tags, 2).join(' '); clientFilters = _.drop(tags, 2); }
+                    fetchPosts(apiTags, 1, false, clientFilters);
+                };
+                watch(() => route.query.q, (q) => {
+                    if (route.name === 'danbooru-folder' && q === undefined) return !searchQueryInput.value && (searchQueryInput.value = 'order:rank');
+                    searchQueryInput.value = q ?? 'order:rank';
+                    if (['danbooru-grid', 'danbooru-single'].includes(route.name) && (!posts.value.length || q !== lastFetchedQuery.value)) executeSearch(q);
+                }, {immediate: true});
+                watch(() => route.params.folderId, (id) => { if (!id || route.name !== 'danbooru-folder') return; lastFetchedQuery.value = null; const folder = foldersById.value[id]; if (folder) fetchPosts(folder.postIds.length ? `id:${folder.postIds.join(',')}` : 'id:0', 1, false); }, {immediate: true});
+                watch(() => route.name, (n) => n === 'danbooru-grid' && !route.query.q && !posts.value.length && router.replace({name: 'danbooru-grid', query: {q: 'order:rank'}}), {immediate: true});
+                const search = () => (searchQueryInput.value === route.query.q && route.name === 'danbooru-grid') ? executeSearch(searchQueryInput.value) : router.push({name: 'danbooru-grid', query: {q: searchQueryInput.value}});
+                const goToFolder = (f) => (activeFolderId.value == f.id) ? (lastFetchedQuery.value = null, router.push({name: 'danbooru-grid', query: {q: searchQueryInput.value || 'order:rank'}})) : router.push({name: 'danbooru-folder', params: {folderId: f.id}});
+                
+                const handleFolderButtonPress = () => {
+                    const name = folderName.value.trim();
+                    if (isEditing.value || !name) return (isEditing.value = !isEditing.value);
+                    if (danbooru.value.folders.some(f => f.name.toLowerCase() === name.toLowerCase())) return addToast({msg: 'Name exists.', type: 'error', source: 'danbooru'});
+                    const newFolder = {id: danbooru.value.nextFolderId++, name, postIds: []};
+                    danbooru.value.folders.push(newFolder); addToast({msg: `Folder "${name}" created.`, type: 'success', source: 'danbooru'});
+                    folderName.value = ''; goToFolder(newFolder);
+                };
+                const togglePostInFolder = (post, folder) => { const wasIn = folder.postIds.includes(post.id); folder.postIds = _.xor(folder.postIds, [post.id]); addToast({msg: `Post ${wasIn ? 'removed from' : 'added to'} "${folder.name}"`, type: wasIn ? 'info' : 'success', source: 'danbooru', duration: 2000}); };
+                const savedSearchName = ref(''), savedSearchAction = (action, item) => {
+                    action === 'save' ? (() => { const name = savedSearchName.value.trim(), prompt = searchQueryInput.value.trim(); if (!name) return addToast({msg: 'Name required.', type: 'error', source: 'danbooru'}); const existing = _.find(savedSearches.value, {name}); existing ? (existing.prompt = prompt) : savedSearches.value.push({name, prompt}); addToast({msg: `Saved "${name}".`, type: 'success', source: 'danbooru'}); savedSearchName.value = ''; })() : action === 'load' ? (searchQueryInput.value = item.prompt, savedSearchName.value = item.name, search()) : action === 'delete' ? (_.pull(savedSearches.value, item), addToast({msg: `Deleted "${item.name}".`, type: 'info', source: 'danbooru'})) : null;
+                };
+                const addTagToSearch = (t) => searchQueryInput.value = _.uniq([...(searchQueryInput.value||'').split(',').map(x=>x.trim()).filter(Boolean), t.replace(/_/g, ' ')]).join(', ');
+                const searchSingleTag = (t) => { searchQueryInput.value = t.replace(/_/g, ' '); search(); };
+                const toggleTagInSearch = (tag, searchItem) => { const raw = tag.replace(/ /g, '_'), p = searchItem.prompt || ''; if (p.includes('|')) { searchItem.prompt = _.xorBy(p.split('|').map(x => x.trim()).filter(Boolean), [raw], _.toLower).join(' | '); } else { const r = new RegExp(`(^|\\s)${_.escapeRegExp(raw)}($|\\s)`, 'i'); searchItem.prompt = r.test(p) ? p.replace(r, ' ').trim() : (p ? `${p} | ${raw}` : raw); } addToast({msg: `Updated "${searchItem.name}"`, type: 'success', source: 'danbooru', duration: 1000}); };
+
+                useInfiniteScroll(rightPanelRef, () => Object.values(ratingFilters.value).some(Boolean) && !isLoading.value && hasMorePages.value && gridRoutes.includes(route.name) && fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []), {distance: 1000});
+                provide('danbooruState', { posts: sortedPosts, isLoading, isLoadingMore: computed(() => isLoading.value && pageNum.value > 1), hasMorePages, statusMsg: computed(() => isLoading.value && !posts.value.length ? 'Searching...' : err.value ? `Error: ${err.value.message}` : !posts.value.length ? 'Search for images on Danbooru.' : `Showing ${posts.value.length} posts${hasMorePages.value ? ' (scroll for more)' : ''}`), hoveredImage, rightPanelRef, lastScrollPos, gridSize: toRef(danbooru.value, 'gridCols') });
+                provide('danbooruFolders', {folders: toRef(danbooru.value, 'folders'), isPostInFolder: (pid, fid) => _.includes(foldersById.value[fid]?.postIds, pid), togglePostInFolder});
+                provide('danbooruSearch', {onSearch: addTagToSearch, onSingle: searchSingleTag, savedSearches, onToggleSearch: toggleTagInSearch, isTagIn: (p, t) => (p||'').split((p||'').includes('|')?'|':/\s+/).map(x=>x.trim().toLowerCase()).includes(t.replace(/ /g,'_').toLowerCase())});
+                const featuredArtist = computed(() => { const a = _.head((displayedImage.value?.tag_string_artist || '').split(' ').filter(Boolean)); return a ? {name: a, type: 'artist'} : null; });
+
+                const {isOpen: isSavedOpen, root: savedRoot, close: closeSaved} = useDropdown();
+
+                return {
+                    danbooru, isLoading, search, searchQueryInput, displayedImage, rightPanelRef, newFolderName: folderName, isEditMode: isEditing, handleFolderButtonPress, goToFolder, activeFolderId, naiTagKnowledge, blacklist, sortOrder, ratingFilters, ratingMeta, savedSearches, savedSearchName, savedSearchAction, featuredArtist,
+                    folderBtn: computed(() => isEditing.value ? {icon: 'check', color: 'btn-info text-white'} : (folderName.value.trim() ? {icon: 'create_new_folder', color: 'btn-success text-white'} : {icon: 'drive_file_rename_outline', color: 'btn-ghost bg-white/5'})),
+                    displayedTags: computed(() => { const tags = displayedImage.value ? ['artist', 'copyright', 'character', 'general', 'meta'].flatMap(type => (displayedImage.value[`tag_string_${type}`] || '').split(' ').filter(Boolean).map(name => ({name, type}))) : []; return featuredArtist.value ? _.reject(tags, {name: featuredArtist.value.name, type: 'artist'}) : tags; }),
+                    addTagToSearch, searchSingleTag, toggleTagInSearch,
+                    deleteFolder: (f) => { _.remove(danbooru.value.folders, x => x.id === f.id); addToast({msg: `Deleted "${f.name}"`, type: 'info', source: 'danbooru'}); if (activeFolderId.value === f.id) router.push({name: 'danbooru-grid'}); },
+                    debouncedRenameFolder: useDebounceFn((f, n) => { if (!n.trim()) return addToast({msg: 'Empty name.', type: 'error', source: 'danbooru'}); if (danbooru.value.folders.some(x => x.id !== f.id && x.name.toLowerCase() === n.trim().toLowerCase())) return addToast({msg: 'Name taken.', type: 'error', source: 'danbooru'}); if (foldersById.value[f.id]) foldersById.value[f.id].name = n.trim(); }, 500),
+                    updateRatings: (t) => ratingFilters.value = _.mapValues(ratingFilters.value, (v, k) => !t || k === t),
+                    isSavedOpen, savedRoot, closeSaved
+                };
+            },
+            template: `
+                <div class="flex flex-col h-full">
+                    <div class="z-[200] shrink-0">
+                        <collapsible-panel storage-key="danbooru-search" flush>
+                            <template #header>
+                                <span>Danbooru Search</span>
+                                <div class="flex flex-1 items-center gap-2" @click.stop>
+                                    <div class="join flex-1 min-w-0 shadow-sm">
+                                        <div class="join-item flex-1 relative flex items-center bg-base-100 input input-sm input-bordered h-auto min-h-[2rem] py-0.5 px-2 focus-within:border-primary focus-within:z-10">
+                                            <div class="flex-1 w-full"><autocomplete-field tag="input" v-model:model-val="searchQueryInput" @keydown.enter.prevent="search" class="!border-none !shadow-none !bg-transparent !p-0 !h-6 !min-h-0 focus:outline-none w-full text-sm" placeholder="Search tags..."></autocomplete-field></div>
+                                        </div>
+                                        <button @click="search" class="join-item btn btn-primary btn-sm px-3" :disabled="isLoading"><span v-if="isLoading" class="loading loading-spinner loading-xs"></span><material-icon v-else icon="search" size="20"></material-icon></button>
+                                    </div>
+                                    <div ref="savedRoot" class="dropdown dropdown-end" :class="{'dropdown-open': isSavedOpen}" @mouseenter="isSavedOpen = true" @mouseleave="closeSaved">
+                                        <div tabindex="0" role="button" class="btn btn-sm glass-nested font-normal gap-2 px-3 text-white" @click.stop @mousedown.stop><material-icon icon="bookmarks" size="18"></material-icon><span>Saved</span></div>
+                                        <ul tabindex="0" class="dropdown-content z-[100] menu menu-sm p-2 shadow-2xl bg-base-200 rounded-box w-80 max-h-[500px] custom-scroll border border-white/10 gap-1">
+                                            <li class="mb-2"><div class="join flex w-full shadow-sm p-0 border border-white/10 !bg-base-100 cursor-default"><input v-model="savedSearchName" type="text" class="join-item input input-sm input-ghost flex-1 w-full min-w-0 text-xs focus:bg-transparent" placeholder="Save current search..." @keydown.enter.prevent="savedSearchAction('save')"><icon-btn class="join-item shrink-0" icon="save" color="btn-secondary" @click="savedSearchAction('save')"></icon-btn></div></li>
+                                            <li v-if="!savedSearches.length" class="text-neutral-500 text-xs text-center py-2 pointer-events-none"><span>No saved searches</span></li>
+                                            <li v-for="item in savedSearches" :key="item.name" class="relative group">
+                                                <a @click="savedSearchAction('load', item)" class="justify-between py-2"><span class="truncate pr-8">{{item.name}}<span class="text-neutral-500 text-xs ml-2 font-normal">{{_.truncate(item.prompt, {length: 25})}}</span></span></a>
+                                                <div class="absolute right-1 top-1/2 -translate-y-1/2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity bg-inherit px-1 rounded"><icon-btn icon="delete" size="btn-xs" color="text-error hover:bg-error/20 min-h-0" @click.stop="savedSearchAction('delete', item)" tooltip="Delete"></icon-btn></div>
+                                            </li>
+                                        </ul>
+                                    </div>
+                                    <div class="ml-2"><counter :count="danbooru.gridCols" :on-update="val => danbooru.gridCols = Math.max(1, Math.min(6, danbooru.gridCols + val))"><template #icon><material-icon icon="add_column_right" size="16"></material-icon></template></counter></div>
+                                </div>
+                            </template>
+                            <div class="flex flex-col gap-2 pt-2">
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <div class="grow shrink min-w-[150px] flex-1"><prompt-input tag="input" label="Blacklist" v-model="blacklist" is-uc placeholder="e.g. text, blur..." class="!min-h-0 !h-8 !p-0 !px-3 !pt-2 text-sm" @keydown.enter.prevent="search"></prompt-input></div>
+                                    <setting-input v-model="sortOrder" label="Sort" type="select" :options="[{val:'id',text:'ID'},{val:'score',text:'Score'}]" class="shrink-0 w-24"></setting-input>
+                                    <div class="join shadow-sm shrink-0 h-8">
+                                        <button class="join-item btn btn-sm px-2 h-full min-h-0 glass hover:bg-white/10 text-neutral-300" @click="updateRatings()">All</button>
+                                        <button v-for="r in ratingMeta" :key="r.k" class="join-item btn btn-sm px-2 h-full min-h-0" :class="ratingFilters[r.k] ? r.active : r.inactive" @click="ratingFilters[r.k] = !ratingFilters[r.k]" @dblclick.prevent="updateRatings(r.k)">{{r.label}}</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </collapsible-panel>
+                    </div>
+                    <div class="flex-1 min-h-0 relative">
+                        <split-pane config-key="splitSizesDanbooru" :min-size="[300, 400]" right-class="overflow-hidden">
+                            <template #left>
+                                <collapsible-panel storage-key="danbooru-tags" class="relative z-10">
+                                    <template #header><span class="mr-2">Tags</span><tag-pill v-if="featuredArtist" :tag="featuredArtist" :knowledge="naiTagKnowledge[featuredArtist.name]"></tag-pill></template>
+                                    <placeholder v-if="!displayedImage" icon="touch_app" text="Hover over or select an image to view its tags." class="py-6"></placeholder>
+                                    <div v-else class="flex flex-wrap gap-1.5"><tag-pill v-for="tag in displayedTags" :key="tag.name" :tag="tag" :knowledge="naiTagKnowledge[tag.name]"></tag-pill></div>
+                                </collapsible-panel>
+                                <collapsible-panel storage-key="danbooru-folders">
+                                    <template #header>
+                                        <div class="join w-full shadow-sm mr-2" @click.stop>
+                                            <input placeholder="New folder..." class="join-item input input-sm input-bordered w-full min-w-0 text-xs focus:z-10" v-model="newFolderName" :disabled="isEditMode" @keydown.enter.prevent="handleFolderButtonPress" />
+                                            <icon-btn class="join-item border-white/20" :color="folderBtn.color" :icon="folderBtn.icon" @click="handleFolderButtonPress"></icon-btn>
+                                        </div>
+                                    </template>
+                                    <div class="space-y-1 pt-1">
+                                        <div v-if="danbooru.folders.length === 0" class="text-center text-neutral-400 text-sm py-4">{{isEditMode ? 'Exit edit mode to create a folder.' : 'No folders created yet.'}}</div>
+                                        <transition-group name="list" tag="div" class="space-y-1">
+                                            <div v-for="folder in danbooru.folders" :key="folder.id" class="flex items-center gap-2 px-2 py-1 rounded-lg transition-colors" :class="activeFolderId == folder.id ? 'bg-primary/20' : 'hover:bg-base-300/40'">
+                                                <material-icon :icon="!isEditMode && activeFolderId == folder.id ? 'folder_open' : 'folder'" size="20" :class="isEditMode ? 'text-neutral-500' : 'text-primary'"></material-icon>
+                                                <span v-if="!isEditMode" class="flex-1 truncate font-medium cursor-pointer" @click="goToFolder(folder)">{{folder.name}}</span>
+                                                <input v-else :value="folder.name" @input="debouncedRenameFolder(folder, $event.target.value)" class="input input-xs bg-transparent border-b-primary border-0 rounded-none focus:outline-none focus:ring-0 w-full" />
+                                                <span v-if="!isEditMode" class="text-xs text-neutral-400">{{folder.postIds.length}}</span>
+                                                <icon-btn v-else icon="delete" size="btn-xs" color="btn-error" @click="deleteFolder(folder)"></icon-btn>
+                                            </div>
+                                        </transition-group>
+                                    </div>
+                                </collapsible-panel>
+                            </template>
+                            <template #right><div class="h-full overflow-y-auto custom-scroll" ref="rightPanelRef"><router-view v-slot="{Component}"><keep-alive><component :is="Component" /></keep-alive></router-view></div></template>
+                        </split-pane>
+                    </div>
+                </div>
+            `
+        };
+
+        const DanbooruGrid = {
+            template: `
+                <div v-if="isSingleView" class="flex flex-col items-center gap-4 p-4 pb-24 group min-h-full" @mouseleave="closeMenu">
+                    <div class="relative flex justify-center items-center w-full my-auto">
+                        <lazy-image v-if="currentImg" :key="currentImg.id" :src="'https://api.codetabs.com/v1/proxy/?quest=' + currentImg.file_url" :alt="currentImg.tag_string_general" :aspect-ratio="currentImg.image_width/currentImg.image_height" class="w-full max-w-2xl shadow-2xl rounded-lg relative">
+                            <folder-dropdown v-if="folders.length" class="opacity-0 group-hover:opacity-100 transition-opacity" menu-class="absolute top-2 right-2 dropdown-end" :post="currentImg"></folder-dropdown>
+                        </lazy-image>
+                        <placeholder v-else icon="image_search" text="Fetching image info..." class="skeleton w-full aspect-[2/3] max-w-2xl bg-white/5 rounded-lg"></placeholder>
+                    </div>
+                    <div class="sticky bottom-6 mt-auto z-[500]">
+                        <div class="join shadow-2xl border border-white/10 backdrop-blur-md bg-black/40">
+                            <icon-btn icon="arrow_back" size="btn-md" color="glass text-neutral-100 hover:bg-white/20 border-white/10 join-item" @click="nav(-1)"></icon-btn>
+                            <button @click="showGrid" class="join-item btn btn-md btn-primary px-8 border-white/10"><material-icon icon="grid_view" class="mr-2"></material-icon>Back to Grid</button>
+                            <icon-btn icon="arrow_forward" size="btn-md" color="glass text-neutral-100 hover:bg-white/20 border-white/10 join-item" @click="nav(1)"></icon-btn>
+                        </div>
+                    </div>
+                </div>
+                <div v-else>
+                    <div v-if="!isLoading && !posts.length" class="flex items-center justify-center h-[50vh]"><placeholder icon="image" :text="statusMsg"></placeholder></div>
+                    <div v-show="posts.length" class="masonry-grid w-full" :style="{'grid-template-columns': 'repeat(' + gridSize + ', 1fr)'}">
+                        <div v-for="post in posts" :key="post.id" class="grid-item group cursor-pointer" :class="{'col-span-2': (post.image_width / post.image_height) > 1.2}" @click="showSingle(post)" @mouseenter="hoveredImage = post" @mouseleave="hoveredImage = null; closeMenu($event)">
+                            <lazy-image :src="'https://api.codetabs.com/v1/proxy/?quest=' + post.large_file_url" :alt="post.tag_string_general" :aspect-ratio="post.image_width / post.image_height"><folder-dropdown v-if="folders.length" class="opacity-0 group-hover:opacity-100 transition-opacity" menu-class="absolute top-1 right-1 dropdown-end" :post="post"></folder-dropdown></lazy-image>
+                        </div>
+                    </div>
+                    <div v-if="isLoadingMore" class="text-center py-8"><span class="loading loading-spinner loading-lg"></span><p class="text-neutral-400 mt-2">Loading more...</p></div>
+                    <div v-else-if="posts.length && !hasMorePages" class="text-center py-8"><p class="text-neutral-400">No more images</p></div>
+                </div>`,
+            setup() {
+                const {posts, isLoading, isLoadingMore, hasMorePages, statusMsg, hoveredImage, rightPanelRef, lastScrollPos, gridSize} = inject('danbooruState'), {folders} = inject('danbooruFolders');
+                const router = useRouter(), route = useRoute(), activeId = ref(null);
+                const isSingleView = computed(() => route.name === 'danbooru-single'), currentImg = computed(() => activeId.value === null ? null : (_.find(posts.value, {id: activeId.value}) || hoveredImage.value));
+                watch(() => route.params.id, (id) => { activeId.value = id ? Number(id) : null; if (id && rightPanelRef.value) rightPanelRef.value.scrollTop = 0; else if (!id) nextTick(() => rightPanelRef.value && (rightPanelRef.value.scrollTop = lastScrollPos.value)); }, {immediate: true});
+                watch(activeId, async (id) => { if (id && !posts.value.some(p => p.id === id) && hoveredImage.value?.id !== id) try { const d = await (await fetch(`https://danbooru.donmai.us/posts/${id}.json`)).json(); if (d?.id === id && d.large_file_url && !d.is_banned) hoveredImage.value = d; } catch {} });
+                const nav = (o) => { if (!currentImg.value && !posts.value.length) return; const i = posts.value.findIndex(p => p.id === activeId.value); router.push({path: `/danbooru/${posts.value[(i === -1 ? 0 : i + o + posts.value.length) % posts.value.length].id}`, query: route.query}); };
+                onKeyStroke(['ArrowLeft', 'ArrowRight', 'Escape'], (e) => { if (document.activeElement?.closest('input, textarea') || !isSingleView.value) return; e.preventDefault(); e.key === 'Escape' ? router.push({name: 'danbooru-grid', query: route.query}) : nav(e.key === 'ArrowLeft' ? -1 : 1); });
+                return {posts, isLoading, isLoadingMore, hasMorePages, statusMsg, hoveredImage, gridSize, folders, isSingleView, currentImg, showSingle: (p) => router.push({path: `/danbooru/${p.id}`, query: route.query}), showGrid: () => router.push({name: 'danbooru-grid', query: route.query}), nav, closeMenu: (e) => (document.activeElement && e.currentTarget.contains(document.activeElement)) && document.activeElement.blur()};
+            }
+        };
+
+        const NAITagTest = {
+            setup() {
+                const store = useAppStore(), {config, queue, addReqs, clearQueueBySource, isDispatcherRunning, isApiHalted} = store;
+                const {tagTest, genConfig} = toRefs(config.value), urlManager = useObjectURLManager();
+                const isTestActive = ref(false), currentSessionId = ref(0), actionStatusMsg = ref('Ready to start testing'), judgedPairsNum = ref(0), generatedImageNum = ref(0), displayQueue = [], resultsStore = reactive({tags: {}, control: {}}), totalTests = ref(0), emptyPair = {imageA: null, imageB: null, tagA: '', tagB: ''}, currentImages = reactive({...emptyPair});
+                const pendingJobs = computed(() => queue.value.reduce((total, req) => total + (req.source === 'tagTest'), 0));
+                const formattedResults = computed(() => {
+                    const {isControl, shouldFilterMiddleResults: filter} = tagTest.value, {tags, control} = resultsStore;
+                    const list = _.orderBy([...Object.keys(tags), ...(isControl && !_.isEmpty(control) ? ['Control'] : [])].map(name => { const d = name === 'Control' ? control : tags[name], total = d.wins + d.losses; return {name, score: +(total ? (d.wins / total) * 100 : 50).toFixed(1), tests: total, ...d}; }), 'score', 'desc');
+                    return filter ? list.filter(r => r.score < 33 || r.score > 66) || list : list;
+                });
+                const progressText = computed(() => { if (!isTestActive.value && judgedPairsNum.value === 0) return ''; return `(${judgedPairsNum.value + (currentImages.imageA ? 1 : 0)} / ${generatedImageNum.value / 2} / ${tagTest.value.isInfinite ? '∞' : totalTests.value})`; });
+                const shouldShowComparisonUI = computed(() => isTestActive.value || currentImages.imageA);
+                const getTaggedString = (baseString, tag, isUcTarget) => { const {tagTarget, tagPos, tagStrength: s} = tagTest.value; if (tagTarget !== (isUcTarget ? 'uc' : 'prompt')) return baseString; const t = s == 1 ? tag : `(${tag}:${s.toFixed(2)})`; return tagPos === 'beginning' ? `${t}, ${baseString}` : `${baseString}, ${t}`; };
+                const displayNextPair = () => { const nextPair = displayQueue.shift(); Object.assign(currentImages, nextPair || emptyPair); if (nextPair) return actionStatusMsg.value = 'Ready for evaluation.'; const isFinished = !tagTest.value.isInfinite && totalTests.value > 0 && judgedPairsNum.value >= totalTests.value; if (isTestActive.value && isFinished && !pendingJobs.value) { isTestActive.value = false; actionStatusMsg.value = 'Testing complete!'; } else actionStatusMsg.value = isTestActive.value ? 'Waiting for next pair...' : (judgedPairsNum.value > 0 ? 'Testing complete!' : 'Ready to start testing'); };
+                const imgGenCallback = (err, {blob, context} = {}) => { if (err || context.sessionId !== currentSessionId.value) return err && (actionStatusMsg.value = `Error: ${err.message}`); generatedImageNum.value++; const {pair, imageKey} = context; pair[imageKey] = urlManager.create(blob); if (pair.imageA_url && pair.imageB_url) { const [itemA, itemB] = _.shuffle([{image: pair.imageA_url, tag: pair.tagA}, {image: pair.imageB_url, tag: pair.tagB}]); displayQueue.push({imageA: itemA.image, tagA: itemA.tag, imageB: itemB.image, tagB: itemB.tag}); if (!currentImages.imageA) displayNextPair(); } };
+                const buildAndAddReqs = () => {
+                    const {tagsToTest, isControl, iterations: iters, isInfinite, prompts: raw, unwantedContent: baseUc} = tagTest.value, tags = _.compact(tagsToTest.split('\n').map(l => l.trim())), prompts = raw.map(i => parsePrompt(i.val)).map(p => ({prompt: p.positive, uc: _.compact([p.negative, baseUc]).join(', ')})).filter(p => p.prompt);
+                    if (tags.length < (isControl ? 1 : 2) || !prompts.length) return (actionStatusMsg.value = `Error: Missing resources.`) && (isTestActive.value = false);
+                    const pairs = isControl ? tags.map(tag1 => ({tag1, isCtrl: true})) : tags.flatMap((tag1, i) => tags.slice(i + 1).map(tag2 => ({tag1, tag2})));
+                    const reqs = _.flatMap(_.range(isInfinite ? 1 : iters), () => _.shuffle(pairs).flatMap(pair => { const {prompt, uc} = _.sample(prompts), seed = _.random(9e15), ctx = {}; return ['A', 'B'].map((lbl, i) => { const active = i ? (pair.tag2 || pair.tag1) : (pair.isCtrl ? null : pair.tag1); ctx[`tag${lbl}`] = active || 'Control'; return {source: 'tagTest', seed, genConfig: prepareGenConfig(genConfig.value), callback: imgGenCallback, onStatusUpdate: m => actionStatusMsg.value = m, prompt: active ? getTaggedString(prompt, active, false) : prompt, uc: active ? getTaggedString(uc, active, true) : uc, context: {pair: ctx, imageKey: `image${lbl}_url`, sessionId: currentSessionId.value}}; }); }));
+                    totalTests.value += reqs.length / 2; addReqs(reqs);
+                };
+                const startTesting = () => { if (isTestActive.value) { stopTesting(); return; } if (!config.value.app.apiKey) return actionStatusMsg.value = 'Error: API Key is missing.'; isApiHalted.value = false; isTestActive.value = true; currentSessionId.value++; actionStatusMsg.value = isDispatcherRunning.value ? 'Waiting...' : 'Initializing...'; urlManager.revokeAll(); resultsStore.tags = {}; resultsStore.control = {wins:0,losses:0,skips:0}; judgedPairsNum.value = 0; generatedImageNum.value = 0; totalTests.value = 0; displayQueue.length = 0; Object.assign(currentImages, emptyPair); buildAndAddReqs(); };
+                const stopTesting = () => { isTestActive.value = false; clearQueueBySource('tagTest'); currentSessionId.value++; urlManager.revokeAll(); displayQueue.length = 0; displayNextPair(); };
+                watch(isApiHalted, (val) => { if(val && isTestActive.value) { stopTesting(); actionStatusMsg.value = 'Testing halted: Invalid API Key.'; } });
+                watch(pendingJobs, (num) => { if (!num && isTestActive.value && tagTest.value.isInfinite && !isApiHalted.value) { actionStatusMsg.value = 'Starting next iteration...'; buildAndAddReqs(); } });
+                const recordJudgement = (choice) => { if (!currentImages.imageA) return; judgedPairsNum.value++; const {tagA, tagB} = currentImages; const upd = (w, l, s) => { const S = (t) => (t === 'Control' ? resultsStore.control : (resultsStore.tags[t] ??= {wins:0,losses:0,skips:0})); S(w)[s?'skips':'wins']++; S(l)[s?'skips':'losses']++; }; choice === 'skip' ? upd(tagA, tagB, true) : upd(choice === 'A' ? tagA : tagB, choice === 'A' ? tagB : tagA); displayNextPair(); };
+                const getOpt = (l, k, v, c) => ({label: l, active: tagTest.value[k] === v, onClick: () => tagTest.value[k] = v, activeClass: c});
+                return { tagTest, genConfig, isTestActive, currentImages, formattedResults, actionStatusMsg, progressText, startTesting, recordJudgement, shouldShowComparisonUI, tagStrengthMin: computed(() => tagTest.value.hasExtendedRange ? 0.1 : 0.5), tagStrengthMax: computed(() => tagTest.value.hasExtendedRange ? 5.0 : 2.0), stopTesting, toRef, tagPosOptions: computed(() => [getOpt('Start', 'tagPos', 'beginning'), getOpt('End', 'tagPos', 'end')]), tagTargetOptions: computed(() => [getOpt('Prompt', 'tagTarget', 'prompt'), getOpt('UC', 'tagTarget', 'uc', 'btn-error text-white')]), modeOptions: computed(() => [getOpt('Control', 'isControl', true), getOpt('Tag vs Tag', 'isControl', false)]) };
+            },
+            template:`
+                <div class="flex flex-col h-full"><div class="z-10 shrink-0"><collapsible-panel storage-key="tag-test-settings" flush><template #header><span>Tag Test</span><button @click.stop="isTestActive ? stopTesting() : startTesting()" class="btn btn-sm flex-1 mx-4 shadow-lg" :class="isTestActive ? 'btn-error' : 'btn-primary'">{{isTestActive ? 'Stop' : 'Start'}}</button></template><template #actions><div class="flex items-center gap-1"><counter :count="tagTest.iterations" :on-update="v => tagTest.iterations = Math.max(1, tagTest.iterations + v)" :class="{'opacity-50 pointer-events-none': tagTest.isInfinite}"><template #icon><material-icon icon="repeat" size="16"></material-icon></template></counter><icon-btn icon="all_inclusive" :color="tagTest.isInfinite?'btn-primary text-white':'glass-nested text-neutral-500'" size="btn-sm min-h-0 border-white/10" @click="tagTest.isInfinite=!tagTest.isInfinite"></icon-btn></div></template><div class="flex flex-col gap-1 pt-1"><segmented-control :options="modeOptions" height="h-8" font-size="text-xs"></segmented-control><div class="text-center px-1 h-4"><transition name="fade" mode="out-in"><span :key="tagTest.isControl" class="text-[10px] text-neutral-400 tracking-wide block">{{tagTest.isControl ? 'Compare tagged vs. untagged base' : 'Compare two different tags directly'}}</span></transition></div></div></collapsible-panel></div>
+                    <div class="flex-1 min-h-0 relative"><split-pane config-key="splitSizes" :min-size="[400, 300]">
+                            <template #left>
+                                <prompt-list title="Prompts & UC" storage-key="prompts-uc" :items="tagTest.prompts" :id-ref="toRef(tagTest, 'nextPromptId')" icon="playlist_add" placeholder="1girl, blue hair... Use '--' for prompt-specific UCs"><template #footer><div class="my-4 border-t border-white/5"></div><prompt-input label="Global Negative" v-model="tagTest.unwantedContent" is-uc placeholder="Global unwanted content..."></prompt-input></template></prompt-list>
+                                <collapsible-panel title="Tags to Test" storage-key="tags-to-test">
+                                    <div class="mb-3 pt-2"><prompt-input label="Tags" v-model="tagTest.tagsToTest" placeholder="Enter tags separated by newlines..."></prompt-input></div>
+                                    <div class="grid grid-cols-2 gap-3 mb-3"><segmented-control :options="tagPosOptions" height="h-9" font-size="text-[11px] font-bold"></segmented-control><segmented-control :options="tagTargetOptions" height="h-9" font-size="text-[11px] font-bold"></segmented-control></div>
+                                    <setting-input v-model="tagTest.tagStrength" :min="tagStrengthMin" :max="tagStrengthMax" :step="0.05" type="range" number><template #prefix><label class="swap swap-rotate w-6 h-6 -ml-1 flex items-center justify-center cursor-pointer text-neutral-400 hover:text-warning transition-colors z-20"><input v-model="tagTest.hasExtendedRange" type="checkbox" class="hidden" /><material-icon icon="bolt" :size="20" class="swap-on text-warning leading-none"></material-icon><material-icon icon="bolt" :size="20" class="swap-off leading-none"></material-icon></label></template></setting-input>
+                                </collapsible-panel>
+                                <generation-settings-panel :config="genConfig"></generation-settings-panel>
+                            </template>
+                            <template #right>
+                                <collapsible-panel title="Image Comparison" storage-key="img-comparison"><template #actions><label class="label cursor-pointer p-0 gap-2" @click.stop><span class="label-text text-xs text-neutral-400">Show Tags</span><input v-model="tagTest.areTagsVisible" type="checkbox" class="toggle toggle-xs toggle-primary" /></label></template>
+                                    <div class="text-center text-neutral-300 mb-4"><p class="font-semibold">{{actionStatusMsg}}</p><p class="text-sm">{{progressText}}</p></div>
+                                    <transition name="fade"><div v-if="shouldShowComparisonUI" class="space-y-3"><div class="grid grid-cols-2 gap-3"><div v-for="(image, key) in [{url: currentImages.imageA, tag: currentImages.tagA, name: 'A'}, {url: currentImages.imageB, tag: currentImages.tagB, name: 'B'}]" :key="key"><div class="glass rounded-lg p-3 aspect-square flex items-center justify-center min-w-[256px]"><image-viewer :src="image.url" :alt="'Image '+image.name" :text="'Image '+image.name"></image-viewer></div><div v-if="tagTest.areTagsVisible" class="text-center mt-1.5 text-neutral-300">{{image.tag}}</div></div></div><div class="space-y-2.5"><div class="grid grid-cols-2 gap-2.5"><button @click="recordJudgement('A')" :disabled="!(currentImages.imageA && currentImages.imageB)" class="btn btn-primary">I prefer Image A</button><button @click="recordJudgement('B')" :disabled="!(currentImages.imageA && currentImages.imageB)" class="btn btn-primary">I prefer Image B</button></div><button @click="recordJudgement('skip')" :disabled="!(currentImages.imageA && currentImages.imageB)" class="btn btn-neutral w-full">Skip</button></div></div></transition>
+                                </collapsible-panel>
+                                <collapsible-panel title="Results" storage-key="results-panel"><template #actions><label class="label cursor-pointer p-0 gap-2" @click.stop><span class="label-text text-xs text-neutral-400">Hide Middle</span><input v-model="tagTest.shouldFilterMiddleResults" type="checkbox" class="toggle toggle-xs toggle-primary" /></label></template>
+                                    <transition-group tag="div" name="list" class="space-y-2 mb-4"><div v-for="result in formattedResults" :key="result.name" class="flex items-center gap-2"><div class="w-20 text-neutral-100 text-sm truncate">{{result.name}}</div><div class="flex-1 rounded-full h-4 relative bg-neutral-800 overflow-hidden"><div :style="{width: result.score + '%'}" class="h-full bg-gradient-to-r from-warning to-primary transition-[width] duration-[400ms] ease-out"></div><div class="absolute inset-0 flex items-center justify-center text-neutral-100 text-xs font-medium">{{result.score}}%</div></div><div class="text-xs text-neutral-400">{{result.tests}} tests</div></div></transition-group>
+                                    <div class="overflow-x-auto max-h-48 custom-scroll"><table class="table table-sm"><thead><tr><th>Tag</th><th>Score</th><th>W/L</th><th>Skips</th></tr></thead><tbody><tr v-for="result in formattedResults" :key="result.name"><td>{{result.name}}</td><td>{{result.score}}%</td><td>{{result.wins}}/{{result.losses}}</td><td>{{result.skips}}</td></tr></tbody></table></div>
+                                </collapsible-panel>
+                            </template>
+                        </split-pane></div></div>`
+        }
+        
+        // --- Gemini API Composable ---
+        const CANDIDATE_BLOCK_REASONS = new Set(['SAFETY','IMAGE_SAFETY','IMAGE_PROHIBITED_CONTENT','PROHIBITED_CONTENT','RECITATION','IMAGE_RECITATION','OTHER','IMAGE_OTHER','NO_IMAGE','BLOCKLIST','SPII']);
+        const TERMINAL_FINISH_REASONS = new Set(['LANGUAGE','MODEL_ARMOR']);
+
+        const useGeminiAPI = createGlobalState(() => {
+            const store = useAppStore();
+            const messages = ref([]);
+            const gallery = ref([]);
+            const generating = ref(false);
+            const generatingMsgId = ref(null);
+            const abortCtrl = ref(null);
+            const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview';
+
+            const createVariant = () => reactive({id: uid(), parts: [], _thinking: '', _text: '', _images: [], _usage: null, _error: null, _blockReason: null, _isPromptBlock: false, timestamp: null});
+
+            const getMsgParts = (msg) => {
+                if (msg.role === 'model' && msg.variants) { const v = msg.variants[msg.activeVariant] ?? msg.variants[0]; return v ? v.parts : []; }
+                const parts = [];
+                for (const img of (msg.images || [])) { if (!img.hidden) parts.push({inlineData: {data: img.data, mimeType: img.mimeType}}); }
+                if (msg.text) parts.push({text: msg.text});
+                return parts;
+            };
+            const buildBody = (contents) => {
+                const cfg = store.config.value.gemini;
+                const genCfg = {responseModalities: ['TEXT','IMAGE'], thinkingConfig: {thinkingLevel: cfg.thinkingLevel, includeThoughts: cfg.thinkingLevel === 'HIGH'}};
+                const imgCfg = {};
+                if (cfg.aspectRatio && cfg.aspectRatio !== 'auto') imgCfg.aspectRatio = cfg.aspectRatio;
+                if (cfg.imageSize) imgCfg.imageSize = cfg.imageSize;
+                if (Object.keys(imgCfg).length) genCfg.imageConfig = imgCfg;
+                return {contents, generationConfig: genCfg};
+            };
+            const getContents = (endIdx) => messages.value.slice(0, endIdx).filter(m => !m.hidden).map(m => ({role: m.role, parts: getMsgParts(m)}));
+
+            async function* parseSSE(res) {
+                const reader = res.body.getReader(), dec = new TextDecoder(); let buf = '';
+                while (true) {
+                    const {done, value} = await reader.read(); if (done) break;
+                    buf += dec.decode(value, {stream: true}); let idx;
+                    while ((idx = buf.indexOf('\n')) !== -1) {
+                        const line = buf.substring(0, idx).trim(); buf = buf.substring(idx + 1);
+                        if (line.startsWith('data: ')) { const d = line.substring(6); if (d === '[DONE]') return; try { yield JSON.parse(d); } catch {} }
+                    }
+                }
+            }
+            const extractDisplay = (parts) => {
+                let thinking = '', text = ''; const images = [];
+                for (const p of parts) { if (p.thought && p.text) thinking += p.text; else if (p.text) text += p.text; if (p.inlineData) images.push({mimeType: p.inlineData.mimeType, data: p.inlineData.data}); }
+                return {thinking, text, images};
+            };
+
+            const streamToVariant = async (msgId, varIdx, contents, promptTxt) => {
+                const getV = () => messages.value.find(m => m.id === msgId)?.variants[varIdx];
+                const res = await fetch(`${API_BASE}:streamGenerateContent?alt=sse`, {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json','x-goog-api-key': store.config.value.gemini.apiKey},
+                    body: JSON.stringify(buildBody(contents)), signal: abortCtrl.value.signal
+                });
+                if (!res.ok) {
+                    const errData = await res.json().catch(() => null);
+                    const msg = errData?.error?.message || `HTTP ${res.status}`;
+                    const e = new Error(msg); e.status = res.status;
+                    if ([429, 500, 502, 503, 504].includes(res.status)) e.isRetryable = true;
+                    if (res.status === 400 && /quota|resource.?exhausted/i.test(msg)) e.isRetryable = true;
+                    throw e;
+                }
+                const allParts = []; let finalFinishReason = null;
+                for await (const chunk of parseSSE(res)) {
+                    if (chunk.promptFeedback?.blockReason) {
+                        const e = new Error(`Prompt blocked: ${chunk.promptFeedback.blockReason}`);
+                        e.isPromptBlock = true; e.blockReason = chunk.promptFeedback.blockReason; throw e;
+                    }
+                    const cand = chunk.candidates?.[0];
+                    if (cand?.content?.parts) for (const p of cand.content.parts) allParts.push(p);
+                    if (cand?.finishReason) finalFinishReason = cand.finishReason;
+                    const disp = extractDisplay(allParts), v = getV();
+                    if (v) { v._thinking = disp.thinking; v._text = disp.text; v._images = disp.images; if (chunk.usageMetadata) v._usage = chunk.usageMetadata; }
+                }
+                if (CANDIDATE_BLOCK_REASONS.has(finalFinishReason)) { const e = new Error(`Output blocked: ${finalFinishReason}`); e.isCandidateBlock = true; e.blockReason = finalFinishReason; throw e; }
+                if (TERMINAL_FINISH_REASONS.has(finalFinishReason)) { const e = new Error(`Generation stopped: ${finalFinishReason}`); e.isTerminal = true; e.blockReason = finalFinishReason; throw e; }
+                const v = getV();
+                if (!v?._images?.length) { const reason = finalFinishReason || 'EMPTY'; const e = new Error(v?._text ? `No image generated (${reason})` : `Empty response (${reason})`); e.isCandidateBlock = true; e.blockReason = reason; throw e; }
+                if (v) { v.parts = allParts; v.timestamp = Date.now(); for (const img of v._images) gallery.value.push({id: uid(), mimeType: img.mimeType, data: img.data, prompt: promptTxt, timestamp: Date.now()}); }
+            };
+
+            // Shared retry-loop error handler — returns true to continue, false to break
+            const handleStreamError = async (err, v, retryCount, onNewVariant) => {
+                if (err.name === 'AbortError') { if (v) { v._error = 'Request cancelled.'; v.timestamp = Date.now(); } return false; }
+                if (err.isRetryable && retryCount.value < 6) {
+                    retryCount.value++;
+                    const delay = Math.min(Math.pow(2, retryCount.value) * 500 + Math.random() * 500, 30000);
+                    store.addToast({msg: `${err.status === 429 ? 'Rate limited' : 'Server error'}, retrying (${retryCount.value}/6)…`, type: 'warning', duration: delay + 500});
+                    try { await abortableSleep(delay, abortCtrl.value?.signal); } catch { if (v) { v._error = 'Request cancelled.'; v.timestamp = Date.now(); } return false; }
+                    return true;
+                }
+                if (err.isTerminal) { if (v) { v._error = `Stopped: ${err.blockReason}`; v._blockReason = err.blockReason; v.timestamp = Date.now(); } store.addToast({msg: `Generation stopped: ${err.blockReason}`, type: 'error'}); return false; }
+                if (err.isPromptBlock) { if (v) { v._error = err.message; v._blockReason = err.blockReason; v._isPromptBlock = true; v.timestamp = Date.now(); } store.addToast({msg: err.message, type: 'error'}); return false; }
+                if (err.isCandidateBlock) {
+                    if (v) { v._error = err.message; v._blockReason = err.blockReason; v.timestamp = Date.now(); }
+                    if (store.config.value.gemini.autoRetry) { store.addToast({msg: `Blocked (${err.blockReason}), retrying…`, type: 'warning', duration: 1500}); onNewVariant(); retryCount.value = 0; return true; }
+                    return false;
+                }
+                if (v) { v._error = err.message || 'Unknown error'; v.timestamp = Date.now(); }
+                store.addToast({msg: err.message || 'Generation failed', type: 'error'}); return false;
+            };
+
+            const sendMessage = async (text, imgs, scrollFn) => {
+                if (!text && !imgs.length) return;
+                if (!store.config.value.gemini?.apiKey) { store.addToast({msg: 'Set your Gemini API key in Settings', type: 'error'}); return; }
+                if (generating.value) return;
+                const userMsg = reactive({id: uid(), role: 'user', images: imgs.map(i => ({id: uid(), data: i.data, mimeType: i.mimeType, name: i.name, hidden: false})), text: text || '', hidden: false, timestamp: Date.now()});
+                messages.value.push(userMsg);
+                const modelMsg = reactive({id: uid(), role: 'model', hidden: false, variants: [createVariant()], activeVariant: 0});
+                messages.value.push(modelMsg);
+                abortCtrl.value = new AbortController();
+                generating.value = true; generatingMsgId.value = modelMsg.id; scrollFn?.();
+                const modelIdx = messages.value.indexOf(modelMsg), contents = getContents(modelIdx), retryCount = ref(0);
+                while (true) {
+                    const varIdx = modelMsg.activeVariant, v = modelMsg.variants[varIdx];
+                    try { await streamToVariant(modelMsg.id, varIdx, contents, text); break; }
+                    catch (err) { if (!await handleStreamError(err, v, retryCount, () => { modelMsg.variants.push(createVariant()); modelMsg.activeVariant = modelMsg.variants.length - 1; })) break; }
+                }
+                generating.value = false; generatingMsgId.value = null; abortCtrl.value = null; scrollFn?.();
+            };
+
+            const regenerateMessage = async (msgId) => {
+                const msg = messages.value.find(m => m.id === msgId);
+                if (!msg || msg.role !== 'model' || generating.value) return;
+                if (!store.config.value.gemini?.apiKey) { store.addToast({msg: 'Set your Gemini API key first', type: 'error'}); return; }
+                msg.variants.push(createVariant()); msg.activeVariant = msg.variants.length - 1;
+                abortCtrl.value = new AbortController(); generating.value = true; generatingMsgId.value = msg.id;
+                const msgIdx = messages.value.indexOf(msg), contents = getContents(msgIdx), retryCount = ref(0);
+                let promptTxt = ''; for (let i = msgIdx - 1; i >= 0; i--) { if (messages.value[i].role === 'user') { promptTxt = messages.value[i].text || ''; break; } }
+                while (true) {
+                    const varIdx = msg.activeVariant, v = msg.variants[varIdx];
+                    try { await streamToVariant(msgId, varIdx, contents, promptTxt); break; }
+                    catch (err) { if (!await handleStreamError(err, v, retryCount, () => { msg.variants.push(createVariant()); msg.activeVariant = msg.variants.length - 1; })) break; }
+                }
+                generating.value = false; generatingMsgId.value = null; abortCtrl.value = null;
+            };
+
+            const deleteMessage = (msgId) => {
+                const msg = messages.value.find(m => m.id === msgId); if (!msg) return;
+                if (msg.role === 'model' && msg.variants?.length > 1) {
+                    const vi = msg.activeVariant; msg.variants.splice(vi, 1); msg.activeVariant = Math.min(vi, msg.variants.length - 1);
+                    store.addToast({msg: 'Variant deleted', type: 'success', duration: 2000}); return;
+                }
+                const idx = messages.value.findIndex(m => m.id === msgId); if (idx !== -1) { messages.value.splice(idx, 1); store.addToast({msg: 'Message deleted', type: 'success', duration: 2000}); }
+            };
+            const deleteAllVariants = (msgId) => {
+                const idx = messages.value.findIndex(m => m.id === msgId);
+                if (idx !== -1) { messages.value.splice(idx, 1); store.addToast({msg: 'All variants deleted', type: 'success', duration: 2000}); }
+            };
+            const newChat = () => { messages.value = []; gallery.value = []; };
+            const abort = () => abortCtrl.value?.abort();
+
+            return {messages, gallery, generating, generatingMsgId, sendMessage, regenerateMessage, deleteMessage, deleteAllVariants, newChat, abort};
+        });
+
+        // --- ChatMessage Component ---
+        const ChatMessage = {
+            props: ['msg', 'editState'],
+            emits: ['open-lightbox', 'update:editState', 'request-edit-upload', 'use-as-input'],
+            setup(props, {emit}) {
+                const store = useAppStore();
+                const {generating, generatingMsgId, regenerateMessage, deleteMessage, deleteAllVariants} = useGeminiAPI();
+
+                const isGen = computed(() => generatingMsgId.value === props.msg.id);
+                const variant = computed(() => props.msg.variants?.[props.msg.activeVariant] ?? props.msg.variants?.[0] ?? null);
+                const isAwaitingContent = computed(() => isGen.value && !variant.value?._text && !variant.value?._error && !variant.value?._images?.length);
+                const isEditing = computed(() => props.editState?.msgId === props.msg.id);
+
+                const toggleHide = () => { props.msg.hidden = !props.msg.hidden; store.addToast({msg: props.msg.hidden ? 'Hidden from model' : 'Visible to model', type: 'success', duration: 2000}); };
+                const toggleHideImage = (imgId) => { const img = props.msg.images?.find(i => i.id === imgId); if (img) { img.hidden = !img.hidden; store.addToast({msg: img.hidden ? 'Image hidden from model' : 'Image shown to model', type: 'success', duration: 1500}); } };
+                const deleteImage = (imgId) => { if (!props.msg.images) return; const i = props.msg.images.findIndex(x => x.id === imgId); if (i !== -1) props.msg.images.splice(i, 1); };
+                const navigateVariant = (dir) => { const m = props.msg; m.activeVariant = Math.max(0, Math.min(m.variants.length - 1, m.activeVariant + dir)); };
+                const startEdit = () => emit('update:editState', {msgId: props.msg.id, text: props.msg.text || '', images: (props.msg.images || []).map(i => ({...i}))});
+                const saveEdit = () => {
+                    const es = props.editState; if (!es) return;
+                    const t = es.text.trim();
+                    if (!t && !es.images.length) { store.addToast({msg: 'Message cannot be empty', type: 'error'}); return; }
+                    props.msg.text = t; props.msg.images = es.images;
+                    emit('update:editState', null);
+                    store.addToast({msg: 'Message edited', type: 'success', duration: 2000});
+                };
+
+                return {isGen, variant, isAwaitingContent, isEditing, imgSrc, fmtTokens, markdownParse, downloadImage,
+                        toggleHide, toggleHideImage, deleteImage, navigateVariant, startEdit, saveEdit,
+                        regenerateMessage, deleteMessage, deleteAllVariants, emit};
+            },
+            template: `
+<div v-if="msg.role === 'user'" class="chat chat-end group/umsg">
+  <div class="chat-image avatar">
+    <div class="w-8 h-8 rounded-full bg-primary/15 border border-primary/20 flex items-center justify-center shrink-0">
+      <material-icon icon="person" :size="16" class="text-primary/70"></material-icon>
+    </div>
+  </div>
+  <div v-if="isEditing" class="chat-bubble bubble-user max-w-[90%] p-3 space-y-2.5">
+    <textarea v-model="editState.text" class="textarea textarea-bordered w-full text-sm min-h-[64px] bg-base-100/40 resize-none leading-relaxed" rows="3" @keydown.ctrl.enter.prevent="saveEdit"></textarea>
+    <div class="flex flex-wrap gap-1.5">
+      <div v-for="(img, i) in editState.images" :key="img.id" class="relative group/eimg shrink-0">
+        <img :src="imgSrc(img)" class="h-14 w-14 object-cover rounded-lg border border-white/20 block">
+        <button @click="editState.images.splice(i, 1)" class="absolute -top-1.5 -right-1.5 btn btn-xs btn-circle btn-error min-h-0 h-5 w-5 p-0 opacity-0 group-hover/eimg:opacity-100 transition-opacity shadow-sm">
+          <material-icon icon="close" :size="10"></material-icon>
+        </button>
+      </div>
+      <button @click="emit('request-edit-upload')" class="h-14 w-14 shrink-0 rounded-lg border-2 border-dashed border-white/20 flex items-center justify-center text-neutral-500 hover:text-neutral-300 hover:border-white/40 transition-colors">
+        <material-icon icon="add_photo_alternate" :size="20"></material-icon>
+      </button>
+    </div>
+    <div class="flex gap-2 justify-end">
+      <button @click="saveEdit" class="btn btn-primary btn-xs shadow-sm">Save</button>
+      <button @click="emit('update:editState', null)" class="btn btn-ghost btn-xs">Cancel</button>
+    </div>
+  </div>
+  <div v-else class="chat-bubble bubble-user max-w-[82%]" :class="msg.hidden ? 'opacity-40 !border-dashed' : ''">
+    <div v-if="msg.hidden" class="flex items-center gap-1 text-xs text-neutral-500 mb-1.5 pb-1.5 border-b border-white/10">
+      <material-icon icon="visibility_off" :size="12"></material-icon><span>Hidden from model</span>
+    </div>
+    <div v-if="msg.images && msg.images.length" class="flex flex-wrap gap-1.5 mb-2">
+      <div v-for="img in msg.images" :key="img.id" class="relative group/uimg shrink-0" :class="img.hidden ? 'opacity-40' : ''">
+        <img :src="imgSrc(img)" class="max-h-28 max-w-[8rem] object-cover rounded-xl border border-white/10 cursor-pointer block" @click="emit('open-lightbox', imgSrc(img))">
+        <div v-if="img.hidden" class="absolute inset-0 flex items-center justify-center bg-black/40 rounded-xl pointer-events-none">
+          <material-icon icon="visibility_off" :size="14" class="text-white/70"></material-icon>
+        </div>
+        <div class="absolute top-1 right-1 flex gap-0.5 opacity-0 group-hover/uimg:opacity-100 transition-opacity">
+          <button @click.stop="toggleHideImage(img.id)" class="btn btn-xs bg-black/65 hover:bg-black/85 text-white border-none min-h-0 h-6 w-6 p-0 rounded-md" :title="img.hidden ? 'Show to model' : 'Hide from model'">
+            <material-icon :icon="img.hidden ? 'visibility' : 'visibility_off'" :size="12"></material-icon>
+          </button>
+          <button @click.stop="deleteImage(img.id)" class="btn btn-xs bg-black/65 hover:bg-error text-white border-none min-h-0 h-6 w-6 p-0 rounded-md" title="Remove image">
+            <material-icon icon="delete" :size="12"></material-icon>
+          </button>
+        </div>
+      </div>
+    </div>
+    <p v-if="msg.text" class="text-sm whitespace-pre-wrap leading-relaxed">{{msg.text}}</p>
+  </div>
+  <div v-if="!isEditing" class="chat-footer flex gap-0.5 mt-1 opacity-0 group-hover/umsg:opacity-100 focus-within:opacity-100 transition-opacity justify-end">
+    <button @click="startEdit" class="btn btn-ghost btn-xs btn-circle" title="Edit"><material-icon icon="edit" :size="13"></material-icon></button>
+    <button @click="toggleHide" class="btn btn-ghost btn-xs btn-circle" :title="msg.hidden ? 'Show' : 'Hide'"><material-icon :icon="msg.hidden ? 'visibility' : 'visibility_off'" :size="13"></material-icon></button>
+    <button @click="deleteMessage(msg.id)" class="btn btn-ghost btn-xs btn-circle text-error/70 hover:text-error" title="Delete"><material-icon icon="delete" :size="13"></material-icon></button>
+  </div>
+</div>
+<div v-else class="chat chat-start group/mmsg">
+  <div class="chat-image avatar">
+    <div class="w-8 h-8 rounded-full bg-accent/15 border border-accent/20 flex items-center justify-center">
+      <material-icon icon="auto_awesome" :size="16" class="text-accent"></material-icon>
+    </div>
+  </div>
+  <div class="chat-bubble bubble-model max-w-[88%] space-y-2 p-3" :class="msg.hidden ? 'opacity-40 !border-dashed' : ''">
+    <div v-if="msg.hidden" class="flex items-center gap-1 text-xs text-neutral-500 pb-1.5 border-b border-white/10">
+      <material-icon icon="visibility_off" :size="12"></material-icon><span>Hidden from model</span>
+    </div>
+    <collapsible-panel v-if="variant && variant._thinking" :storage-key="'banana-thinking-' + msg.id" class="!rounded-xl !border-secondary/25 !bg-secondary/8 overflow-hidden">
+      <template #header><span class="flex items-center gap-1.5 text-xs font-semibold text-secondary"><material-icon icon="psychology" :size="14"></material-icon>Thinking</span></template>
+      <div class="font-mono text-xs text-neutral-500 leading-relaxed -mt-1" v-html="markdownParse(variant._thinking)"></div>
+    </collapsible-panel>
+    <div v-if="isAwaitingContent" class="py-1 px-1"><span class="loading loading-dots loading-sm text-accent"></span></div>
+    <div v-if="variant && variant._text" class="text-sm leading-relaxed prose prose-sm max-w-none prose-invert prose-p:my-1 prose-pre:bg-base-300/80 prose-code:text-accent/90" v-html="markdownParse(variant._text)"></div>
+    <div v-if="variant && variant._images && variant._images.length" class="flex flex-wrap gap-2 pt-0.5">
+      <div v-for="(img, i) in variant._images" :key="i" class="relative group/img cursor-pointer rounded-xl overflow-hidden border border-white/10 shadow-lg hover:shadow-accent/10 transition-shadow">
+        <img :src="imgSrc(img)" class="max-h-72 block transition-transform duration-200 group-hover/img:scale-[1.012]" @click="emit('open-lightbox', imgSrc(img))">
+        <div class="absolute bottom-2 right-2 flex gap-1.5 opacity-0 group-hover/img:opacity-100 transition-opacity">
+          <button @click.stop="downloadImage(imgSrc(img))" class="btn btn-xs bg-black/65 hover:bg-black/85 text-white border-none min-h-0 h-7 w-7 p-0 rounded-lg" title="Download"><material-icon icon="download" :size="14"></material-icon></button>
+          <button @click.stop="emit('use-as-input', img)" class="btn btn-xs bg-black/65 hover:bg-black/85 text-white border-none min-h-0 h-7 w-7 p-0 rounded-lg" title="Use as input"><material-icon icon="auto_fix_high" :size="14"></material-icon></button>
+        </div>
+      </div>
+    </div>
+    <div v-if="variant && variant._error" role="alert" class="alert alert-error p-2 gap-2 text-sm">
+      <material-icon :icon="variant._isPromptBlock ? 'block' : 'output'" :size="16"></material-icon>
+      <div>
+        <p v-if="variant._blockReason" class="font-bold text-xs uppercase tracking-wide opacity-80 mb-0.5">{{variant._isPromptBlock ? 'Prompt blocked' : 'Output blocked'}} · {{variant._blockReason}}</p>
+        <p>{{variant._error}}</p>
+      </div>
+    </div>
+    <div v-if="variant && variant._usage && !isGen" class="flex items-center gap-1.5 text-xs text-neutral-600 pt-1 border-t border-white/5 mt-1">
+      <material-icon icon="data_usage" :size="12"></material-icon>
+      <span>{{fmtTokens(variant._usage.promptTokenCount)}} in / {{fmtTokens(variant._usage.candidatesTokenCount)}} out</span>
+    </div>
+  </div>
+  <div class="chat-footer flex items-center gap-0.5 mt-1 flex-wrap opacity-0 group-hover/mmsg:opacity-100 focus-within:opacity-100 transition-opacity">
+    <template v-if="msg.variants && msg.variants.length > 1">
+      <button @click="navigateVariant(-1)" :disabled="msg.activeVariant <= 0" class="btn btn-ghost btn-xs btn-circle disabled:opacity-30"><material-icon icon="chevron_left" :size="16"></material-icon></button>
+      <span class="text-xs text-neutral-600 font-mono select-none tabular-nums">{{msg.activeVariant + 1}}/{{msg.variants.length}}</span>
+      <button @click="navigateVariant(1)" :disabled="msg.activeVariant >= msg.variants.length - 1" class="btn btn-ghost btn-xs btn-circle disabled:opacity-30"><material-icon icon="chevron_right" :size="16"></material-icon></button>
+    </template>
+    <template v-if="!isGen">
+      <button @click="regenerateMessage(msg.id)" class="btn btn-ghost btn-xs gap-1"><material-icon icon="refresh" :size="13"></material-icon><span>Regen</span></button>
+      <button @click="toggleHide" class="btn btn-ghost btn-xs btn-circle" :title="msg.hidden ? 'Show' : 'Hide'"><material-icon :icon="msg.hidden ? 'visibility' : 'visibility_off'" :size="13"></material-icon></button>
+      <button @click="deleteMessage(msg.id)" class="btn btn-ghost btn-xs btn-circle text-error/50 hover:text-error" :title="msg.variants && msg.variants.length > 1 ? 'Delete this variant' : 'Delete'"><material-icon icon="delete" :size="13"></material-icon></button>
+      <button v-if="msg.variants && msg.variants.length > 1" @click="deleteAllVariants(msg.id)" class="btn btn-ghost btn-xs btn-circle text-error/70 hover:text-error" title="Delete all variants"><material-icon icon="delete_sweep" :size="13"></material-icon></button>
+    </template>
+  </div>
+</div>`
+        };
+
+        // --- Nano Banana Studio ---
+        const NanoBananaStudio = {
+            setup() {
+                const store = useAppStore();
+                const {messages, gallery, generating, sendMessage, newChat, abort} = useGeminiAPI();
+
+                const editState = ref(null);
+                const pendingImages = ref([]);
+                const showGallery = ref(false);
+                const lightboxSrc = ref(null);
+                const chatEl = ref(null);
+                const promptInputEl = ref(null);
+                const fileInput = ref(null);
+                const editFileInput = ref(null);
+
+                const geminiConfig = store.config.value.gemini;
+                const hasApiKey = computed(() => !!geminiConfig.apiKey);
+                const aspectRatios = [
+                    {val:'', text:'Auto'},
+                    {val:'1:1', text:'1:1'}, {val:'16:9', text:'16:9'}, {val:'9:16', text:'9:16'},
+                    {val:'4:3', text:'4:3'}, {val:'3:4', text:'3:4'}, {val:'3:2', text:'3:2'},
+                    {val:'2:3', text:'2:3'}, {val:'21:9', text:'21:9'}, {val:'4:5', text:'4:5'}, {val:'5:4', text:'5:4'}
+                ];
+                const imageSizes = ['0.5K','1K','2K','4K'];
+                const tips = [
+                    {label:'Retro diner', prompt:'A retro diner at midnight, neon signs glowing in the rain'},
+                    {label:'Space chess', prompt:'An astronaut playing chess with a robot on Mars'},
+                    {label:'Bookshop cat', prompt:'A cozy Japanese bookshop with a cat sleeping in the window'},
+                    {label:'Pixel castle', prompt:'Isometric pixel art of a fantasy castle surrounded by clouds'},
+                ];
+                const thinkingOpts = computed(() => [
+                    {label:'Min', active: geminiConfig.thinkingLevel === 'MINIMAL', activeClass:'btn-secondary text-white shadow-md', onClick:()=>geminiConfig.thinkingLevel='MINIMAL'},
+                    {label:'High', active: geminiConfig.thinkingLevel === 'HIGH', activeClass:'btn-secondary text-white shadow-md', onClick:()=>geminiConfig.thinkingLevel='HIGH'},
+                ]);
+                const imageSizeOpts = computed(() => imageSizes.map(s => ({label: s, active: geminiConfig.imageSize === s, onClick: () => geminiConfig.imageSize = s})));
+
+                const scrollToBottom = () => nextTick(() => { if (chatEl.value) chatEl.value.scrollTo({top: chatEl.value.scrollHeight, behavior: 'smooth'}); });
+
+                const handleFileUpload = async (files, forEdit = false) => {
+                    const arr = files instanceof FileList ? Array.from(files) : [files];
+                    const valid = arr.filter(f => f?.type.startsWith('image/'));
+                    if (!valid.length) { store.addToast({msg: 'Please upload an image file', type: 'error'}); return; }
+                    const results = await Promise.all(valid.map(readBase64));
+                    if (forEdit && editState.value) editState.value.images.push(...results.map(r => ({id: uid(), data: r.data, mimeType: r.mimeType, name: r.name, hidden: false})));
+                    else pendingImages.value.push(...results.map(r => ({data: r.data, mimeType: r.mimeType, name: r.name})));
+                };
+                const removePendingImage = (idx) => pendingImages.value.splice(idx, 1);
+                const useAsInput = (img) => { pendingImages.value.push({data: img.data, mimeType: img.mimeType, name: 'generated.png'}); store.addToast({msg: 'Image added as reference', type: 'success', duration: 2000}); };
+                const useAsInputFromSrc = (src) => { const m = src.match(/^data:([^;]+);base64,(.+)$/); if (m) { pendingImages.value.push({mimeType: m[1], data: m[2], name: 'image.png'}); store.addToast({msg: 'Image added as reference', type: 'success', duration: 2000}); } };
+
+                const setPrompt = (text) => { if (!promptInputEl.value) return; promptInputEl.value.value = text; promptInputEl.value.style.height = 'auto'; promptInputEl.value.style.height = Math.min(promptInputEl.value.scrollHeight, 160)+'px'; promptInputEl.value.focus(); };
+                const autoResize = (e) => { const ta = e.target; ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 160)+'px'; };
+                const onKeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!generating.value) doSend(); } };
+                const onPaste = (e) => { const items = e.clipboardData?.items; if (!items) return; for (const item of items) { if (item.type.startsWith('image/')) { const file = item.getAsFile(); if (file) handleFileUpload([file]); break; } } };
+                const doSend = async () => {
+                    const text = promptInputEl.value?.value?.trim();
+                    if (!text && !pendingImages.value.length) return;
+                    if (promptInputEl.value) { promptInputEl.value.value = ''; promptInputEl.value.style.height = '42px'; }
+                    const imgs = [...pendingImages.value]; pendingImages.value = [];
+                    await sendMessage(text, imgs, scrollToBottom);
+                };
+
+                onKeyStroke('Escape', () => { if (lightboxSrc.value) lightboxSrc.value = null; });
+                if (window.marked) window.marked.setOptions({breaks: true, gfm: true});
+
+                return {
+                    messages, gallery, generating, showGallery, editState, pendingImages, lightboxSrc,
+                    chatEl, promptInputEl, fileInput, editFileInput,
+                    hasApiKey, geminiConfig, aspectRatios, tips, thinkingOpts, imageSizeOpts,
+                    imgSrc, newChat, abort, doSend,
+                    handleFileUpload, removePendingImage, useAsInput, useAsInputFromSrc, downloadImage,
+                    setPrompt, autoResize, onKeydown, onPaste,
+                };
+            },
+            template: `
+<div class="flex flex-col h-full">
+  <div class="z-10 shrink-0">
+    <collapsible-panel storage-key="banana-settings" flush>
+      <template #header>
+        <span class="flex items-center gap-2 select-none">
+          <material-icon icon="auto_awesome" :size="20" class="text-accent shrink-0"></material-icon>
+          <span>Nano Banana Studio</span>
+        </span>
+        <span class="flex items-center gap-1.5 ml-1 shrink-0">
+          <span class="status status-sm" :class="hasApiKey ? 'status-success' : 'status-error'"></span>
+          <span class="text-xs font-medium" :class="hasApiKey ? 'text-success' : 'text-error'">{{hasApiKey ? 'Connected' : 'No Key'}}</span>
+        </span>
+      </template>
+      <template #actions>
+        <label class="flex items-center gap-1 cursor-pointer" title="Auto-retry on candidate block" @click.stop>
+          <material-icon icon="autorenew" :size="16" class="text-neutral-500"></material-icon>
+          <input type="checkbox" v-model="geminiConfig.autoRetry" class="toggle toggle-xs toggle-warning">
+        </label>
+        <icon-btn icon="photo_library" size="btn-xs" :active="showGallery" color="btn-ghost" tooltip="Gallery" @click.stop="showGallery = !showGallery"></icon-btn>
+        <icon-btn icon="add" size="btn-xs" color="btn-ghost" tooltip="New chat" @click.stop="newChat"></icon-btn>
+      </template>
+      <div class="flex flex-wrap items-end gap-3 pt-1 pb-1">
+        <div class="relative shrink-0 w-[8.5rem]">
+          <floating-label label="Thinking" color="badge-secondary"></floating-label>
+          <div class="mt-1 pt-1"><segmented-control :options="thinkingOpts" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div>
+        </div>
+        <div class="shrink-0 w-28">
+          <setting-input v-model="geminiConfig.aspectRatio" label="Aspect Ratio" type="select" :options="aspectRatios"></setting-input>
+        </div>
+        <div class="relative shrink-0 w-[14.5rem]">
+          <floating-label label="Image Size"></floating-label>
+          <div class="mt-1 pt-1"><segmented-control :options="imageSizeOpts" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div>
+        </div>
+      </div>
+    </collapsible-panel>
+  </div>
+
+  <div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4">
+    <div v-if="!messages.length" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none">
+      <material-icon icon="auto_awesome" :size="64" class="text-accent/40"></material-icon>
+      <div>
+        <h3 class="text-xl font-bold text-neutral-200 mb-1.5 tracking-tight">What will you create?</h3>
+        <p class="text-sm text-neutral-500 max-w-xs leading-relaxed">Type a prompt to generate an image, or upload one to edit and remix.</p>
+      </div>
+      <div class="flex flex-wrap gap-2 justify-center mt-1">
+        <button v-for="tip in tips" :key="tip.label" @click="setPrompt(tip.prompt)" class="btn btn-sm glass-nested border-white/10 text-neutral-400 hover:text-accent hover:border-accent/30 text-xs font-medium transition-colors">{{tip.label}}</button>
+      </div>
+    </div>
+    <chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState"
+      @update:edit-state="editState = $event"
+      @open-lightbox="lightboxSrc = $event"
+      @request-edit-upload="editFileInput.click()"
+      @use-as-input="useAsInput($event)">
+    </chat-message>
+  </div>
+
+  <transition name="fade">
+    <div v-if="showGallery" class="shrink-0 border-t border-white/10 bg-base-200/25 backdrop-blur-sm">
+      <div class="flex items-center justify-between px-4 py-1.5">
+        <span class="text-xs font-semibold text-neutral-500 uppercase tracking-widest">Gallery</span>
+        <span class="badge badge-xs badge-ghost font-mono">{{gallery.length}}</span>
+      </div>
+      <div v-if="!gallery.length" class="text-center text-xs text-neutral-600 py-3 pb-4">No images generated yet in this session</div>
+      <div v-else class="flex gap-2 overflow-x-auto pb-3 px-4 custom-scroll" style="scrollbar-width:thin">
+        <div v-for="g in [...gallery].reverse()" :key="g.id" @click="lightboxSrc = imgSrc(g)" class="shrink-0 w-[72px] h-[72px] rounded-xl overflow-hidden cursor-pointer ring-2 ring-transparent hover:ring-accent transition-all duration-150 shadow-sm">
+          <img :src="imgSrc(g)" class="w-full h-full object-cover">
+        </div>
+      </div>
+    </div>
+  </transition>
+
+  <div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10">
+    <div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl">
+      <div v-for="(img, idx) in pendingImages" :key="idx" class="relative group/pimg shrink-0">
+        <img :src="imgSrc(img)" class="h-12 w-12 object-cover rounded-lg border border-white/20 block">
+        <button @click="removePendingImage(idx)" class="absolute -top-1.5 -right-1.5 btn btn-xs btn-circle btn-neutral border-none min-h-0 h-5 w-5 p-0 opacity-0 group-hover/pimg:opacity-100 transition-opacity shadow-sm hover:btn-error">
+          <material-icon icon="close" :size="10"></material-icon>
+        </button>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      <button @click="fileInput.click()" class="btn btn-ghost btn-sm btn-square shrink-0 text-neutral-500 hover:text-white border-white/10" title="Upload image(s)">
+        <material-icon icon="attach_file" :size="20"></material-icon>
+      </button>
+      <textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] max-h-[160px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea>
+      <button @click="generating ? abort() : doSend()" class="btn shrink-0 transition-colors shadow-sm w-9 h-9 p-0" :class="generating ? 'btn-error' : (hasApiKey ? 'btn-primary' : 'btn-disabled')" :title="generating ? 'Stop generation' : 'Send'">
+        <material-icon :icon="generating ? 'stop' : 'send'" :size="18"></material-icon>
+      </button>
+    </div>
+  </div>
+
+  <input ref="fileInput" type="file" accept="image/*" multiple class="hidden" @change="e => { if(e.target.files.length) handleFileUpload(e.target.files); e.target.value = ''; }">
+  <input ref="editFileInput" type="file" accept="image/*" multiple class="hidden" @change="e => { if(e.target.files.length) handleFileUpload(e.target.files, true); e.target.value = ''; }">
+
+  <teleport to="body">
+    <transition name="fade">
+      <div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null">
+        <button @click="lightboxSrc = null" class="absolute top-4 right-4 btn btn-ghost btn-circle text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1">
+          <material-icon icon="close" :size="22"></material-icon>
+        </button>
+        <img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop>
+        <div class="flex gap-3 mt-5">
+          <button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20">
+            <material-icon icon="download" :size="15"></material-icon>Download
+          </button>
+          <button @click="useAsInputFromSrc(lightboxSrc); lightboxSrc = null" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20">
+            <material-icon icon="auto_fix_high" :size="15"></material-icon>Use as input
+          </button>
+        </div>
+      </div>
+    </transition>
+  </teleport>
+</div>`
+        };
+
+        const models = [
+            {val: 'nai-diffusion-4-5-full', text: 'v4.5 Full'},
+            {val: 'nai-diffusion-4-5-curated', text: 'v4.5 Curated'},
+            {val: 'nai-diffusion-4-full', text: 'v4 Full'}
+        ];
+
+        const Settings = {
+            setup: () => ({app: useAppStore().config.value.app, gemini: useAppStore().config.value.gemini, models}),
+            template:`
+                <div class="max-w-4xl mx-auto p-4 space-y-4 h-full custom-scroll">
+                    <collapsible-panel title="API Configuration" storage-key="api-config">
+                        <div class="pt-2 space-y-3"><setting-input v-model="app.apiKey" label="NovelAI API Key" type="password"></setting-input><p class="text-xs text-neutral-500 mt-2 ml-1">Stored locally in your browser.</p></div>
+                    </collapsible-panel>
+                    <collapsible-panel title="Nano Banana Studio (Gemini)" storage-key="banana-api-config">
+                        <div class="pt-2 space-y-3">
+                            <setting-input v-model="gemini.apiKey" label="Gemini API Key" type="password" placeholder="AIzaSy..."></setting-input>
+                            <p class="text-xs text-neutral-500 ml-1">Get a free key from <a href="https://aistudio.google.com/apikey" target="_blank" class="text-primary hover:underline">Google AI Studio</a>. Stored locally.</p>
+                        </div>
+                    </collapsible-panel>
+                    <collapsible-panel title="Application Settings" storage-key="app-settings">
+                        <div class="pt-2"><setting-input v-model="app.model" label="NovelAI Model" type="select" :options="models"></setting-input></div>
+                    </collapsible-panel>
+                </div>
+            `
+        };
+        
+        // --- Router Setup ---
+        const routes = [
+            {path:'/', redirect:'/tagtest'},
+            {path:'/gen', component:NAIImageGenerator, name: 'gen', meta: {genSource: 'gen'}},
+            {path:'/tagtest', component:NAITagTest, name: 'tagTest', meta: {genSource: 'tagTest'}},
+            {
+                path:'/danbooru',
+                component:DanbooruBrowser,
+                children: [
+                    {path: '', component: DanbooruGrid, name: 'danbooru-grid'},
+                    {path: ':id(\\d+)', component: DanbooruGrid, name: 'danbooru-single'},
+                    {path: 'folder/:folderId', component: DanbooruGrid, name: 'danbooru-folder'}
+                ]
+            },
+            {path:'/settings', component:Settings, name: 'settings'},
+            {path:'/banana', component:NanoBananaStudio, name: 'banana'}
+        ];
+        
+        const router = createRouter({
+            history:createWebHashHistory(),
+            routes,
+            scrollBehavior: (to, from, savedPos) => savedPos || {top: 0, behavior: 'smooth'},
+        });
+        
+        // --- Main App ---
+        const App = {
+            setup() {
+                const {notifications, resetNotificationNum, config} = useAppStore();
+                const navItems = computed(() => [
+                    {path:'/gen', icon:'image', label:'NAI Image Generator', source: 'gen'},
+                    {path:'/tagtest', icon:'lab_research', label:'NAI Tag Test', source: 'tagTest'},
+                    {path: config.value.danbooru.lastPath || '/danbooru', icon:'package_2', label:'Danbooru Browser', source: 'danbooru'},
+                    {path:'/banana', icon:'auto_awesome', label:'Nano Banana Studio', source: 'banana'}
+                ]);
+
+                useRouter().afterEach((to) => to.meta.genSource && resetNotificationNum(to.meta.genSource));
+
+                return {navItems, notifications};
+            },
+            template:`
+                <div class="flex h-screen animated-bg animate-gradientShift">
+                    <nav class="z-50 p-2 glass border-r-0 flex flex-col">
+                        <ul class="menu bg-transparent rounded-box p-0 space-y-2">
+                            <li v-for="item in navItems" :key="item.path"><nav-link :to="item.path" :icon="item.icon" :notification="notifications[item.source]"></nav-link></li>
+                        </ul>
+                        <ul class="menu bg-transparent rounded-box p-0 mt-auto pt-2 border-t border-white/10">
+                            <li><nav-link to="/settings" icon="settings"></nav-link></li>
+                        </ul>
+                    </nav>
+                    <main class="flex-1 overflow-hidden"><router-view v-slot="{Component}"><keep-alive><component :is="Component" /></keep-alive></router-view></main>
+                    <toast-container></toast-container>
+                </div>
+            `
+        };
+        
+        const app = createApp(App);
+        Object.entries({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ImageViewer, ToastContainer, PromptInput, FolderDropdown, NavLink, ChatMessage, NanoBananaStudio}).forEach(([n, c]) => app.component(n, c));
+        app.use(router);
+        app.mount('#app');
+    </script>
+</body>
+</html> 
