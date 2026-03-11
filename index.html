@@ -263,7 +263,7 @@
                                         const { genHistory, conversations, box: _ignoredBox, ...rest } = loadedState;
                                         if (genHistory) store.largeData.genHistory = genHistory;
                                         if (conversations) store.largeData.conversations = conversations;
-                                        _.merge(store.config.value, rest);
+                                        _.mergeWith(store.config.value, rest, (objValue, srcValue) => _.isArray(srcValue) ? srcValue : undefined);
                                         store.addToast({msg: 'Settings loaded from Box.', type: 'success', duration: 2000});
                                     }
                                 }
@@ -471,9 +471,12 @@
 
             const saveConfig = async (configObj) => {
                 if (!isReady.value) return;
+                const store = useAppStore();
+                if (store.isHydrating.value) return;
                 if (saveConfigTimeout) clearTimeout(saveConfigTimeout);
                 
                 saveConfigTimeout = setTimeout(async () => {
+                    if (store.isHydrating.value) return;
                     try {
                         const folderId = await getFolderId();
                         if (!cachedConfigFileId) {
@@ -493,9 +496,12 @@
 
             const saveHistory = async (historyObj) => {
                 if (!isReady.value) return;
+                const store = useAppStore();
+                if (store.isHydrating.value) return;
                 if (saveHistoryTimeout) clearTimeout(saveHistoryTimeout);
                 
                 saveHistoryTimeout = setTimeout(async () => {
+                    if (store.isHydrating.value) return;
                     try {
                         const folderId = await getFolderId();
                         if (!cachedHistoryFileId) {
@@ -1869,7 +1875,7 @@
                             const { genHistory, conversations, box: _ignoredBox, ...rest } = loadedState;
                             if (genHistory) largeData.genHistory = genHistory;
                             if (conversations) largeData.conversations = conversations;
-                            _.merge(config.value, rest);
+                            _.mergeWith(config.value, rest, (objValue, srcValue) => _.isArray(srcValue) ? srcValue : undefined);
                             store.addToast({msg: 'Settings loaded from Box.', type: 'success', duration: 2000});
                         }
                     }
