@@ -177,10 +177,19 @@
         });
 
         const hydrateFromLoadedState = (loadedState, config, largeData) => {
-            const { genHistory, conversations, box: _ignoredBox, ...rest } = loadedState;
+            const { genHistory, conversations, box, ...rest } = loadedState;
             if (genHistory) largeData.genHistory = genHistory;
             if (conversations) largeData.conversations = conversations;
-            _.mergeWith(config.value, rest, (objValue, srcValue) => _.isArray(srcValue) ? srcValue : undefined);
+
+            // Allow merging of safe Box config keys (like clientId, clientSecret),
+            // but explicitly discard tokens so we don't overwrite the active session.
+            let safeBoxState = {};
+            if (box) {
+                const { accessToken, refreshToken, tokenExpiresAt, ...safeBoxConfig } = box;
+                safeBoxState = { box: safeBoxConfig };
+            }
+
+            _.mergeWith(config.value, { ...rest, ...safeBoxState }, (objValue, srcValue) => _.isArray(srcValue) ? srcValue : undefined);
         };
 
         // --- Box API Service ---
