@@ -460,7 +460,17 @@
                     onError: (e) => !e?.name?.includes('Abort') && addToast({msg: `Search failed: ${e.message}`, type: 'error', source: 'danbooru'}),
                     onSuccess: ({data, page, append, tags, clientFilters = [], aborted, error}) => {
                         if (aborted || error) return error && addToast({msg: error, type: 'error', source: 'danbooru'});
-                        const bl = blacklist.value.split(',').map(t => t.trim()).filter(Boolean), results = data.filter(p => p.large_file_url && !p.is_banned && p.image_width > 0 && /png|jpe?g|gif/.test(p.file_ext) && !bl.some(b => (p.tag_string||'').includes(b)) && (!clientFilters.length || clientFilters.every(f => (` ${p.tag_string||''} `).includes(` ${f} `))));
+                        const blSet = new Set(blacklist.value.split(',').map(t => t.trim()).filter(Boolean));
+                        const results = data.filter(p => {
+                            if (!p.large_file_url || p.is_banned || p.image_width <= 0 || !/png|jpe?g|gif/.test(p.file_ext)) return false;
+                            const pTags = (p.tag_string || '').split(' ');
+                            if (blSet.size > 0 && pTags.some(t => blSet.has(t))) return false;
+                            if (clientFilters.length > 0) {
+                                const pTagsSet = new Set(pTags);
+                                if (!clientFilters.every(f => pTagsSet.has(f))) return false;
+                            }
+                            return true;
+                        });
                         results.forEach(p => ['artist', 'general', 'character', 'copyright', 'meta'].forEach(t => (p[`tag_string_${t}`]||'').split(' ').forEach(tag => { if (tag && !naiTagKnowledge.value[tag] && !queuedTags.has(tag)) { tagQueues[t === 'artist' ? 'danbooru' : 'nai'].push(tag); queuedTags.add(tag); processQueues(); } })));
                         posts.value = append ? posts.value.concat(results) : results; hasMorePages.value = data.length >= (tags.includes('|') ? (DANBOORU_LIMIT / 2) : DANBOORU_LIMIT); pageNum.value = page; currentSearchTags.value = tags;
                         if (page === 1) addToast({msg: `Found ${results.length} posts.`, type: 'success', source: 'danbooru', duration: 2000});
