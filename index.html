@@ -263,7 +263,7 @@
                                         const { genHistory, conversations, box: _ignoredBox, ...rest } = loadedState;
                                         if (genHistory) store.largeData.genHistory = genHistory;
                                         if (conversations) store.largeData.conversations = conversations;
-                                        Object.assign(store.config.value, rest);
+                                        _.merge(store.config.value, rest);
                                         store.addToast({msg: 'Settings loaded from Box.', type: 'success', duration: 2000});
                                     }
                                 }
@@ -1869,7 +1869,7 @@
                             const { genHistory, conversations, box: _ignoredBox, ...rest } = loadedState;
                             if (genHistory) largeData.genHistory = genHistory;
                             if (conversations) largeData.conversations = conversations;
-                            Object.assign(config.value, rest);
+                            _.merge(config.value, rest);
                             store.addToast({msg: 'Settings loaded from Box.', type: 'success', duration: 2000});
                         }
                     }
