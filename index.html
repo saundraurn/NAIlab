@@ -97,10 +97,250 @@
         };
         const readBase64 = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res({data: r.result.split(',')[1], mimeType: file.type, name: file.name}); r.onerror = rej; r.readAsDataURL(file); });
         const downloadImage = (src, name) => { const a = document.createElement('a'); a.href = src; a.download = name || 'gemini-'+Date.now()+'.png'; document.body.appendChild(a); a.click(); a.remove(); };
+
+        let webpWorker = null;
+        const getWebPWorker = () => {
+            if (!webpWorker) {
+                const workerCode = `
+                    import { encode } from 'https://esm.sh/@jsquash/webp?bundle';
+                    self.onmessage = async (e) => {
+                        try {
+                            const { id, bitmap, quality } = e.data;
+                            const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+                            const ctx = canvas.getContext('2d');
+                            ctx.drawImage(bitmap, 0, 0);
+                            const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+                            const resultBuffer = await encode(imageData, { effort: 6, quality: quality || 100 });
+                            self.postMessage({ id, buffer: resultBuffer }, [resultBuffer]);
+                        } catch (err) {
+                            self.postMessage({ id: e.data.id, error: err.message });
+                        }
+                    };
+                `;
+                const blob = new Blob([workerCode], { type: 'application/javascript' });
+                webpWorker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+                webpWorker._callbacks = new Map();
+                webpWorker.onmessage = (e) => {
+                    const { id, buffer, error } = e.data;
+                    const cb = webpWorker._callbacks.get(id);
+                    if (cb) {
+                        webpWorker._callbacks.delete(id);
+                        if (error) cb.reject(new Error(error));
+                        else cb.resolve(buffer);
+                    }
+                };
+            }
+            return webpWorker;
+        };
+
+        const convertBlobToWebP = async (blob, quality = 100) => {
+            const bitmap = await createImageBitmap(blob);
+            const worker = getWebPWorker();
+            const id = Date.now() + '_' + Math.random();
+            return new Promise((resolve, reject) => {
+                worker._callbacks.set(id, {
+                    resolve: async (buffer) => {
+                        const webpBlob = new Blob([buffer], { type: 'image/webp' });
+                        const reader = new FileReader();
+                        reader.onload = () => resolve({ data: reader.result.split(',')[1], mimeType: 'image/webp', name: 'image.webp', blob: webpBlob });
+                        reader.onerror = reject;
+                        reader.readAsDataURL(webpBlob);
+                    },
+                    reject
+                });
+                worker.postMessage({ id, bitmap, quality }, [bitmap]);
+            });
+        };
+
+        const convertBase64ToWebP = async (base64, mimeType = 'image/png', quality = 100) => {
+            const r = await fetch(`data:${mimeType};base64,${base64}`);
+            const blob = await r.blob();
+            return await convertBlobToWebP(blob, quality);
+        };
         const abortableSleep = (ms, signal) => new Promise((resolve, reject) => {
             if (signal?.aborted) return reject(new DOMException('', 'AbortError'));
             const t = setTimeout(resolve, ms);
             signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('', 'AbortError')); }, {once: true});
+        });
+
+        // --- Box API Service ---
+        const useBoxAPI = createGlobalState(() => {
+            const FOLDER_NAME = 'NAIlabData';
+            const STATE_FILE_NAME = 'appState.json';
+
+            const isReady = ref(false);
+            const isValidating = ref(false);
+
+            const validateToken = async () => {
+                const store = useAppStore();
+                const token = store.config.value.box?.developerToken;
+                if (!token) {
+                    isReady.value = false;
+                    return false;
+                }
+                isValidating.value = true;
+                try {
+                    const res = await fetch('https://api.box.com/2.0/users/me', {
+                        headers: { 'Authorization': `Bearer ${token}` }
+                    });
+                    isReady.value = res.ok;
+                    if (!res.ok) {
+                        store.addToast({msg: 'Box API Token Expired or Invalid.', type: 'error'});
+                    }
+                    return res.ok;
+                } catch (e) {
+                    isReady.value = false;
+                    return false;
+                } finally {
+                    isValidating.value = false;
+                }
+            };
+
+            const _headers = () => {
+                const store = useAppStore();
+                const token = store.config.value.box?.developerToken;
+                if (!isReady.value || !token) return { 'Content-Type': 'application/json' };
+                return {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'};
+            };
+
+            const _fetch = async (url, options = {}) => {
+                const res = await fetch(url, options);
+                if (res.status === 401) {
+                    isReady.value = false;
+                    const store = useAppStore();
+                    store.addToast({msg: 'Box API Token Expired. Please refresh it in settings.', type: 'error', duration: 5000});
+                    throw new Error('Unauthorized');
+                }
+                return res;
+            };
+
+            const findFolder = async (name) => {
+                const res = await _fetch(`https://api.box.com/2.0/search?query=${name}&type=folder`, {headers: _headers()});
+                if (!res.ok) throw new Error('Failed to search Box folders');
+                const data = await res.json();
+                return data.entries.find(e => e.name === name);
+            };
+
+            const createFolder = async (name) => {
+                const res = await _fetch(`https://api.box.com/2.0/folders`, {
+                    method: 'POST', headers: _headers(),
+                    body: JSON.stringify({name, parent: {id: '0'}})
+                });
+                if (!res.ok) throw new Error('Failed to create Box folder');
+                return await res.json();
+            };
+
+            let cachedFolderId = null;
+            let cachedFileId = null;
+            let lastToken = null;
+            const getFolderId = async () => {
+                if (!isReady.value) return null;
+                const store = useAppStore();
+                const currentToken = store.config.value.box?.developerToken;
+                if (currentToken !== lastToken) {
+                    cachedFolderId = null;
+                    cachedFileId = null;
+                    lastToken = currentToken;
+                }
+                if (cachedFolderId) return cachedFolderId;
+
+                // First try to search
+                let folder = await findFolder(FOLDER_NAME);
+
+                // If not found, check items in root
+                if (!folder) {
+                    const res = await _fetch(`https://api.box.com/2.0/folders/0/items`, {headers: _headers()});
+                    if (res.ok) {
+                        const data = await res.json();
+                        folder = data.entries.find(e => e.name === FOLDER_NAME && e.type === 'folder');
+                    }
+                }
+
+                if (!folder) folder = await createFolder(FOLDER_NAME);
+                cachedFolderId = folder.id;
+                return cachedFolderId;
+            };
+
+            const findFile = async (folderId, name) => {
+                const res = await _fetch(`https://api.box.com/2.0/folders/${folderId}/items`, {headers: _headers()});
+                if (!res.ok) throw new Error('Failed to list folder items');
+                const data = await res.json();
+                return data.entries.find(e => e.name === name && e.type === 'file');
+            };
+
+            const loadState = async () => {
+                if (!isReady.value) return null;
+                try {
+                    const folderId = await getFolderId();
+                    const file = await findFile(folderId, STATE_FILE_NAME);
+                    if (!file) return null;
+
+                    const res = await _fetch(`https://api.box.com/2.0/files/${file.id}/content`, {headers: _headers()});
+                    if (!res.ok) throw new Error('Failed to download state file');
+                    return await res.json();
+                } catch (e) {
+                    console.error('Box load error:', e);
+                    const store = useAppStore();
+                    store.addToast({msg: 'Failed to load from Box: ' + e.message, type: 'error'});
+                    return null;
+                }
+            };
+
+            let saveTimeout = null;
+            const saveState = async (stateObj) => {
+                if (!isReady.value) return;
+
+                // Debounce manual to avoid overriding the reference to timeout
+                if (saveTimeout) clearTimeout(saveTimeout);
+
+                saveTimeout = setTimeout(async () => {
+                    try {
+                        const folderId = await getFolderId();
+
+                        if (!cachedFileId) {
+                            const file = await findFile(folderId, STATE_FILE_NAME);
+                            if (file) cachedFileId = file.id;
+                        }
+
+                        const stateStr = JSON.stringify(stateObj);
+                        const formData = new FormData();
+
+                        const store = useAppStore();
+                        const token = store.config.value.box.developerToken;
+                        if (cachedFileId) {
+                            formData.append('attributes', JSON.stringify({name: STATE_FILE_NAME}));
+                            formData.append('file', new Blob([stateStr], {type: 'application/json'}), STATE_FILE_NAME);
+                            const res = await _fetch(`https://upload.box.com/api/2.0/files/${cachedFileId}/content`, {
+                                method: 'POST',
+                                headers: {'Authorization': `Bearer ${token}`},
+                                body: formData
+                            });
+                            if (!res.ok) throw new Error('Failed to update Box state file');
+                        } else {
+                            formData.append('attributes', JSON.stringify({name: STATE_FILE_NAME, parent: {id: folderId}}));
+                            formData.append('file', new Blob([stateStr], {type: 'application/json'}), STATE_FILE_NAME);
+                            const res = await _fetch(`https://upload.box.com/api/2.0/files/content`, {
+                                method: 'POST',
+                                headers: {'Authorization': `Bearer ${token}`},
+                                body: formData
+                            });
+                            if (!res.ok) throw new Error('Failed to upload Box state file');
+                            const responseData = await res.json();
+                            if (responseData.entries && responseData.entries.length > 0) {
+                                cachedFileId = responseData.entries[0].id;
+                            }
+                        }
+                        const storeInstance = useAppStore();
+                        storeInstance.addToast({msg: 'Settings saved to Box.', type: 'success', duration: 2000});
+                    } catch (e) {
+                        console.error('Box save error:', e);
+                        const storeInstance = useAppStore();
+                        storeInstance.addToast({msg: 'Failed to sync to Box: ' + e.message, type: 'warning'});
+                    }
+                }, 3000); // 3 second debounce
+            };
+
+            return { isReady, isValidating, validateToken, loadState, saveState };
         });
 
         // --- Unified Application Store ---
@@ -111,11 +351,28 @@
                 ui: {splitSizes:[60,40], splitSizesDanbooru:[40,60], splitSizesGen:[40,60], splitSizesBanana:[100,0], collapsibleStates:{'tag-test-settings':true, 'prompts-uc':true, 'tags-to-test':true, 'gen-settings':true, 'api-config':true, 'app-settings':true, 'img-comparison':true, 'results-panel':true, 'danbooru-search':true, 'danbooru-folders':true, 'nai-main-prompt':true, 'nai-char-prompts':true, 'nai-last-img':true, 'banana-settings':false}},
                 app: {apiKey:'', model:'nai-diffusion-4-5-full'},
                 gemini: {apiKey:'', thinkingLevel:'MINIMAL', aspectRatio:'1:1', imageSize:'1K', autoRetry:false},
+                box: {developerToken: ''},
                 danbooru: {folders:[], nextFolderId:1, gridCols:4, lastPath:'/danbooru', blacklist:'', sortOrder:'id', ratingFilters:{g:true, s:true, q:true, e:true}, savedSearches:[{name:'Trending', prompt:'order:rank'}]},
                 genState: {prompt:'1girl, solo, wearing casual clothes', uc:'multiple views, monochrome, black and white, looking at viewer, pov', charPrompts:[{id:1, val:''}], nextCharPromptId:2}
             }, {mergeDefaults: true});
 
+            // Keep large data out of localStorage to avoid quota issues
+            const largeData = reactive({
+                genHistory: [],
+                conversations: []
+            });
+
+            const fullState = computed(() => ({...config.value, ...largeData}));
+
             const toasts = ref([]), notifications = reactive({}), queue = ref([]), isDispatcherRunning = ref(false), isApiHalted = ref(false);
+            const isHydrating = ref(false);
+
+            watch(fullState, (newConfig) => {
+                if (isHydrating.value) return;
+                const boxAPI = useBoxAPI();
+                if (boxAPI.isReady.value) boxAPI.saveState(newConfig);
+            }, { deep: true });
+
             let uniqueIdCounter = 0;
 
             const removeToast = (id) => _.remove(toasts.value, {id}).forEach(t => clearTimeout(t.timerId));
@@ -183,7 +440,7 @@
                 } finally {isDispatcherRunning.value = false;}
             };
 
-            return {config, toasts, addToast, removeToast, notifications, resetNotificationNum: (src) => updateNotification(src, 0), queue, isDispatcherRunning, isApiHalted, addReqs, clearQueueBySource, startDispatcher};
+            return {config, largeData, toasts, addToast, removeToast, notifications, resetNotificationNum: (src) => updateNotification(src, 0), queue, isDispatcherRunning, isApiHalted, addReqs, clearQueueBySource, startDispatcher};
         });
 
         // --- Primitives ---
@@ -398,18 +655,51 @@
             setup() {
                 const store = useAppStore();
                 const {genState, genConfig} = toRefs(store.config.value);
+                const {genHistory} = toRefs(store.largeData);
                 const urlManager = useObjectURLManager();
-                const statusMsg = ref('Ready to generate.'), genHistory = shallowRef([]), viewedImg = ref(null);
+                const statusMsg = ref('Ready to generate.'), viewedImg = ref(null);
                 const createCaptions = (key) => genState.value.charPrompts.flatMap(p => { const val = parsePrompt(p.val)[key]?.trim(); return val ? [{char_caption: val, centers: [{x: 0.5, y: 0.5}]}] : []; });
                 const generate = () => {
                     const seed = _.random(9007199254740990);
                     store.addReqs([{
                         source: 'gen', prompt: genState.value.prompt, uc: genState.value.uc, seed, char_captions: createCaptions('positive'), negative_char_captions: createCaptions('negative'), genConfig: prepareGenConfig(genConfig.value),
-                        callback: (error, {blob, context} = {}) => { if (error) return statusMsg.value = `Error: ${error.message}`; const newImage = {id: Date.now(), url: urlManager.create(blob), seed: context.seed}; genHistory.value.unshift(newImage); viewedImg.value = newImage; statusMsg.value = `Image generated with seed ${context.seed}.`; },
+                        callback: async (error, {blob, context} = {}) => {
+                            if (error) return statusMsg.value = `Error: ${error.message}`;
+                            try {
+                                const webpData = await convertBlobToWebP(blob);
+                                const newImage = {id: Date.now(), url: urlManager.create(webpData.blob), seed: context.seed, base64: webpData.data};
+                                genHistory.value.unshift(newImage);
+                                viewedImg.value = newImage;
+                                statusMsg.value = `Image generated with seed ${context.seed}.`;
+                            } catch (e) {
+                                statusMsg.value = `Error converting to WebP: ${e.message}`;
+                            }
+                        },
                         onStatusUpdate: (message) => statusMsg.value = message, context: {seed}
                     }]);
                     statusMsg.value = 'Queued for generation...';
                 };
+
+                // Hydrate URLs on load for images loaded from storage
+                watch(() => genHistory.value.length, () => {
+                    genHistory.value.forEach(img => {
+                        // URL manager isn't globally exposed but we can simply check if we need to hydrate
+                        // If it has a URL but was saved to Box, it's a dead blob URL from a previous session.
+                        // We shouldn't store URLs in Box at all, so we just rebuild if needed:
+                        if (img.url && img.url.startsWith('blob:') && img._hydrated !== true) {
+                            img.url = null;
+                        }
+                        if (!img.url && img.base64) {
+                            const binStr = atob(img.base64);
+                            const u8arr = new Uint8Array(binStr.length);
+                            for (let i = 0; i < binStr.length; i++) { u8arr[i] = binStr.charCodeAt(i); }
+                            const blob = new Blob([u8arr], {type: 'image/webp'});
+                            img.url = urlManager.create(blob);
+                            img._hydrated = true;
+                        }
+                    });
+                }, {immediate: true});
+
                 return {genState, genConfig, toRef, generate, statusMsg, viewedImg, setViewedImg: (image) => viewedImg.value = image, genHistory};
             },
             template:`
@@ -708,8 +998,21 @@
 
         const useGeminiAPI = createGlobalState(() => {
             const store = useAppStore();
-            const messages = ref([]);
-            const gallery = ref([]);
+            const conversations = toRef(store.largeData, 'conversations');
+            const activeConversationId = ref(null);
+
+            const getActiveConversation = () => conversations.value.find(c => c.id === activeConversationId.value);
+
+            // Watch for conversation changes so activeConversationId doesn't get orphaned when cloud state loads
+            watch(conversations, (newConvs) => {
+                if (newConvs && newConvs.length > 0 && !newConvs.find(c => c.id === activeConversationId.value)) {
+                    activeConversationId.value = newConvs[0].id;
+                }
+            }, { immediate: true, deep: true });
+
+            const messages = computed(() => getActiveConversation()?.messages || []);
+            const gallery = computed(() => getActiveConversation()?.gallery || []);
+
             const generating = ref(false);
             const generatingMsgId = ref(null);
             const abortCtrl = ref(null);
@@ -734,6 +1037,19 @@
                 return {contents, generationConfig: genCfg};
             };
             const getContents = (endIdx) => messages.value.slice(0, endIdx).filter(m => !m.hidden).map(m => ({role: m.role, parts: getMsgParts(m)}));
+
+            const selectConversation = (id) => { activeConversationId.value = id; };
+            const renameConversation = (id, newName) => {
+                const c = conversations.value.find(c => c.id === id);
+                if (c && newName.trim()) c.title = newName.trim();
+            };
+            const deleteConversation = (id) => {
+                const idx = conversations.value.findIndex(c => c.id === id);
+                if (idx !== -1) {
+                    conversations.value.splice(idx, 1);
+                    if (activeConversationId.value === id) activeConversationId.value = conversations.value[0]?.id || null;
+                }
+            };
 
             async function* parseSSE(res) {
                 const reader = res.body.getReader(), dec = new TextDecoder(); let buf = '';
@@ -783,7 +1099,26 @@
                 if (TERMINAL_FINISH_REASONS.has(finalFinishReason)) { const e = new Error(`Generation stopped: ${finalFinishReason}`); e.isTerminal = true; e.blockReason = finalFinishReason; throw e; }
                 const v = getV();
                 if (!v?._images?.length) { const reason = finalFinishReason || 'EMPTY'; const e = new Error(v?._text ? `No image generated (${reason})` : `Empty response (${reason})`); e.isCandidateBlock = true; e.blockReason = reason; throw e; }
-                if (v) { v.parts = allParts; v.timestamp = Date.now(); for (const img of v._images) gallery.value.push({id: uid(), mimeType: img.mimeType, data: img.data, prompt: promptTxt, timestamp: Date.now()}); }
+                if (v) {
+                    v.parts = allParts;
+                    v.timestamp = Date.now();
+                    const conv = getActiveConversation();
+                    if (conv && conv.gallery) {
+                        for (let i = 0; i < v._images.length; i++) {
+                            const img = v._images[i];
+                            // convert inline image data base64 string to WebP to save space
+                            try {
+                                const webp = await convertBase64ToWebP(img.data, img.mimeType);
+                                conv.gallery.push({id: uid(), mimeType: webp.mimeType, data: webp.data, prompt: promptTxt, timestamp: Date.now()});
+                                // update the variant as well
+                                v._images[i] = { mimeType: webp.mimeType, data: webp.data };
+                            } catch (e) {
+                                console.error('Failed to convert image to WebP:', e);
+                                conv.gallery.push({id: uid(), mimeType: img.mimeType, data: img.data, prompt: promptTxt, timestamp: Date.now()});
+                            }
+                        }
+                    }
+                }
             };
 
             // Shared retry-loop error handler — returns true to continue, false to break
@@ -854,10 +1189,21 @@
                 const idx = messages.value.findIndex(m => m.id === msgId);
                 if (idx !== -1) { messages.value.splice(idx, 1); store.addToast({msg: 'All variants deleted', type: 'success', duration: 2000}); }
             };
-            const newChat = () => { messages.value = []; gallery.value = []; };
+            const newChat = () => {
+                const newId = uid();
+                conversations.value.unshift({id: newId, title: 'New Conversation', messages: [], gallery: []});
+                activeConversationId.value = newId;
+            };
             const abort = () => abortCtrl.value?.abort();
 
-            return {messages, gallery, generating, generatingMsgId, sendMessage, regenerateMessage, deleteMessage, deleteAllVariants, newChat, abort};
+            // Initialize a chat if none exists
+            if (!conversations.value.length) {
+                newChat();
+            } else if (!activeConversationId.value) {
+                activeConversationId.value = conversations.value[0].id;
+            }
+
+            return {conversations, activeConversationId, messages, gallery, generating, generatingMsgId, sendMessage, regenerateMessage, deleteMessage, deleteAllVariants, newChat, selectConversation, renameConversation, deleteConversation, abort};
         });
 
         // --- ChatMessage Component ---
@@ -1001,7 +1347,7 @@
         const NanoBananaStudio = {
             setup() {
                 const store = useAppStore();
-                const {messages, gallery, generating, sendMessage, newChat, abort} = useGeminiAPI();
+                const {conversations, activeConversationId, messages, gallery, generating, sendMessage, newChat, selectConversation, renameConversation, deleteConversation, abort} = useGeminiAPI();
 
                 const editState = ref(null);
                 const pendingImages = ref([]);
@@ -1011,6 +1357,12 @@
                 const promptInputEl = ref(null);
                 const fileInput = ref(null);
                 const editFileInput = ref(null);
+
+                const renamingId = ref(null);
+                const newTitle = ref('');
+
+                const startRename = (conv) => { renamingId.value = conv.id; newTitle.value = conv.title; };
+                const finishRename = (conv) => { if (newTitle.value.trim()) renameConversation(conv.id, newTitle.value); renamingId.value = null; };
 
                 const geminiConfig = store.config.value.gemini;
                 const hasApiKey = computed(() => !!geminiConfig.apiKey);
@@ -1039,9 +1391,21 @@
                     const arr = files instanceof FileList ? Array.from(files) : [files];
                     const valid = arr.filter(f => f?.type.startsWith('image/'));
                     if (!valid.length) { store.addToast({msg: 'Please upload an image file', type: 'error'}); return; }
-                    const results = await Promise.all(valid.map(readBase64));
-                    if (forEdit && editState.value) editState.value.images.push(...results.map(r => ({id: uid(), data: r.data, mimeType: r.mimeType, name: r.name, hidden: false})));
-                    else pendingImages.value.push(...results.map(r => ({data: r.data, mimeType: r.mimeType, name: r.name})));
+                    const base64Results = await Promise.all(valid.map(readBase64));
+
+                    const webpResults = [];
+                    for (const r of base64Results) {
+                        try {
+                            const webp = await convertBase64ToWebP(r.data, r.mimeType);
+                            webpResults.push({ id: uid(), data: webp.data, mimeType: webp.mimeType, name: r.name.replace(/\.[^/.]+$/, "") + ".webp", hidden: false });
+                        } catch (e) {
+                            console.error('Failed to convert image to WebP:', e);
+                            webpResults.push({ id: uid(), data: r.data, mimeType: r.mimeType, name: r.name, hidden: false });
+                        }
+                    }
+
+                    if (forEdit && editState.value) editState.value.images.push(...webpResults);
+                    else pendingImages.value.push(...webpResults.map(r => ({data: r.data, mimeType: r.mimeType, name: r.name})));
                 };
                 const removePendingImage = (idx) => pendingImages.value.splice(idx, 1);
                 const useAsInput = (img) => { pendingImages.value.push({data: img.data, mimeType: img.mimeType, name: 'generated.png'}); store.addToast({msg: 'Image added as reference', type: 'success', duration: 2000}); };
@@ -1063,16 +1427,51 @@
                 if (window.marked) window.marked.setOptions({breaks: true, gfm: true});
 
                 return {
-                    messages, gallery, generating, showGallery, editState, pendingImages, lightboxSrc,
-                    chatEl, promptInputEl, fileInput, editFileInput,
+                    conversations, activeConversationId, messages, gallery, generating, showGallery, editState, pendingImages, lightboxSrc,
+                    chatEl, promptInputEl, fileInput, editFileInput, renamingId, newTitle, startRename, finishRename,
                     hasApiKey, geminiConfig, aspectRatios, tips, thinkingOpts, imageSizeOpts,
-                    imgSrc, newChat, abort, doSend,
+                    imgSrc, newChat, selectConversation, deleteConversation, abort, doSend,
                     handleFileUpload, removePendingImage, useAsInput, useAsInputFromSrc, downloadImage,
                     setPrompt, autoResize, onKeydown, onPaste,
                 };
             },
             template: `
 <div class="flex flex-col h-full">
+  <split-pane config-key="splitSizesBanana" :min-size="[250, 400]">
+  <template #left>
+    <div class="flex flex-col h-full gap-2 pt-2">
+      <div class="px-2 flex items-center justify-between">
+        <span class="text-sm font-semibold uppercase tracking-widest text-neutral-500">Conversations</span>
+        <icon-btn icon="add" size="btn-sm" color="btn-ghost" tooltip="New chat" @click="newChat"></icon-btn>
+      </div>
+      <div class="flex-1 overflow-y-auto custom-scroll px-2 space-y-1 pb-4">
+        <div v-for="c in conversations" :key="c.id"
+             @click="selectConversation(c.id)"
+             class="group flex items-center gap-2 p-2 rounded-lg cursor-pointer transition-colors"
+             :class="activeConversationId === c.id ? 'bg-primary/20 text-primary' : 'hover:bg-white/5 text-neutral-300'">
+          <material-icon icon="chat_bubble" size="16" class="shrink-0 opacity-70"></material-icon>
+          <div class="flex-1 min-w-0">
+            <input v-if="renamingId === c.id"
+                   v-model="newTitle"
+                   @blur="finishRename(c)"
+                   @keydown.enter="finishRename(c)"
+                   @keydown.esc="renamingId = null"
+                   class="input input-xs w-full bg-base-300 text-neutral-100"
+                   ref="renameInput"
+                   v-focus>
+            <span v-else class="truncate text-sm block" @dblclick="startRename(c)">{{ c.title || 'New Conversation' }}</span>
+          </div>
+          <div class="opacity-0 group-hover:opacity-100 flex items-center shrink-0">
+            <icon-btn v-if="renamingId !== c.id" icon="edit" size="btn-xs min-h-0 h-6 w-6" color="btn-ghost text-neutral-400 hover:text-white" @click.stop="startRename(c)"></icon-btn>
+            <icon-btn icon="delete" size="btn-xs min-h-0 h-6 w-6" color="btn-ghost text-error/70 hover:text-error" @click.stop="deleteConversation(c.id)"></icon-btn>
+          </div>
+        </div>
+        <div v-if="!conversations.length" class="text-xs text-center text-neutral-500 py-4">No conversations yet</div>
+      </div>
+    </div>
+  </template>
+  <template #right>
+  <div class="flex flex-col h-full">
   <div class="z-10 shrink-0">
     <collapsible-panel storage-key="banana-settings" flush>
       <template #header>
@@ -1184,6 +1583,9 @@
       </div>
     </transition>
   </teleport>
+</div>
+  </template>
+  </split-pane>
 </div>`
         };
 
@@ -1194,7 +1596,7 @@
         ];
 
         const Settings = {
-            setup: () => ({app: useAppStore().config.value.app, gemini: useAppStore().config.value.gemini, models}),
+            setup: () => ({app: useAppStore().config.value.app, gemini: useAppStore().config.value.gemini, box: useAppStore().config.value.box, models}),
             template:`
                 <div class="max-w-4xl mx-auto p-4 space-y-4 h-full custom-scroll">
                     <collapsible-panel title="API Configuration" storage-key="api-config">
@@ -1204,6 +1606,12 @@
                         <div class="pt-2 space-y-3">
                             <setting-input v-model="gemini.apiKey" label="Gemini API Key" type="password" placeholder="AIzaSy..."></setting-input>
                             <p class="text-xs text-neutral-500 ml-1">Get a free key from <a href="https://aistudio.google.com/apikey" target="_blank" class="text-primary hover:underline">Google AI Studio</a>. Stored locally.</p>
+                        </div>
+                    </collapsible-panel>
+                    <collapsible-panel title="Box Cloud Storage" storage-key="box-api-config">
+                        <div class="pt-2 space-y-3">
+                            <setting-input v-model="box.developerToken" label="Box Developer Token" type="password" placeholder="..."></setting-input>
+                            <p class="text-xs text-neutral-500 ml-1">Create an app in Box Developer Console and generate a Developer Token to sync data to your Box account.</p>
                         </div>
                     </collapsible-panel>
                     <collapsible-panel title="Application Settings" storage-key="app-settings">
@@ -1240,7 +1648,27 @@
         // --- Main App ---
         const App = {
             setup() {
-                const {notifications, resetNotificationNum, config} = useAppStore();
+                const store = useAppStore();
+                const {notifications, resetNotificationNum, config, largeData} = store;
+                const boxAPI = useBoxAPI();
+
+                onMounted(async () => {
+                    store.isHydrating = true;
+                    await boxAPI.validateToken();
+                    if (boxAPI.isReady.value) {
+                        const loadedState = await boxAPI.loadState();
+                        if (loadedState) {
+                            // Merge loaded state directly into config and largeData
+                            const { genHistory, conversations, ...rest } = loadedState;
+                            if (genHistory) largeData.genHistory = genHistory;
+                            if (conversations) largeData.conversations = conversations;
+                            Object.assign(config.value, rest);
+                            store.addToast({msg: 'Settings loaded from Box.', type: 'success', duration: 2000});
+                        }
+                    }
+                    await nextTick();
+                    store.isHydrating = false;
+                });
                 const navItems = computed(() => [
                     {path:'/gen', icon:'image', label:'NAI Image Generator', source: 'gen'},
                     {path:'/tagtest', icon:'lab_research', label:'NAI Tag Test', source: 'tagTest'},
@@ -1270,8 +1698,10 @@
         
         const app = createApp(App);
         Object.entries({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ImageViewer, ToastContainer, PromptInput, FolderDropdown, NavLink, ChatMessage, NanoBananaStudio}).forEach(([n, c]) => app.component(n, c));
+        app.directive('focus', { mounted: el => el.focus() });
         app.use(router);
         app.mount('#app');
+        window.__VUE_APP_MOUNTED__ = true;
     </script>
 </body>
 </html> 
