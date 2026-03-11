@@ -6,7 +6,7 @@ test.describe('Global Utilities in index.html', () => {
         const filePath = `file://${path.resolve('index.html')}`;
         await page.goto(filePath);
         // Wait for vue to load and global functions to be available
-        await page.waitForFunction(() => typeof formatDisplayNum === 'function');
+        await page.waitForFunction(() => typeof formatDisplayNum === 'function', {timeout: 20000});
     });
 
     test('formatDisplayNum formats numbers correctly', async ({ page }) => {
