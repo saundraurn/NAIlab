@@ -177,10 +177,19 @@
         });
 
         const hydrateFromLoadedState = (loadedState, config, largeData) => {
-            const { genHistory, conversations, box: _ignoredBox, ...rest } = loadedState;
+            const { genHistory, conversations, box, ...rest } = loadedState;
             if (genHistory) largeData.genHistory = genHistory;
             if (conversations) largeData.conversations = conversations;
-            _.mergeWith(config.value, rest, (objValue, srcValue) => _.isArray(srcValue) ? srcValue : undefined);
+
+            // Allow merging of safe Box config keys (like clientId, clientSecret),
+            // but explicitly discard tokens so we don't overwrite the active session.
+            let safeBoxState = {};
+            if (box) {
+                const { accessToken, refreshToken, tokenExpiresAt, ...safeBoxConfig } = box;
+                safeBoxState = { box: safeBoxConfig };
+            }
+
+            _.mergeWith(config.value, { ...rest, ...safeBoxState }, (objValue, srcValue) => _.isArray(srcValue) ? srcValue : undefined);
         };
 
         // --- Box API Service ---
@@ -332,7 +341,19 @@
                     const refreshed = await refreshPromise;
                     refreshPromise = null;
                     if (refreshed) {
-                        options.headers = _headers();
+                        const store = useAppStore();
+                        const token = store.config.value.box?.accessToken;
+                        if (options.headers) {
+                            if (options.headers instanceof Headers) {
+                                options.headers.set('Authorization', `Bearer ${token}`);
+                            } else if (Array.isArray(options.headers)) {
+                                const authIndex = options.headers.findIndex(h => h[0].toLowerCase() === 'authorization');
+                                if (authIndex >= 0) options.headers[authIndex][1] = `Bearer ${token}`;
+                                else options.headers.push(['Authorization', `Bearer ${token}`]);
+                            } else {
+                                options.headers = { ...options.headers, 'Authorization': `Bearer ${token}` };
+                            }
+                        }
                         res = await fetch(url, options);
                     } else {
                         isReady.value = false;
