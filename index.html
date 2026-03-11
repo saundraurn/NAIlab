@@ -115,15 +115,17 @@
                 const workerCode = `
                     import { encode } from 'https://esm.sh/@jsquash/webp?bundle';
                     self.onmessage = async (e) => {
+                        const { id, bitmap, quality } = e.data;
                         try {
-                            const { id, bitmap, quality } = e.data;
                             const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
                             const ctx = canvas.getContext('2d');
                             ctx.drawImage(bitmap, 0, 0);
                             const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+                            bitmap.close();
                             const resultBuffer = await encode(imageData, { effort: 6, quality: quality || 100 });
                             self.postMessage({ id, buffer: resultBuffer }, [resultBuffer]);
                         } catch (err) {
+                            try { bitmap.close(); } catch (_) {}
                             self.postMessage({ id: e.data.id, error: err.message });
                         }
                     };
@@ -1229,7 +1231,8 @@
                 return {thinking, text, images};
             };
 
-            const streamToVariant = async (msgId, varIdx, contents, promptTxt) => {
+            const streamToVariant = async (msgId, varIdx, contents, promptTxt, originatingConvId) => {
+                const conv = conversations.value.find(c => c.id === originatingConvId);
                 const getV = () => messages.value.find(m => m.id === msgId)?.variants[varIdx];
                 const res = await fetch(`${API_BASE}:streamGenerateContent?alt=sse`, {
                     method: 'POST',
@@ -1263,7 +1266,6 @@
                 if (v) { 
                     v.parts = allParts; 
                     v.timestamp = Date.now(); 
-                    const conv = getActiveConversation();
                     if (conv && conv.gallery) {
                         for (let i = 0; i < v._images.length; i++) {
                             const img = v._images[i];
@@ -1312,6 +1314,7 @@
                 if (!text && !imgs.length) return;
                 if (!store.config.value.gemini?.apiKey) { store.addToast({msg: 'Set your Gemini API key in Settings', type: 'error'}); return; }
                 if (generating.value) return;
+                const originatingConvId = activeConversationId.value;
                 const userMsg = reactive({id: uid(), role: 'user', images: imgs.map(i => ({id: uid(), data: i.data, mimeType: i.mimeType, name: i.name, hidden: false})), text: text || '', hidden: false, timestamp: Date.now()});
                 messages.value.push(userMsg);
                 const modelMsg = reactive({id: uid(), role: 'model', hidden: false, variants: [createVariant()], activeVariant: 0});
@@ -1321,7 +1324,7 @@
                 const modelIdx = messages.value.indexOf(modelMsg), contents = getContents(modelIdx), retryCount = ref(0);
                 while (true) {
                     const varIdx = modelMsg.activeVariant, v = modelMsg.variants[varIdx];
-                    try { await streamToVariant(modelMsg.id, varIdx, contents, text); break; }
+                    try { await streamToVariant(modelMsg.id, varIdx, contents, text, originatingConvId); break; }
                     catch (err) { if (!await handleStreamError(err, v, retryCount, () => { modelMsg.variants.push(createVariant()); modelMsg.activeVariant = modelMsg.variants.length - 1; })) break; }
                 }
                 generating.value = false; generatingMsgId.value = null; abortCtrl.value = null; scrollFn?.();
@@ -1331,13 +1334,14 @@
                 const msg = messages.value.find(m => m.id === msgId);
                 if (!msg || msg.role !== 'model' || generating.value) return;
                 if (!store.config.value.gemini?.apiKey) { store.addToast({msg: 'Set your Gemini API key first', type: 'error'}); return; }
+                const originatingConvId = activeConversationId.value;
                 msg.variants.push(createVariant()); msg.activeVariant = msg.variants.length - 1;
                 abortCtrl.value = new AbortController(); generating.value = true; generatingMsgId.value = msg.id;
                 const msgIdx = messages.value.indexOf(msg), contents = getContents(msgIdx), retryCount = ref(0);
                 let promptTxt = ''; for (let i = msgIdx - 1; i >= 0; i--) { if (messages.value[i].role === 'user') { promptTxt = messages.value[i].text || ''; break; } }
                 while (true) {
                     const varIdx = msg.activeVariant, v = msg.variants[varIdx];
-                    try { await streamToVariant(msgId, varIdx, contents, promptTxt); break; }
+                    try { await streamToVariant(msgId, varIdx, contents, promptTxt, originatingConvId); break; }
                     catch (err) { if (!await handleStreamError(err, v, retryCount, () => { msg.variants.push(createVariant()); msg.activeVariant = msg.variants.length - 1; })) break; }
                 }
                 generating.value = false; generatingMsgId.value = null; abortCtrl.value = null;
@@ -1844,7 +1848,7 @@
                         const loadedState = await boxAPI.loadState();
                         if (loadedState) {
                             // Merge loaded state directly into config and largeData
-                            const { genHistory, conversations, ...rest } = loadedState;
+                            const { genHistory, conversations, box: _ignoredBox, ...rest } = loadedState;
                             if (genHistory) largeData.genHistory = genHistory;
                             if (conversations) largeData.conversations = conversations;
                             Object.assign(config.value, rest);
