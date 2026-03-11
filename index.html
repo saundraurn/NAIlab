@@ -1265,12 +1265,10 @@
                     v.timestamp = Date.now(); 
                     const conv = getActiveConversation();
                     if (conv && conv.gallery) {
-                        for (let i = 0; i < v._images.length; i++) {
-                            const img = v._images[i];
+                        const results = await Promise.all(v._images.map(async (img, i) => {
                             // convert inline image data base64 string to WebP to save space
                             try {
                                 const webp = await convertBase64ToWebP(img.data, img.mimeType);
-                                conv.gallery.push({id: uid(), mimeType: webp.mimeType, data: webp.data, prompt: promptTxt, timestamp: Date.now()}); 
                                 // update the variant as well
                                 v._images[i] = { mimeType: webp.mimeType, data: webp.data };
                                 // update the original part so it's not saved at full size in the conversation history
@@ -1278,11 +1276,13 @@
                                 if (partIdx !== -1) {
                                     v.parts[partIdx].inlineData = { mimeType: webp.mimeType, data: webp.data };
                                 }
+                                return {id: uid(), mimeType: webp.mimeType, data: webp.data, prompt: promptTxt, timestamp: Date.now()};
                             } catch (e) {
                                 console.error('Failed to convert image to WebP:', e);
-                                conv.gallery.push({id: uid(), mimeType: img.mimeType, data: img.data, prompt: promptTxt, timestamp: Date.now()}); 
+                                return {id: uid(), mimeType: img.mimeType, data: img.data, prompt: promptTxt, timestamp: Date.now()};
                             }
-                        }
+                        }));
+                        conv.gallery.push(...results);
                     }
                 }
             };
@@ -1559,16 +1559,15 @@
                     if (!valid.length) { store.addToast({msg: 'Please upload an image file', type: 'error'}); return; }
                     const base64Results = await Promise.all(valid.map(readBase64));
                     
-                    const webpResults = [];
-                    for (const r of base64Results) {
+                    const webpResults = await Promise.all(base64Results.map(async (r) => {
                         try {
                             const webp = await convertBase64ToWebP(r.data, r.mimeType);
-                            webpResults.push({ id: uid(), data: webp.data, mimeType: webp.mimeType, name: r.name.replace(/\.[^/.]+$/, "") + ".webp", hidden: false });
+                            return { id: uid(), data: webp.data, mimeType: webp.mimeType, name: r.name.replace(/\.[^/.]+$/, "") + ".webp", hidden: false };
                         } catch (e) {
                             console.error('Failed to convert image to WebP:', e);
-                            webpResults.push({ id: uid(), data: r.data, mimeType: r.mimeType, name: r.name, hidden: false });
+                            return { id: uid(), data: r.data, mimeType: r.mimeType, name: r.name, hidden: false };
                         }
-                    }
+                    }));
 
                     if (forEdit && editState.value) editState.value.images.push(...webpResults);
                     else pendingImages.value.push(...webpResults.map(r => ({data: r.data, mimeType: r.mimeType, name: r.name})));
