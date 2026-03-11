@@ -341,7 +341,19 @@
                     const refreshed = await refreshPromise;
                     refreshPromise = null;
                     if (refreshed) {
-                        options.headers = _headers();
+                        const store = useAppStore();
+                        const token = store.config.value.box?.accessToken;
+                        if (options.headers) {
+                            if (options.headers instanceof Headers) {
+                                options.headers.set('Authorization', `Bearer ${token}`);
+                            } else if (Array.isArray(options.headers)) {
+                                const authIndex = options.headers.findIndex(h => h[0].toLowerCase() === 'authorization');
+                                if (authIndex >= 0) options.headers[authIndex][1] = `Bearer ${token}`;
+                                else options.headers.push(['Authorization', `Bearer ${token}`]);
+                            } else {
+                                options.headers = { ...options.headers, 'Authorization': `Bearer ${token}` };
+                            }
+                        }
                         res = await fetch(url, options);
                     } else {
                         isReady.value = false;
