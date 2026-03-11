@@ -343,7 +343,7 @@
             const getFolderId = async () => {
                 if (!isReady.value) return null;
                 const store = useAppStore();
-                const currentToken = store.config.value.box?.developerToken;
+                const currentToken = store.config.value.box?.accessToken;
                 if (currentToken !== lastToken) {
                     cachedFolderId = null;
                     cachedFileId = null;
