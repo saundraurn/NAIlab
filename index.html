@@ -176,6 +176,13 @@
             signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('', 'AbortError')); }, {once: true});
         });
 
+        const hydrateFromLoadedState = (loadedState, config, largeData) => {
+            const { genHistory, conversations, box: _ignoredBox, ...rest } = loadedState;
+            if (genHistory) largeData.genHistory = genHistory;
+            if (conversations) largeData.conversations = conversations;
+            _.mergeWith(config.value, rest, (objValue, srcValue) => _.isArray(srcValue) ? srcValue : undefined);
+        };
+
         // --- Box API Service ---
         const useBoxAPI = createGlobalState(() => {
             const FOLDER_NAME = 'NAIlabData';
@@ -248,11 +255,27 @@
                             });
                             if (!res.ok) throw new Error('Failed to exchange code for token');
                             const data = await res.json();
-                            store.config.value.box.accessToken = data.access_token;
-                            store.config.value.box.refreshToken = data.refresh_token;
-                            store.config.value.box.tokenExpiresAt = Date.now() + (data.expires_in * 1000);
-                            store.addToast({msg: 'Box connected successfully!', type: 'success'});
-                            await validateToken();
+
+                            store.isHydrating.value = true;
+                            try {
+                                store.config.value.box.accessToken = data.access_token;
+                                store.config.value.box.refreshToken = data.refresh_token;
+                                store.config.value.box.tokenExpiresAt = Date.now() + (data.expires_in * 1000);
+                                store.addToast({msg: 'Box connected successfully!', type: 'success'});
+
+                                const isValid = await validateToken();
+                                if (isValid) {
+                                    const loadedState = await loadState();
+                                    if (loadedState) {
+                                        hydrateFromLoadedState(loadedState, store.config, store.largeData);
+                                        store.addToast({msg: 'Settings loaded from Box.', type: 'success', duration: 2000});
+                                    }
+                                }
+
+                                await nextTick();
+                            } finally {
+                                store.isHydrating.value = false;
+                            }
                         } catch (e) {
                             console.error('Box OAuth error:', e);
                             store.addToast({msg: 'Failed to authenticate with Box.', type: 'error'});
@@ -338,15 +361,17 @@
             };
 
             let cachedFolderId = null;
-            let cachedFileId = null;
+            let cachedConfigFileId = null;
+            let cachedHistoryFileId = null;
             let lastToken = null;
             const getFolderId = async () => {
                 if (!isReady.value) return null;
                 const store = useAppStore();
-                const currentToken = store.config.value.box?.developerToken;
+                const currentToken = store.config.value.box?.accessToken;
                 if (currentToken !== lastToken) {
                     cachedFolderId = null;
-                    cachedFileId = null;
+                    cachedConfigFileId = null;
+                    cachedHistoryFileId = null;
                     lastToken = currentToken;
                 }
                 if (cachedFolderId) return cachedFolderId;
@@ -376,9 +401,6 @@
                 const data = await res.json();
                 return data.entries.find(e => e.name === name && e.type === 'file');
             };
-
-            let cachedConfigFileId = null;
-            let cachedHistoryFileId = null;
 
             const loadState = async () => {
                 if (!isReady.value) return null;
@@ -453,9 +475,12 @@
 
             const saveConfig = async (configObj) => {
                 if (!isReady.value) return;
+                const store = useAppStore();
+                if (store.isHydrating.value) return;
                 if (saveConfigTimeout) clearTimeout(saveConfigTimeout);
                 
                 saveConfigTimeout = setTimeout(async () => {
+                    if (store.isHydrating.value) return;
                     try {
                         const folderId = await getFolderId();
                         if (!cachedConfigFileId) {
@@ -475,9 +500,12 @@
 
             const saveHistory = async (historyObj) => {
                 if (!isReady.value) return;
+                const store = useAppStore();
+                if (store.isHydrating.value) return;
                 if (saveHistoryTimeout) clearTimeout(saveHistoryTimeout);
                 
                 saveHistoryTimeout = setTimeout(async () => {
+                    if (store.isHydrating.value) return;
                     try {
                         const folderId = await getFolderId();
                         if (!cachedHistoryFileId) {
@@ -1848,10 +1876,7 @@
                         const loadedState = await boxAPI.loadState();
                         if (loadedState) {
                             // Merge loaded state directly into config and largeData
-                            const { genHistory, conversations, box: _ignoredBox, ...rest } = loadedState;
-                            if (genHistory) largeData.genHistory = genHistory;
-                            if (conversations) largeData.conversations = conversations;
-                            Object.assign(config.value, rest);
+                            hydrateFromLoadedState(loadedState, config, largeData);
                             store.addToast({msg: 'Settings loaded from Box.', type: 'success', duration: 2000});
                         }
                     }
