@@ -917,10 +917,10 @@
           <material-icon icon="visibility_off" :size="14" class="text-white/70"></material-icon>
         </div>
         <div class="absolute top-1 right-1 flex gap-0.5 opacity-0 group-hover/uimg:opacity-100 transition-opacity">
-          <button @click.stop="toggleHideImage(img.id)" class="btn btn-xs bg-black/65 hover:bg-black/85 text-white border-none min-h-0 h-6 w-6 p-0 rounded-md" :title="img.hidden ? 'Show to model' : 'Hide from model'">
+          <button @click.stop="toggleHideImage(img.id)" class="btn btn-xs btn-square bg-black/65 hover:bg-black/85 text-white border-none rounded-md" :title="img.hidden ? 'Show to model' : 'Hide from model'">
             <material-icon :icon="img.hidden ? 'visibility' : 'visibility_off'" :size="12"></material-icon>
           </button>
-          <button @click.stop="deleteImage(img.id)" class="btn btn-xs bg-black/65 hover:bg-error text-white border-none min-h-0 h-6 w-6 p-0 rounded-md" title="Remove image">
+          <button @click.stop="deleteImage(img.id)" class="btn btn-xs btn-square bg-black/65 hover:bg-error text-white border-none rounded-md" title="Remove image">
             <material-icon icon="delete" :size="12"></material-icon>
           </button>
         </div>
@@ -954,8 +954,8 @@
       <div v-for="(img, i) in variant._images" :key="i" class="relative group/img cursor-pointer rounded-xl overflow-hidden border border-white/10 shadow-lg hover:shadow-accent/10 transition-shadow">
         <img :src="imgSrc(img)" class="max-h-72 block transition-transform duration-200 group-hover/img:scale-[1.012]" @click="emit('open-lightbox', imgSrc(img))">
         <div class="absolute bottom-2 right-2 flex gap-1.5 opacity-0 group-hover/img:opacity-100 transition-opacity">
-          <button @click.stop="downloadImage(imgSrc(img))" class="btn btn-xs bg-black/65 hover:bg-black/85 text-white border-none min-h-0 h-7 w-7 p-0 rounded-lg" title="Download"><material-icon icon="download" :size="14"></material-icon></button>
-          <button @click.stop="emit('use-as-input', img)" class="btn btn-xs bg-black/65 hover:bg-black/85 text-white border-none min-h-0 h-7 w-7 p-0 rounded-lg" title="Use as input"><material-icon icon="auto_fix_high" :size="14"></material-icon></button>
+          <button @click.stop="downloadImage(imgSrc(img))" class="btn btn-xs btn-square bg-black/65 hover:bg-black/85 text-white border-none rounded-lg" title="Download"><material-icon icon="download" :size="14"></material-icon></button>
+          <button @click.stop="emit('use-as-input', img)" class="btn btn-xs btn-square bg-black/65 hover:bg-black/85 text-white border-none rounded-lg" title="Use as input"><material-icon icon="auto_fix_high" :size="14"></material-icon></button>
         </div>
       </div>
     </div>
@@ -1137,17 +1137,17 @@
     <div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl">
       <div v-for="(img, idx) in pendingImages" :key="idx" class="relative group/pimg shrink-0">
         <img :src="imgSrc(img)" class="h-12 w-12 object-cover rounded-lg border border-white/20 block">
-        <button @click="removePendingImage(idx)" class="absolute -top-1.5 -right-1.5 btn btn-xs btn-circle btn-neutral border-none min-h-0 h-5 w-5 p-0 opacity-0 group-hover/pimg:opacity-100 transition-opacity shadow-sm hover:btn-error">
+        <button @click="removePendingImage(idx)" class="absolute -top-1.5 -right-1.5 btn btn-xs btn-circle btn-neutral border-none opacity-0 group-hover/pimg:opacity-100 transition-opacity shadow-sm hover:btn-error">
           <material-icon icon="close" :size="10"></material-icon>
         </button>
       </div>
     </div>
     <div class="flex items-center gap-2">
-      <button @click="fileInput.click()" class="btn btn-ghost btn-sm btn-square shrink-0 text-neutral-500 hover:text-white border-white/10" title="Upload image(s)">
+      <button @click="fileInput.click()" class="btn btn-ghost btn-square shrink-0 text-neutral-500 hover:text-white border-white/10" title="Upload image(s)">
         <material-icon icon="attach_file" :size="20"></material-icon>
       </button>
       <textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] max-h-[160px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea>
-      <button @click="generating ? abort() : doSend()" class="btn shrink-0 transition-colors shadow-sm w-9 h-9 p-0" :class="generating ? 'btn-error' : (hasApiKey ? 'btn-primary' : 'btn-disabled')" :title="generating ? 'Stop generation' : 'Send'">
+      <button @click="generating ? abort() : doSend()" class="btn btn-square shrink-0 transition-colors shadow-sm" :class="generating ? 'btn-error' : (hasApiKey ? 'btn-primary' : 'btn-disabled')" :title="generating ? 'Stop generation' : 'Send'">
         <material-icon :icon="generating ? 'stop' : 'send'" :size="18"></material-icon>
       </button>
     </div>
