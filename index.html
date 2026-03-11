@@ -98,34 +98,65 @@
         const readBase64 = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res({data: r.result.split(',')[1], mimeType: file.type, name: file.name}); r.onerror = rej; r.readAsDataURL(file); });
         const downloadImage = (src, name) => { const a = document.createElement('a'); a.href = src; a.download = name || 'gemini-'+Date.now()+'.png'; document.body.appendChild(a); a.click(); a.remove(); };
 
-        const convertBlobToWebP = (blob) => new Promise((resolve, reject) => {
-            const img = new Image();
-            img.onload = () => {
-                const canvas = document.createElement('canvas');
-                canvas.width = img.width;
-                canvas.height = img.height;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(img, 0, 0);
-                canvas.toBlob((webpBlob) => {
-                    if (webpBlob) {
+        let webpWorker = null;
+        const getWebPWorker = () => {
+            if (!webpWorker) {
+                const workerCode = `
+                    import { encode } from 'https://esm.sh/@jsquash/webp?bundle';
+                    self.onmessage = async (e) => {
+                        try {
+                            const { id, bitmap, quality } = e.data;
+                            const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+                            const ctx = canvas.getContext('2d');
+                            ctx.drawImage(bitmap, 0, 0);
+                            const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+                            const resultBuffer = await encode(imageData, { effort: 6, quality: quality || 100 });
+                            self.postMessage({ id, buffer: resultBuffer }, [resultBuffer]);
+                        } catch (err) {
+                            self.postMessage({ id: e.data.id, error: err.message });
+                        }
+                    };
+                `;
+                const blob = new Blob([workerCode], { type: 'application/javascript' });
+                webpWorker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+                webpWorker._callbacks = new Map();
+                webpWorker.onmessage = (e) => {
+                    const { id, buffer, error } = e.data;
+                    const cb = webpWorker._callbacks.get(id);
+                    if (cb) {
+                        webpWorker._callbacks.delete(id);
+                        if (error) cb.reject(new Error(error));
+                        else cb.resolve(buffer);
+                    }
+                };
+            }
+            return webpWorker;
+        };
+
+        const convertBlobToWebP = async (blob, quality = 100) => {
+            const bitmap = await createImageBitmap(blob);
+            const worker = getWebPWorker();
+            const id = Date.now() + '_' + Math.random();
+            return new Promise((resolve, reject) => {
+                worker._callbacks.set(id, {
+                    resolve: async (buffer) => {
+                        const webpBlob = new Blob([buffer], { type: 'image/webp' });
                         const reader = new FileReader();
-                        reader.onload = () => resolve({data: reader.result.split(',')[1], mimeType: 'image/webp', name: 'image.webp', blob: webpBlob});
+                        reader.onload = () => resolve({ data: reader.result.split(',')[1], mimeType: 'image/webp', name: 'image.webp', blob: webpBlob });
                         reader.onerror = reject;
                         reader.readAsDataURL(webpBlob);
-                    } else reject(new Error('Canvas toBlob failed'));
-                }, 'image/webp', 1.0);
-                URL.revokeObjectURL(img.src);
-            };
-            img.onerror = () => { URL.revokeObjectURL(img.src); reject(new Error('Image load failed')); };
-            img.src = URL.createObjectURL(blob);
-        });
-        const convertBase64ToWebP = (base64, mimeType = 'image/png') => new Promise((resolve, reject) => {
-            fetch(`data:${mimeType};base64,${base64}`)
-                .then(r => r.blob())
-                .then(blob => convertBlobToWebP(blob))
-                .then(resolve)
-                .catch(reject);
-        });
+                    },
+                    reject
+                });
+                worker.postMessage({ id, bitmap, quality }, [bitmap]);
+            });
+        };
+
+        const convertBase64ToWebP = async (base64, mimeType = 'image/png', quality = 100) => {
+            const r = await fetch(`data:${mimeType};base64,${base64}`);
+            const blob = await r.blob();
+            return await convertBlobToWebP(blob, quality);
+        };
         const abortableSleep = (ms, signal) => new Promise((resolve, reject) => {
             if (signal?.aborted) return reject(new DOMException('', 'AbortError'));
             const t = setTimeout(resolve, ms);
@@ -136,24 +167,62 @@
         const useBoxAPI = createGlobalState(() => {
             const FOLDER_NAME = 'NAIlabData';
             const STATE_FILE_NAME = 'appState.json';
-            const isReady = computed(() => {
+
+            const isReady = ref(false);
+            const isValidating = ref(false);
+
+            const validateToken = async () => {
                 const store = useAppStore();
-                return !!store.config.value.box?.developerToken;
-            });
+                const token = store.config.value.box?.developerToken;
+                if (!token) {
+                    isReady.value = false;
+                    return false;
+                }
+                isValidating.value = true;
+                try {
+                    const res = await fetch('https://api.box.com/2.0/users/me', {
+                        headers: { 'Authorization': `Bearer ${token}` }
+                    });
+                    isReady.value = res.ok;
+                    if (!res.ok) {
+                        store.addToast({msg: 'Box API Token Expired or Invalid.', type: 'error'});
+                    }
+                    return res.ok;
+                } catch (e) {
+                    isReady.value = false;
+                    return false;
+                } finally {
+                    isValidating.value = false;
+                }
+            };
+
             const _headers = () => {
                 const store = useAppStore();
-                return {'Authorization': `Bearer ${store.config.value.box.developerToken}`, 'Content-Type': 'application/json'};
+                const token = store.config.value.box?.developerToken;
+                if (!isReady.value || !token) return { 'Content-Type': 'application/json' };
+                return {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'};
+            };
+
+            const _fetch = async (url, options = {}) => {
+                const res = await fetch(url, options);
+                if (res.status === 401) {
+                    isReady.value = false;
+                    const store = useAppStore();
+                    store.addToast({msg: 'Box API Token Expired. Please refresh it in settings.', type: 'error', duration: 5000});
+                    throw new Error('Unauthorized');
+                }
+                return res;
             };
 
             const findFolder = async (name) => {
-                const res = await fetch(`https://api.box.com/2.0/search?query=${name}&type=folder`, {headers: _headers()});
+                const res = await _fetch(`https://api.box.com/2.0/search?query=${name}&type=folder`, {headers: _headers()});
                 if (!res.ok) throw new Error('Failed to search Box folders');
                 const data = await res.json();
                 return data.entries.find(e => e.name === name);
             };
 
             const createFolder = async (name) => {
-                const res = await fetch(`https://api.box.com/2.0/folders`, {
+                const res = await _fetch(`https://api.box.com/2.0/folders`, {
                     method: 'POST', headers: _headers(),
                     body: JSON.stringify({name, parent: {id: '0'}})
                 });
@@ -161,10 +230,18 @@
                 return await res.json();
             };
 
-            // Cache folder ID to avoid repetitive expensive search calls
             let cachedFolderId = null;
+            let cachedFileId = null;
+            let lastToken = null;
             const getFolderId = async () => {
                 if (!isReady.value) return null;
+                const store = useAppStore();
+                const currentToken = store.config.value.box?.developerToken;
+                if (currentToken !== lastToken) {
+                    cachedFolderId = null;
+                    cachedFileId = null;
+                    lastToken = currentToken;
+                }
                 if (cachedFolderId) return cachedFolderId;
 
                 // First try to search
@@ -172,7 +249,7 @@
 
                 // If not found, check items in root
                 if (!folder) {
-                    const res = await fetch(`https://api.box.com/2.0/folders/0/items`, {headers: _headers()});
+                    const res = await _fetch(`https://api.box.com/2.0/folders/0/items`, {headers: _headers()});
                     if (res.ok) {
                         const data = await res.json();
                         folder = data.entries.find(e => e.name === FOLDER_NAME && e.type === 'folder');
@@ -185,7 +262,7 @@
             };
 
             const findFile = async (folderId, name) => {
-                const res = await fetch(`https://api.box.com/2.0/folders/${folderId}/items`, {headers: _headers()});
+                const res = await _fetch(`https://api.box.com/2.0/folders/${folderId}/items`, {headers: _headers()});
                 if (!res.ok) throw new Error('Failed to list folder items');
                 const data = await res.json();
                 return data.entries.find(e => e.name === name && e.type === 'file');
@@ -198,7 +275,7 @@
                     const file = await findFile(folderId, STATE_FILE_NAME);
                     if (!file) return null;
 
-                    const res = await fetch(`https://api.box.com/2.0/files/${file.id}/content`, {headers: _headers()});
+                    const res = await _fetch(`https://api.box.com/2.0/files/${file.id}/content`, {headers: _headers()});
                     if (!res.ok) throw new Error('Failed to download state file');
                     return await res.json();
                 } catch (e) {
@@ -210,8 +287,6 @@
             };
 
             let saveTimeout = null;
-            // Cache file ID to avoid searching on every save
-            let cachedFileId = null;
             const saveState = async (stateObj) => {
                 if (!isReady.value) return;
 
@@ -235,7 +310,7 @@
                         if (cachedFileId) {
                             formData.append('attributes', JSON.stringify({name: STATE_FILE_NAME}));
                             formData.append('file', new Blob([stateStr], {type: 'application/json'}), STATE_FILE_NAME);
-                            const res = await fetch(`https://upload.box.com/api/2.0/files/${cachedFileId}/content`, {
+                            const res = await _fetch(`https://upload.box.com/api/2.0/files/${cachedFileId}/content`, {
                                 method: 'POST',
                                 headers: {'Authorization': `Bearer ${token}`},
                                 body: formData
@@ -244,7 +319,7 @@
                         } else {
                             formData.append('attributes', JSON.stringify({name: STATE_FILE_NAME, parent: {id: folderId}}));
                             formData.append('file', new Blob([stateStr], {type: 'application/json'}), STATE_FILE_NAME);
-                            const res = await fetch(`https://upload.box.com/api/2.0/files/content`, {
+                            const res = await _fetch(`https://upload.box.com/api/2.0/files/content`, {
                                 method: 'POST',
                                 headers: {'Authorization': `Bearer ${token}`},
                                 body: formData
@@ -265,7 +340,7 @@
                 }, 3000); // 3 second debounce
             };
 
-            return { isReady, loadState, saveState };
+            return { isReady, isValidating, validateToken, loadState, saveState };
         });
 
         // --- Unified Application Store ---
@@ -290,8 +365,10 @@
             const fullState = computed(() => ({...config.value, ...largeData}));
 
             const toasts = ref([]), notifications = reactive({}), queue = ref([]), isDispatcherRunning = ref(false), isApiHalted = ref(false);
+            const isHydrating = ref(false);
 
             watch(fullState, (newConfig) => {
+                if (isHydrating.value) return;
                 const boxAPI = useBoxAPI();
                 if (boxAPI.isReady.value) boxAPI.saveState(newConfig);
             }, { deep: true });
@@ -604,8 +681,8 @@
                 };
 
                 // Hydrate URLs on load for images loaded from storage
-                watch(() => genHistory.value, (newHist) => {
-                    newHist.forEach(img => {
+                watch(() => genHistory.value.length, () => {
+                    genHistory.value.forEach(img => {
                         // URL manager isn't globally exposed but we can simply check if we need to hydrate
                         // If it has a URL but was saved to Box, it's a dead blob URL from a previous session.
                         // We shouldn't store URLs in Box at all, so we just rebuild if needed:
@@ -621,7 +698,7 @@
                             img._hydrated = true;
                         }
                     });
-                }, {immediate: true, deep: true});
+                }, {immediate: true});
 
                 return {genState, genConfig, toRef, generate, statusMsg, viewedImg, setViewedImg: (image) => viewedImg.value = image, genHistory};
             },
@@ -1576,6 +1653,8 @@
                 const boxAPI = useBoxAPI();
 
                 onMounted(async () => {
+                    store.isHydrating = true;
+                    await boxAPI.validateToken();
                     if (boxAPI.isReady.value) {
                         const loadedState = await boxAPI.loadState();
                         if (loadedState) {
@@ -1587,6 +1666,8 @@
                             store.addToast({msg: 'Settings loaded from Box.', type: 'success', duration: 2000});
                         }
                     }
+                    await nextTick();
+                    store.isHydrating = false;
                 });
                 const navItems = computed(() => [
                     {path:'/gen', icon:'image', label:'NAI Image Generator', source: 'gen'},
@@ -1617,8 +1698,10 @@
         
         const app = createApp(App);
         Object.entries({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ImageViewer, ToastContainer, PromptInput, FolderDropdown, NavLink, ChatMessage, NanoBananaStudio}).forEach(([n, c]) => app.component(n, c));
+        app.directive('focus', { mounted: el => el.focus() });
         app.use(router);
         app.mount('#app');
+        window.__VUE_APP_MOUNTED__ = true;
     </script>
 </body>
 </html> 
