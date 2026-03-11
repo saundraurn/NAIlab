@@ -176,6 +176,13 @@
             signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('', 'AbortError')); }, {once: true});
         });
 
+        const hydrateFromLoadedState = (loadedState, config, largeData) => {
+            const { genHistory, conversations, box: _ignoredBox, ...rest } = loadedState;
+            if (genHistory) largeData.genHistory = genHistory;
+            if (conversations) largeData.conversations = conversations;
+            _.mergeWith(config.value, rest, (objValue, srcValue) => _.isArray(srcValue) ? srcValue : undefined);
+        };
+
         // --- Box API Service ---
         const useBoxAPI = createGlobalState(() => {
             const FOLDER_NAME = 'NAIlabData';
@@ -260,10 +267,7 @@
                                 if (isValid) {
                                     const loadedState = await loadState();
                                     if (loadedState) {
-                                        const { genHistory, conversations, box: _ignoredBox, ...rest } = loadedState;
-                                        if (genHistory) store.largeData.genHistory = genHistory;
-                                        if (conversations) store.largeData.conversations = conversations;
-                                        _.mergeWith(store.config.value, rest, (objValue, srcValue) => _.isArray(srcValue) ? srcValue : undefined);
+                                        hydrateFromLoadedState(loadedState, store.config, store.largeData);
                                         store.addToast({msg: 'Settings loaded from Box.', type: 'success', duration: 2000});
                                     }
                                 }
@@ -1872,10 +1876,7 @@
                         const loadedState = await boxAPI.loadState();
                         if (loadedState) {
                             // Merge loaded state directly into config and largeData
-                            const { genHistory, conversations, box: _ignoredBox, ...rest } = loadedState;
-                            if (genHistory) largeData.genHistory = genHistory;
-                            if (conversations) largeData.conversations = conversations;
-                            _.mergeWith(config.value, rest, (objValue, srcValue) => _.isArray(srcValue) ? srcValue : undefined);
+                            hydrateFromLoadedState(loadedState, config, largeData);
                             store.addToast({msg: 'Settings loaded from Box.', type: 'success', duration: 2000});
                         }
                     }
