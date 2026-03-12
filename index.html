@@ -286,7 +286,7 @@
                 try {
                     const gistData = await fetchGist(token, gistId);
                     const fileContent = gistData.files?.[GIST_FILENAME]?.content;
-                    if (!fileContent) return; // Gist exists but file not yet created
+                    if (!fileContent) { syncStatus.value = 'idle'; return; } // Gist exists but file not yet created
 
                     const remote = JSON.parse(fileContent);
                     const local = extractSyncPayload(cfg, true); // always use full local for comparison
@@ -1461,6 +1461,7 @@
 
                 watch(pendingConflict, (conflict) => {
                     if (!conflict) return;
+                    includeApiKeys.value = false;
                     SECTIONS.forEach(({ key }) => {
                         const localTime = conflict.local?._syncMeta?.[key]?.updatedAt || 0;
                         const remoteTime = conflict.remote?._syncMeta?.[key]?.updatedAt || 0;
@@ -1495,7 +1496,17 @@
                 };
                 const cancel = () => { syncStore.pendingConflict.value = null; syncStore.syncStatus.value = 'idle'; };
 
-                return { pendingConflict, syncStatus, SECTIONS, choices, includeApiKeys, expanded, setAll, isConflicted, apply, cancel, fmtTime };
+                const redactedJson = (obj) => {
+                    if (!obj) return '';
+                    const redact = (o) => {
+                        if (_.isArray(o)) return o.map(redact);
+                        if (_.isObject(o)) return _.mapValues(o, (v, k) => /apiKey|secret|token/i.test(k) ? '••••••••' : redact(v));
+                        return o;
+                    };
+                    return JSON.stringify(redact(_.cloneDeep(obj)), null, 2);
+                };
+
+                return { pendingConflict, syncStatus, SECTIONS, choices, includeApiKeys, expanded, setAll, isConflicted, apply, cancel, fmtTime, redactedJson };
             },
             template: `
 <teleport to="body">
@@ -1548,7 +1559,7 @@
                                 <div class="grid grid-cols-2 gap-2">
                                     <div v-for="side in ['local','remote']" :key="side" class="bg-base-300/50 rounded-lg p-2.5">
                                         <p class="text-xs font-bold uppercase tracking-wide mb-1.5" :class="side==='local' ? 'text-primary' : 'text-secondary'">{{ side }}</p>
-                                        <pre class="text-[10px] text-neutral-400 font-mono leading-relaxed overflow-auto max-h-40 custom-scroll">{{ JSON.stringify(pendingConflict[side]?.[sec.key], null, 2) }}</pre>
+                                        <pre class="text-[10px] text-neutral-400 font-mono leading-relaxed overflow-auto max-h-40 custom-scroll">{{ redactedJson(pendingConflict[side]?.[sec.key]) }}</pre>
                                     </div>
                                 </div>
                             </div>
@@ -1793,7 +1804,7 @@
                     }
                     // Auto-sync on config changes (debounced 5s, push only) — watch only synced sections to avoid firing on UI state
                     watch(
-                        () => { const c = config.value; return [c.tagTest, c.genConfig, c.genState, c.app, c.gemini, c.danbooru, c.jssync]; },
+                        () => { const c = config.value; return [c.tagTest, c.genConfig, c.genState, c.app, c.gemini, c.danbooru]; },
                         useDebounceFn(() => {
                             const js = config.value.jssync;
                             if (!js.autoSync || !js.token || !js.gistId) return;
