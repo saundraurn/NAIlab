@@ -26,6 +26,13 @@
     <script src="https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js"></script>
     <script src="https://unpkg.com/textarea-caret@3.1.0/index.js"></script>
 
+    <script src="https://unpkg.com/@isomorphic-git/lightning-fs@4.6.2"></script>
+    <script src="https://unpkg.com/isomorphic-git@1.37.2"></script>
+    <script type="module">
+        import http from 'https://unpkg.com/isomorphic-git@1.37.2/http/web/index.js';
+        window.gitHttp = http;
+    </script>
+
     <link href="https://fonts.googleapis.com/css2?family=Raleway:wght@300;400;500;600;700&family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 
@@ -88,6 +95,63 @@
         // --- Global Utilities ---
         const uid = () => crypto.randomUUID();
         const imgSrc = (img) => img ? `data:${img.mimeType};base64,${img.data}` : '';
+        const uint8ArrayToBase64 = (arr) => {
+            let binary = '';
+            const chunkSize = 8192;
+            for (let i = 0; i < arr.length; i += chunkSize) {
+                binary += String.fromCharCode.apply(null, arr.subarray(i, i + chunkSize));
+            }
+            return btoa(binary);
+        };
+
+        const WEBP_WORKER_CODE = `
+            import encode from 'https://esm.sh/@jsquash/webp@0.1.4';
+            self.onmessage = async (e) => {
+                const { id, imageData } = e.data;
+                try {
+                    const webpData = new Uint8Array(await encode(imageData, { effort: 6, quality: 100 }));
+                    self.postMessage({ id, webp: webpData }, [webpData.buffer]);
+                } catch (error) {
+                    self.postMessage({ id, error: error.message });
+                }
+            };
+        `;
+        let webpWorkerInstance = null;
+        const getWebPWorker = () => {
+            if (!webpWorkerInstance) {
+                const blob = new Blob([WEBP_WORKER_CODE], { type: 'text/javascript' });
+                webpWorkerInstance = new Worker(URL.createObjectURL(blob), { type: 'module' });
+            }
+            return webpWorkerInstance;
+        };
+
+        const blobToWebP = async (blob) => {
+            const bitmap = await createImageBitmap(blob);
+            const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(bitmap, 0, 0);
+            const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+
+            return new Promise((resolve, reject) => {
+                const worker = getWebPWorker();
+                const id = uid();
+                const handler = (e) => {
+                    if (e.data.id === id) {
+                        worker.removeEventListener('message', handler);
+                        if (e.data.error) reject(new Error(e.data.error));
+                        else resolve(e.data.webp);
+                    }
+                };
+                worker.addEventListener('message', handler);
+                worker.postMessage({ id, imageData });
+            });
+        };
+
+        const base64ToWebP = async (base64, mimeType) => {
+            const res = await fetch(`data:${mimeType};base64,${base64}`);
+            const blob = await res.blob();
+            return await blobToWebP(blob);
+        };
         const fmtTokens = (n) => !n ? '0' : n >= 1000 ? (n/1000).toFixed(1)+'k' : String(n);
         const markdownCache = new Map();
         const markdownParse = (text) => {
@@ -96,7 +160,7 @@
             try { const r = window.marked ? window.marked.parse(text) : text; markdownCache.set(text, r); return r; } catch { return text; }
         };
         const readBase64 = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res({data: r.result.split(',')[1], mimeType: file.type, name: file.name}); r.onerror = rej; r.readAsDataURL(file); });
-        const downloadImage = (src, name) => { const a = document.createElement('a'); a.href = src; a.download = name || 'gemini-'+Date.now()+'.png'; document.body.appendChild(a); a.click(); a.remove(); };
+        const downloadImage = (src, name) => { const a = document.createElement('a'); a.href = src; a.download = name || 'gemini-'+Date.now()+'.webp'; document.body.appendChild(a); a.click(); a.remove(); };
         const abortableSleep = (ms, signal) => new Promise((resolve, reject) => {
             if (signal?.aborted) return reject(new DOMException('', 'AbortError'));
             const t = setTimeout(resolve, ms);
@@ -221,6 +285,110 @@
             }
             return fetch(url, options); // direct fallback
         };
+
+        // --- Image Store (LightningFS + isomorphic-git) ---
+        const useImageStore = createGlobalState(() => {
+            const store = useAppStore();
+            let lfs = null;
+
+            const init = async () => {
+                lfs = new LightningFS('nailab-git');
+                try {
+                    await lfs.promises.stat('/.git');
+                } catch (e) {
+                    await window.git.init({ fs: lfs, dir: '/' });
+                }
+            };
+
+            const saveImage = async (imageId, uint8Array) => {
+                await lfs.promises.writeFile('/' + imageId, uint8Array);
+            };
+
+            const loadImage = async (imageId) => {
+                try {
+                    return await lfs.promises.readFile('/' + imageId);
+                } catch (e) {
+                    return null;
+                }
+            };
+
+            const deleteImage = async (imageId) => {
+                try {
+                    await lfs.promises.unlink('/' + imageId);
+                } catch (e) {}
+            };
+
+            const saveConversations = async (serialized) => {
+                await lfs.promises.writeFile('/conversations.json', JSON.stringify(serialized));
+            };
+
+            const loadConversations = async () => {
+                try {
+                    const data = await lfs.promises.readFile('/conversations.json', 'utf8');
+                    return JSON.parse(data);
+                } catch (e) {
+                    return null;
+                }
+            };
+
+            const gitSync = async () => {
+                const config = store.config.value;
+                const token = store.syncToken.value;
+                const { gistId, proxyUrl, proxyUrl2 } = config.jssync;
+                if (!token || !gistId) return null;
+
+                const primaryProxy = proxyUrl || proxyUrl2;
+                if (!primaryProxy) {
+                    console.warn('Image sync requires a Cloudflare Worker proxy.');
+                    return null;
+                }
+                const pUrl = primaryProxy.replace(/\/$/, '') + '/git';
+                const authParams = {
+                    onAuth: () => ({ username: 'token', password: token }),
+                    corsProxy: pUrl,
+                    author: { name: 'NAILab', email: 'sync@nailab' }
+                };
+
+                try {
+                    store.addToast({ msg: 'Syncing images...', type: 'info', duration: 2000, source: 'sync' });
+                    try {
+                        await lfs.promises.stat('/.git');
+                        await window.git.pull({
+                            fs: lfs, http: window.gitHttp, dir: '/',
+                            ...authParams, singleBranch: true
+                        });
+                    } catch (e) {
+                        // clone if no .git or pull fails drastically on empty repo
+                        await window.git.clone({
+                            fs: lfs, http: window.gitHttp, dir: '/',
+                            url: 'https://gist.github.com/' + gistId + '.git',
+                            depth: 1, ...authParams, singleBranch: true
+                        });
+                    }
+
+                    const status = await window.git.statusMatrix({ fs: lfs, dir: '/' });
+                    const changed = status.some(row => row[1] !== row[2] || row[2] !== row[3]);
+
+                    if (changed) {
+                        await window.git.add({ fs: lfs, dir: '/', filepath: '.' });
+                        await window.git.commit({ fs: lfs, dir: '/', message: 'Update images', author: authParams.author });
+                        await window.git.push({
+                            fs: lfs, http: window.gitHttp, dir: '/',
+                            ...authParams
+                        });
+                    }
+
+                    const pFreshData = await loadConversations();
+                    store.addToast({ msg: 'Image sync complete!', type: 'success', source: 'sync' });
+                    return pFreshData;
+                } catch (e) {
+                    store.addToast({ msg: 'Image sync failed — remote may have new changes. Try syncing again.', type: 'error', duration: 5000, source: 'sync' });
+                    return null;
+                }
+            };
+
+            return { init, saveImage, loadImage, deleteImage, saveConversations, loadConversations, gitSync, getLfs: () => lfs };
+        });
 
         // --- Sync Store (GitHub Gist REST API) ---
         const useSyncStore = createGlobalState(() => {
@@ -978,6 +1146,127 @@
                         </split-pane></div></div>`
         }
         
+        // --- Conversation Serialization format ---
+        const serializeConversation = async (messages, gallery) => {
+            const imageStore = useImageStore();
+            const serializedMessages = await Promise.all(messages.map(async (msg) => {
+                const sMsg = { ...msg };
+
+                if (sMsg.images && sMsg.images.length > 0) {
+                    sMsg.images = await Promise.all(sMsg.images.map(async (img, idx) => {
+                        if (!img.imageId && img.data) {
+                            // If user image isn't WebP yet, we must convert it and mutate the original object in memory
+                            // so it doesn't get processed again on the next debounce.
+                            let webpBytes;
+                            if (img.mimeType === 'image/webp') {
+                                // If already webp, just decode base64 to bytes
+                                const binStr = atob(img.data);
+                                webpBytes = new Uint8Array(binStr.length);
+                                for (let i = 0; i < binStr.length; i++) webpBytes[i] = binStr.charCodeAt(i);
+                            } else {
+                                webpBytes = await base64ToWebP(img.data, img.mimeType);
+                                img.data = uint8ArrayToBase64(webpBytes);
+                                img.mimeType = 'image/webp';
+                            }
+                            img.imageId = 'img_' + uid() + '.webp';
+                            await imageStore.saveImage(img.imageId, webpBytes);
+                        }
+                        return { id: img.id, imageId: img.imageId, mimeType: 'image/webp', name: img.name, hidden: img.hidden };
+                    }));
+                }
+
+                if (sMsg.variants && sMsg.variants.length > 0) {
+                    sMsg.variants = await Promise.all(sMsg.variants.map(async (v) => {
+                        const sV = { ...v, _images: v._images.map(img => ({ mimeType: img.mimeType, imageId: img.imageId })) };
+                        let inlineDataCount = 0;
+                        sV.parts = await Promise.all(v.parts.map(async (part) => {
+                            if (part.inlineData) {
+                                let imageId = v._images[inlineDataCount]?.imageId;
+                                if (!imageId) {
+                                    const webpBytes = await base64ToWebP(part.inlineData.data, part.inlineData.mimeType);
+                                    imageId = 'img_' + uid() + '.webp';
+                                    await imageStore.saveImage(imageId, webpBytes);
+
+                                    // Mutate the live array so it doesn't get regenerated on the next debounce save
+                                    if (v._images[inlineDataCount]) {
+                                        v._images[inlineDataCount].imageId = imageId;
+                                    }
+                                }
+                                inlineDataCount++;
+                                return { ...part, inlineData: undefined, _imageRef: imageId, _mimeType: 'image/webp' };
+                            }
+                            return part;
+                        }));
+                        return sV;
+                    }));
+                }
+                return sMsg;
+            }));
+
+            const serializedGallery = gallery.map(item => ({ id: item.id, mimeType: item.mimeType, prompt: item.prompt, timestamp: item.timestamp, imageId: item.imageId }));
+            return { messages: serializedMessages, gallery: serializedGallery };
+        };
+
+        const deserializeConversation = async (serializedData) => {
+            if (!serializedData) return { messages: [], gallery: [] };
+            const imageStore = useImageStore();
+            const messages = await Promise.all((serializedData.messages || []).map(async (msg) => {
+                const dMsg = { ...msg };
+
+                if (dMsg.images && dMsg.images.length > 0) {
+                    dMsg.images = await Promise.all(dMsg.images.map(async (img) => {
+                        const dImg = { ...img };
+                        if (dImg.imageId) {
+                            const bytes = await imageStore.loadImage(dImg.imageId);
+                            if (bytes) {
+                                dImg.data = uint8ArrayToBase64(bytes);
+                            } else {
+                                dImg.data = null;
+                            }
+                        }
+                        return dImg;
+                    }));
+                }
+
+                if (dMsg.variants && dMsg.variants.length > 0) {
+                    dMsg.variants = await Promise.all(dMsg.variants.map(async (v) => {
+                        const dV = { ...v };
+                        dV.parts = await Promise.all(v.parts.map(async (part) => {
+                            if (part._imageRef) {
+                                const bytes = await imageStore.loadImage(part._imageRef);
+                                if (bytes) {
+                                    return { ...part, inlineData: { data: uint8ArrayToBase64(bytes), mimeType: part._mimeType || 'image/webp' }, _imageRef: undefined, _mimeType: undefined };
+                                } else {
+                                    console.warn(`Missing image data for ${part._imageRef}`);
+                                    return { ...part, _imageRef: undefined, _mimeType: undefined };
+                                }
+                            }
+                            return part;
+                        }));
+                        dV._images = await Promise.all((v._images || []).map(async (img) => {
+                            if (img.imageId) {
+                                const bytes = await imageStore.loadImage(img.imageId);
+                                return { ...img, data: bytes ? uint8ArrayToBase64(bytes) : null };
+                            }
+                            return img;
+                        }));
+                        return dV;
+                    }));
+                }
+                return dMsg;
+            }));
+
+            const gallery = await Promise.all((serializedData.gallery || []).map(async (item) => {
+                if (item.imageId) {
+                    const bytes = await imageStore.loadImage(item.imageId);
+                    return { ...item, data: bytes ? uint8ArrayToBase64(bytes) : null };
+                }
+                return item;
+            }));
+
+            return { messages, gallery };
+        };
+
         // --- Gemini API Composable ---
         const CANDIDATE_BLOCK_REASONS = new Set(['SAFETY','IMAGE_SAFETY','IMAGE_PROHIBITED_CONTENT','PROHIBITED_CONTENT','RECITATION','IMAGE_RECITATION','OTHER','IMAGE_OTHER','NO_IMAGE','BLOCKLIST','SPII']);
         const TERMINAL_FINISH_REASONS = new Set(['LANGUAGE','MODEL_ARMOR']);
@@ -989,14 +1278,36 @@
             const generating = ref(false);
             const generatingMsgId = ref(null);
             const abortCtrl = ref(null);
+            const isHydrating = ref(false);
             const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview';
+
+            const imageStore = useImageStore();
+            const debouncedSaveConversation = useDebounceFn(async () => {
+                if (isHydrating.value) return;
+                const serialized = await serializeConversation(messages.value, gallery.value);
+                await imageStore.saveConversations(serialized);
+            }, 2000);
+
+            const initFromStorage = async () => {
+                isHydrating.value = true;
+                const stored = await imageStore.loadConversations();
+                if (stored) {
+                    const deserialized = await deserializeConversation(stored);
+                    messages.value = deserialized.messages;
+                    gallery.value = deserialized.gallery;
+                }
+                isHydrating.value = false;
+            };
+
+            watch(messages, debouncedSaveConversation, { deep: true });
+            watch(gallery, debouncedSaveConversation, { deep: true });
 
             const createVariant = () => reactive({id: uid(), parts: [], _thinking: '', _text: '', _images: [], _usage: null, _error: null, _blockReason: null, _isPromptBlock: false, timestamp: null});
 
             const getMsgParts = (msg) => {
                 if (msg.role === 'model' && msg.variants) { const v = msg.variants[msg.activeVariant] ?? msg.variants[0]; return v ? v.parts : []; }
                 const parts = [];
-                for (const img of (msg.images || [])) { if (!img.hidden) parts.push({inlineData: {data: img.data, mimeType: img.mimeType}}); }
+                for (const img of (msg.images || [])) { if (!img.hidden && img.data) parts.push({inlineData: {data: img.data, mimeType: img.mimeType}}); }
                 if (msg.text) parts.push({text: msg.text});
                 return parts;
             };
@@ -1059,7 +1370,28 @@
                 if (TERMINAL_FINISH_REASONS.has(finalFinishReason)) { const e = new Error(`Generation stopped: ${finalFinishReason}`); e.isTerminal = true; e.blockReason = finalFinishReason; throw e; }
                 const v = getV();
                 if (!v?._images?.length) { const reason = finalFinishReason || 'EMPTY'; const e = new Error(v?._text ? `No image generated (${reason})` : `Empty response (${reason})`); e.isCandidateBlock = true; e.blockReason = reason; throw e; }
-                if (v) { v.parts = allParts; v.timestamp = Date.now(); for (const img of v._images) gallery.value.push({id: uid(), mimeType: img.mimeType, data: img.data, prompt: promptTxt, timestamp: Date.now()}); }
+                if (v) {
+                    let inlineDataCount = 0;
+                    for (let i = 0; i < allParts.length; i++) {
+                        if (allParts[i].inlineData) {
+                            const webpBytes = await base64ToWebP(allParts[i].inlineData.data, allParts[i].inlineData.mimeType);
+                            const imageId = 'img_' + uid() + '.webp';
+                            await imageStore.saveImage(imageId, webpBytes);
+                            allParts[i].inlineData.data = uint8ArrayToBase64(webpBytes);
+                            allParts[i].inlineData.mimeType = 'image/webp';
+                            v._images[inlineDataCount].data = allParts[i].inlineData.data;
+                            v._images[inlineDataCount].mimeType = 'image/webp';
+                            v._images[inlineDataCount].imageId = imageId;
+                            inlineDataCount++;
+                        }
+                    }
+
+                    v.parts = allParts;
+                    v.timestamp = Date.now();
+                    for (const img of v._images) {
+                        gallery.value.push({id: uid(), mimeType: img.mimeType, data: img.data, prompt: promptTxt, timestamp: Date.now(), imageId: img.imageId});
+                    }
+                }
             };
 
             // Shared retry-loop error handler — returns true to continue, false to break
@@ -1130,10 +1462,10 @@
                 const idx = messages.value.findIndex(m => m.id === msgId);
                 if (idx !== -1) { messages.value.splice(idx, 1); store.addToast({msg: 'All variants deleted', type: 'success', duration: 2000}); }
             };
-            const newChat = () => { messages.value = []; gallery.value = []; };
+            const newChat = () => { messages.value = []; gallery.value = []; imageStore.saveConversations({messages:[], gallery:[]}); };
             const abort = () => abortCtrl.value?.abort();
 
-            return {messages, gallery, generating, generatingMsgId, sendMessage, regenerateMessage, deleteMessage, deleteAllVariants, newChat, abort};
+            return {messages, gallery, generating, generatingMsgId, sendMessage, regenerateMessage, deleteMessage, deleteAllVariants, newChat, abort, initFromStorage, isHydrating};
         });
 
         // --- ChatMessage Component ---
@@ -1277,7 +1609,7 @@
         const NanoBananaStudio = {
             setup() {
                 const store = useAppStore();
-                const {messages, gallery, generating, sendMessage, newChat, abort} = useGeminiAPI();
+                const {messages, gallery, generating, sendMessage, newChat, abort, isHydrating} = useGeminiAPI();
 
                 const editState = ref(null);
                 const pendingImages = ref([]);
@@ -1315,7 +1647,11 @@
                     const arr = files instanceof FileList ? Array.from(files) : [files];
                     const valid = arr.filter(f => f?.type.startsWith('image/'));
                     if (!valid.length) { store.addToast({msg: 'Please upload an image file', type: 'error'}); return; }
-                    const results = await Promise.all(valid.map(readBase64));
+                    const results = await Promise.all(valid.map(async f => {
+                        const b64 = await readBase64(f);
+                        const webpBytes = await base64ToWebP(b64.data, b64.mimeType);
+                        return { data: uint8ArrayToBase64(webpBytes), mimeType: 'image/webp', name: b64.name };
+                    }));
                     if (forEdit && editState.value) editState.value.images.push(...results.map(r => ({id: uid(), data: r.data, mimeType: r.mimeType, name: r.name, hidden: false})));
                     else pendingImages.value.push(...results.map(r => ({data: r.data, mimeType: r.mimeType, name: r.name})));
                 };
@@ -1342,7 +1678,7 @@
                     messages, gallery, generating, showGallery, editState, pendingImages, lightboxSrc,
                     chatEl, promptInputEl, fileInput, editFileInput,
                     hasApiKey, geminiConfig, aspectRatios, tips, thinkingOpts, imageSizeOpts,
-                    imgSrc, newChat, abort, doSend,
+                    imgSrc, newChat, abort, doSend, isHydrating,
                     handleFileUpload, removePendingImage, useAsInput, useAsInputFromSrc, downloadImage,
                     setPrompt, autoResize, onKeydown, onPaste,
                 };
@@ -1386,7 +1722,7 @@
   </div>
 
   <div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4">
-    <div v-if="!messages.length" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none">
+    <div v-if="!messages.length && !isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none">
       <material-icon icon="auto_awesome" :size="64" class="text-accent/40"></material-icon>
       <div>
         <h3 class="text-xl font-bold text-neutral-200 mb-1.5 tracking-tight">What will you create?</h3>
@@ -1395,6 +1731,10 @@
       <div class="flex flex-wrap gap-2 justify-center mt-1">
         <button v-for="tip in tips" :key="tip.label" @click="setPrompt(tip.prompt)" class="btn btn-sm glass-nested border-white/10 text-neutral-400 hover:text-accent hover:border-accent/30 text-xs font-medium transition-colors">{{tip.label}}</button>
       </div>
+    </div>
+    <div v-else-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none">
+      <span class="loading loading-spinner loading-lg text-primary"></span>
+      <p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p>
     </div>
     <chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState"
       @update:edit-state="editState = $event"
@@ -1622,6 +1962,7 @@
             setup() {
                 const appStore = useAppStore();
                 const syncStore = useSyncStore();
+                const imageStore = useImageStore();
                 const app = appStore.config.value.app;
                 const gemini = appStore.config.value.gemini;
                 const jssync = appStore.config.value.jssync;
@@ -1630,6 +1971,72 @@
 
                 const isCreatingGist = ref(false);
                 const showToken = ref(false);
+
+                const isImageSyncing = ref(false);
+                const imageCacheSize = ref(0);
+                const imageCacheCount = ref(0);
+                const imageSyncStatus = ref('');
+
+                const updateImageCacheStats = async () => {
+                    const lfs = imageStore.getLfs();
+                    if (!lfs) return;
+                    try {
+                        const files = await lfs.promises.readdir('/');
+                        let size = 0;
+                        let count = 0;
+                        for (const file of files) {
+                            if (file.startsWith('img_') && file.endsWith('.webp')) {
+                                const stat = await lfs.promises.stat('/' + file);
+                                size += stat.size;
+                                count++;
+                            }
+                        }
+                        imageCacheCount.value = count;
+                        imageCacheSize.value = (size / 1024 / 1024).toFixed(2);
+                    } catch (e) {
+                        console.error('Failed to calculate image cache stats:', e);
+                    }
+                };
+
+                onMounted(updateImageCacheStats);
+                watch(() => useGeminiAPI().gallery.value.length, updateImageCacheStats);
+
+                const handleImageSync = async () => {
+                    isImageSyncing.value = true;
+                    imageSyncStatus.value = 'Syncing...';
+
+                    const pUrl = jssync.proxyUrl || jssync.proxyUrl2;
+                    if (!pUrl && jssync.gistId) {
+                        appStore.addToast({ msg: 'Image sync requires a Cloudflare Worker proxy.', type: 'warning', duration: 4000 });
+                        isImageSyncing.value = false;
+                        imageSyncStatus.value = 'Missing proxy URL';
+                        return;
+                    }
+
+                    await imageStore.gitSync();
+                    imageSyncStatus.value = 'Images synced';
+                    setTimeout(() => imageSyncStatus.value = '', 3000);
+                    isImageSyncing.value = false;
+                    await updateImageCacheStats();
+                };
+
+                const clearImageCache = async () => {
+                    if (!confirm('This removes local image data. Images will re-download on next sync if available in Gist. Are you sure?')) return;
+                    const lfs = imageStore.getLfs();
+                    if (!lfs) return;
+                    try {
+                        const files = await lfs.promises.readdir('/');
+                        for (const file of files) {
+                            if (file.startsWith('img_') && file.endsWith('.webp')) {
+                                await lfs.promises.unlink('/' + file);
+                            }
+                        }
+                        await updateImageCacheStats();
+                        appStore.addToast({ msg: 'Image cache cleared.', type: 'success' });
+                    } catch (e) {
+                        appStore.addToast({ msg: 'Failed to clear cache: ' + e.message, type: 'error' });
+                    }
+                };
 
                 const statusMeta = computed(() => {
                     const m = {
@@ -1660,7 +2067,7 @@
                     syncStore.syncNow();
                 };
 
-                return { app, gemini, jssync, syncToken, models, isSyncing, syncStatus, syncError, statusMeta, showToken, isCreatingGist, handleCreateGist, handleSyncNow, fmtSyncTime };
+                return { app, gemini, jssync, syncToken, models, isSyncing, syncStatus, syncError, statusMeta, showToken, isCreatingGist, handleCreateGist, handleSyncNow, fmtSyncTime, isImageSyncing, imageCacheSize, imageCacheCount, imageSyncStatus, handleImageSync, clearImageCache };
             },
             template:`
                 <div class="max-w-4xl mx-auto p-4 space-y-4 h-full custom-scroll">
@@ -1776,7 +2183,22 @@
                                 </div>
                                 <div class="divider my-1 text-xs text-neutral-600">not synced</div>
                                 <div class="flex flex-wrap gap-x-4 gap-y-0.5">
-                                    <span v-for="item in ['UI layout & panel states','Session state','Gen/chat history (Phase 2)']" :key="item" class="flex items-center gap-1 text-xs text-neutral-600"><material-icon icon="remove" :size="10"></material-icon>{{item}}</span>
+                                    <span v-for="item in ['UI layout & panel states','Session state','Gen history']" :key="item" class="flex items-center gap-1 text-xs text-neutral-600"><material-icon icon="remove" :size="10"></material-icon>{{item}}</span>
+                                </div>
+                            </div>
+
+                            <div class="divider text-xs text-neutral-500">Image Sync</div>
+                            <div class="flex items-center justify-between gap-4 p-3 glass-nested rounded-xl">
+                                <div>
+                                    <p class="text-sm text-neutral-200">{{ imageCacheCount }} images stored locally (~{{ imageCacheSize }} MB)</p>
+                                    <p class="text-xs text-neutral-500">{{ imageSyncStatus }}</p>
+                                </div>
+                                <div class="flex gap-2">
+                                    <button @click="clearImageCache" class="btn btn-xs btn-error btn-outline" :disabled="isImageSyncing || imageCacheCount === 0">Clear Cache</button>
+                                    <button @click="handleImageSync" class="btn btn-xs btn-primary gap-1" :disabled="isImageSyncing || !syncToken || !jssync.gistId">
+                                        <span v-if="isImageSyncing" class="loading loading-spinner loading-xs"></span>
+                                        <material-icon v-else icon="sync" :size="14"></material-icon> Sync Images
+                                    </button>
                                 </div>
                             </div>
                         </div>
@@ -1826,11 +2248,18 @@
                 onMounted(async () => {
                     const {syncToken} = useAppStore();
                     const jssync = config.value.jssync;
+                    const imageStore = useImageStore();
+                    const geminiAPI = useGeminiAPI();
+
+                    // Run syncStore.pull in the background, don't wait for it to finish initializing the app
                     if (syncToken.value && jssync.gistId) {
-                        try {
-                            await syncStore.pull();
-                        } catch (e) { /* errors handled inside pull */ }
+                        syncStore.pull().catch(() => {});
                     }
+
+                    await imageStore.init();
+
+                    await geminiAPI.initFromStorage();
+
                     // Auto-sync on config changes (debounced 5s) — pull-then-push so conflicts are detected
                     watch(
                         () => { const c = config.value; return [c.tagTest, c.genConfig, c.genState, c.app, c.gemini, c.danbooru]; },
@@ -1840,6 +2269,20 @@
                             if (syncStore.syncStatus.value === 'conflict') return;
                             syncStore.syncNow();
                         }, 5000),
+                        { deep: true }
+                    );
+
+                    watch(
+                        () => geminiAPI.messages.value,
+                        useDebounceFn(async () => {
+                            const js = config.value.jssync;
+                            if (!syncToken.value || !js.gistId || syncStore.syncStatus.value === 'conflict') return;
+                            const freshData = await imageStore.gitSync();
+                            if (freshData) {
+                                geminiAPI.messages.value = (await deserializeConversation(freshData)).messages;
+                                geminiAPI.gallery.value = (await deserializeConversation(freshData)).gallery;
+                            }
+                        }, 10000),
                         { deep: true }
                     );
                 });
