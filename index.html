@@ -231,7 +231,7 @@
 
             // Merge helper: replaces arrays wholesale instead of merging element-by-index
             const mergeWithArrayReplace = (obj, src) =>
-                _.mergeWith({}, obj, src, (_, srcVal) => _.isArray(srcVal) ? _.cloneDeep(srcVal) : undefined);
+                _.mergeWith({}, obj, src, (_objVal, srcVal) => _.isArray(srcVal) ? _.cloneDeep(srcVal) : undefined);
 
             const SYNCED_SECTIONS = ['tagTest', 'genConfig', 'genState', 'app', 'gemini', 'danbooru', '_syncMeta'];
             const GIST_FILENAME = 'nailab-config.json';
@@ -317,8 +317,13 @@
                             conflicts.push(key);
                         } else if (remoteChanged) {
                             autoMerged[key] = remote[key]; // take remote
+                        } else if (!localChanged && !remoteChanged) {
+                            // Content differs but neither side has a rev increment since last sync —
+                            // this happens on initial setup (all revs zero) or after a baseline reset.
+                            // Present as a conflict so the user can choose which side to keep.
+                            conflicts.push(key);
                         }
-                        // else: local changed or neither — local wins, keep as-is
+                        // else: only local changed — local wins, keep as-is
                     });
 
                     if (conflicts.length > 0) {
@@ -407,6 +412,11 @@
                     const gistData = await createGist(token, content);
                     cfg.jssync.gistId = gistData.id;
                     cfg.jssync.lastSyncedAt = Date.now();
+                    // Establish rev baseline so future pulls on this browser don't misread the initial push as a conflict
+                    if (!cfg.jssync.lastSyncedRevs) cfg.jssync.lastSyncedRevs = {};
+                    SYNCED_SECTIONS.filter(k => k !== '_syncMeta').forEach(k => {
+                        cfg.jssync.lastSyncedRevs[k] = cfg._syncMeta?.[k]?.rev || 0;
+                    });
                     syncStatus.value = 'idle';
                     appStore.addToast({msg: 'Gist created! ID saved.', type: 'success', source: 'sync'});
                     return gistData.id;
