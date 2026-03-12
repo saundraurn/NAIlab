@@ -113,9 +113,12 @@
                 gemini: {apiKey:'', thinkingLevel:'MINIMAL', aspectRatio:'1:1', imageSize:'1K', autoRetry:false},
                 danbooru: {folders:[], nextFolderId:1, gridCols:4, lastPath:'/danbooru', blacklist:'', sortOrder:'id', ratingFilters:{g:true, s:true, q:true, e:true}, savedSearches:[{name:'Trending', prompt:'order:rank'}]},
                 genState: {prompt:'1girl, solo, wearing casual clothes', uc:'multiple views, monochrome, black and white, looking at viewer, pov', charPrompts:[{id:1, val:''}], nextCharPromptId:2},
-                jssync: {token:'', gistId:'', proxyUrl:'', proxyUrl2:'', includeApiKeys:false, autoSync:true, lastSyncedAt:null, lastPulledEtag:''},
-                _syncMeta: {tagTest:{updatedAt:0}, genConfig:{updatedAt:0}, genState:{updatedAt:0}, app:{updatedAt:0}, gemini:{updatedAt:0}, danbooru:{updatedAt:0}}
+                jssync: {gistId:'', proxyUrl:'', proxyUrl2:'', includeApiKeys:false, autoSync:true, lastSyncedAt:null, lastPulledEtag:'', lastSyncedRevs:{}},
+                _syncMeta: {tagTest:{updatedAt:0,rev:0}, genConfig:{updatedAt:0,rev:0}, genState:{updatedAt:0,rev:0}, app:{updatedAt:0,rev:0}, gemini:{updatedAt:0,rev:0}, danbooru:{updatedAt:0,rev:0}}
             }, {mergeDefaults: true});
+
+            // Token held in sessionStorage only — never written to localStorage or synced to Gist
+            const syncToken = useSessionStorage('nai-sync-token', '');
 
             // Guard flag: set true during remote merges so watchers don't stamp _syncMeta
             const isSyncMerging = ref(false);
@@ -125,7 +128,9 @@
             WATCHED_SECTIONS.forEach(section => {
                 watch(() => config.value[section], () => {
                     if (isSyncMerging.value || !config.value._syncMeta) return;
-                    config.value._syncMeta[section].updatedAt = Date.now();
+                    const meta = config.value._syncMeta[section];
+                    meta.rev = (meta.rev || 0) + 1;
+                    meta.updatedAt = Date.now();
                 }, {deep: true});
             });
 
@@ -197,7 +202,7 @@
                 } finally {isDispatcherRunning.value = false;}
             };
 
-            return {config, toasts, addToast, removeToast, notifications, resetNotificationNum: (src) => updateNotification(src, 0), queue, isDispatcherRunning, isApiHalted, addReqs, clearQueueBySource, startDispatcher, isSyncMerging};
+            return {config, toasts, addToast, removeToast, notifications, resetNotificationNum: (src) => updateNotification(src, 0), queue, isDispatcherRunning, isApiHalted, addReqs, clearQueueBySource, startDispatcher, isSyncMerging, syncToken};
         });
 
         // --- Danbooru Fetch Utility (proxy-aware with automatic failover) ---
@@ -279,7 +284,7 @@
             const pull = async () => {
                 const appStore = useAppStore();
                 const cfg = appStore.config.value;
-                const { token, gistId, includeApiKeys } = cfg.jssync;
+                const token = appStore.syncToken.value;
                 if (!token || !gistId) return;
 
                 syncStatus.value = 'pulling'; syncError.value = null;
@@ -289,34 +294,35 @@
                     if (!fileContent) { syncStatus.value = 'idle'; return; } // Gist exists but file not yet created
 
                     const remote = JSON.parse(fileContent);
-                    const local = extractSyncPayload(cfg, true); // always use full local for comparison
+                    // Use same sanitization as remote so API keys don't cause false diffs
+                    const local = extractSyncPayload(cfg, includeApiKeys);
                     const localMeta = cfg._syncMeta || {};
                     const remoteMeta = remote._syncMeta || {};
+                    const lastSyncedRevs = cfg.jssync.lastSyncedRevs || {};
 
-                    // Detect per-section conflicts
+                    // Detect per-section conflicts using rev counters (immune to clock skew)
                     const conflicts = [];
                     const autoMerged = {};
                     SYNCED_SECTIONS.filter(k => k !== '_syncMeta').forEach(key => {
                         if (!remote[key]) return;
-                        const localTime = localMeta[key]?.updatedAt || 0;
-                        const remoteTime = remoteMeta[key]?.updatedAt || 0;
                         const isDifferent = !_.isEqual(local[key], remote[key]);
-                        if (!isDifferent) return; // identical, skip
-                        if (remoteTime > localTime) {
-                            // Remote is newer — check if local also changed since last pull
-                            const bothChanged = localTime > 0 && localTime > (cfg.jssync.lastSyncedAt || 0);
-                            if (bothChanged && remoteTime > (cfg.jssync.lastSyncedAt || 0)) {
-                                conflicts.push(key);
-                            } else {
-                                autoMerged[key] = remote[key]; // take remote
-                            }
+                        if (!isDifferent) return; // identical content, nothing to do
+                        const localRev = localMeta[key]?.rev || 0;
+                        const remoteRev = remoteMeta[key]?.rev || 0;
+                        const lastRev = lastSyncedRevs[key] || 0;
+                        const localChanged = localRev > lastRev;
+                        const remoteChanged = remoteRev > lastRev;
+                        if (localChanged && remoteChanged) {
+                            conflicts.push(key);
+                        } else if (remoteChanged) {
+                            autoMerged[key] = remote[key]; // take remote
                         }
-                        // If localTime >= remoteTime, local wins — keep as-is
+                        // else: local changed or neither — local wins, keep as-is
                     });
 
                     if (conflicts.length > 0) {
                         pendingConflict.value = {
-                            local: extractSyncPayload(cfg, true),
+                            local: extractSyncPayload(cfg, includeApiKeys),
                             remote,
                             conflictKeys: conflicts
                         };
@@ -332,14 +338,17 @@
                                 if (key === '_syncMeta') return;
                                 cfg[key] = mergeWithArrayReplace(cfg[key], val);
                             });
-                            // Merge _syncMeta
+                            // Adopt remote _syncMeta for auto-merged sections
                             if (remote._syncMeta) {
-                                SYNCED_SECTIONS.filter(k => k !== '_syncMeta').forEach(k => {
-                                    if (remote._syncMeta[k]?.updatedAt > (cfg._syncMeta[k]?.updatedAt || 0)) {
-                                        cfg._syncMeta[k] = remote._syncMeta[k];
-                                    }
+                                Object.keys(autoMerged).forEach(k => {
+                                    if (remote._syncMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remote._syncMeta[k]);
                                 });
                             }
+                            // Record remote revs as last-synced for merged sections
+                            if (!cfg.jssync.lastSyncedRevs) cfg.jssync.lastSyncedRevs = {};
+                            Object.keys(autoMerged).forEach(k => {
+                                cfg.jssync.lastSyncedRevs[k] = remoteMeta[k]?.rev || 0;
+                            });
                         } finally {
                             appStore.isSyncMerging.value = false;
                         }
@@ -359,7 +368,8 @@
             const push = async (silent = false) => {
                 const appStore = useAppStore();
                 const cfg = appStore.config.value;
-                const { token, gistId, includeApiKeys } = cfg.jssync;
+                const token = appStore.syncToken.value;
+                const { gistId, includeApiKeys } = cfg.jssync;
                 if (!token || !gistId) return;
 
                 syncStatus.value = 'pushing'; syncError.value = null;
@@ -369,6 +379,11 @@
                     const updated = await updateGist(token, gistId, content);
                     cfg.jssync.lastSyncedAt = Date.now();
                     cfg.jssync.lastPulledEtag = updated.updated_at || '';
+                    // Record current local revs so future pulls know what changed since this push
+                    if (!cfg.jssync.lastSyncedRevs) cfg.jssync.lastSyncedRevs = {};
+                    SYNCED_SECTIONS.filter(k => k !== '_syncMeta').forEach(k => {
+                        cfg.jssync.lastSyncedRevs[k] = cfg._syncMeta?.[k]?.rev || 0;
+                    });
                     syncStatus.value = 'idle';
                     if (!silent) appStore.addToast({msg: 'Config pushed to Gist.', type: 'success', source: 'sync', duration: 2500});
                 } catch (e) {
@@ -381,7 +396,8 @@
             const createAndSetGist = async () => {
                 const appStore = useAppStore();
                 const cfg = appStore.config.value;
-                const { token, includeApiKeys } = cfg.jssync;
+                const token = appStore.syncToken.value;
+                const { includeApiKeys } = cfg.jssync;
                 if (!token) throw new Error('No GitHub token configured.');
                 syncStatus.value = 'pushing'; syncError.value = null;
                 try {
@@ -406,7 +422,7 @@
                 isSyncing.value = true;
                 try {
                     await pull();
-                    if (syncStatus.value !== 'conflict') await push(true);
+                    if (syncStatus.value === 'idle') await push(true);
                 } finally { isSyncing.value = false; }
             };
 
@@ -429,8 +445,8 @@
                             if (chosenMeta && chosenMeta.updatedAt > (cfg._syncMeta[k]?.updatedAt || 0)) {
                                 cfg._syncMeta[k] = chosenMeta;
                             }
-                            // Bump to now so this push wins over any concurrent remote
-                            cfg._syncMeta[k] = { ...(cfg._syncMeta[k] || {}), updatedAt: Date.now() };
+                            // Bump rev and updatedAt so this push wins over any concurrent remote
+                            cfg._syncMeta[k] = { ...(cfg._syncMeta[k] || {}), rev: (cfg._syncMeta[k]?.rev || 0) + 1, updatedAt: Date.now() };
                         });
                     }
                 } finally {
@@ -1598,6 +1614,7 @@
                 const app = appStore.config.value.app;
                 const gemini = appStore.config.value.gemini;
                 const jssync = appStore.config.value.jssync;
+                const syncToken = appStore.syncToken;
                 const { isSyncing, syncStatus, syncError } = syncStore;
 
                 const isCreatingGist = ref(false);
@@ -1621,18 +1638,18 @@
                 };
 
                 const handleCreateGist = async () => {
-                    if (!jssync.token) return appStore.addToast({msg: 'Enter your GitHub PAT first.', type: 'error', source: 'sync'});
+                    if (!syncToken.value) return appStore.addToast({msg: 'Enter your GitHub PAT first.', type: 'error', source: 'sync'});
                     isCreatingGist.value = true;
                     try { await syncStore.createAndSetGist(); } finally { isCreatingGist.value = false; }
                 };
 
                 const handleSyncNow = () => {
-                    if (!jssync.token) return appStore.addToast({msg: 'Configure sync first.', type: 'error', source: 'sync'});
+                    if (!syncToken.value) return appStore.addToast({msg: 'Configure sync first.', type: 'error', source: 'sync'});
                     if (!jssync.gistId) return appStore.addToast({msg: 'No Gist ID. Create or enter one.', type: 'error', source: 'sync'});
                     syncStore.syncNow();
                 };
 
-                return { app, gemini, jssync, models, isSyncing, syncStatus, syncError, statusMeta, showToken, isCreatingGist, handleCreateGist, handleSyncNow, fmtSyncTime };
+                return { app, gemini, jssync, syncToken, models, isSyncing, syncStatus, syncError, statusMeta, showToken, isCreatingGist, handleCreateGist, handleSyncNow, fmtSyncTime };
             },
             template:`
                 <div class="max-w-4xl mx-auto p-4 space-y-4 h-full custom-scroll">
@@ -1660,14 +1677,14 @@
                                 <span>Cross-Browser Config Sync</span>
                             </span>
                             <!-- Status indicator -->
-                            <span v-if="jssync.token && jssync.gistId" class="flex items-center gap-1.5 ml-1 shrink-0">
+                            <span v-if="syncToken && jssync.gistId" class="flex items-center gap-1.5 ml-1 shrink-0">
                                 <span v-if="isSyncing" class="loading loading-spinner loading-xs text-info"></span>
                                 <material-icon v-else :icon="statusMeta.icon" :size="16" :class="statusMeta.color"></material-icon>
                                 <span class="text-xs font-medium" :class="statusMeta.color">{{ statusMeta.text }}</span>
                             </span>
                         </template>
                         <template #actions>
-                            <button @click.stop="handleSyncNow" :disabled="isSyncing || !jssync.token || !jssync.gistId" class="btn btn-xs btn-ghost border border-white/10 gap-1" title="Sync Now">
+                            <button @click.stop="handleSyncNow" :disabled="isSyncing || !syncToken || !jssync.gistId" class="btn btn-xs btn-ghost border border-white/10 gap-1" title="Sync Now">
                                 <span v-if="isSyncing" class="loading loading-spinner loading-xs"></span>
                                 <material-icon v-else icon="sync" :size="14"></material-icon>
                                 <span>Sync Now</span>
@@ -1688,7 +1705,7 @@
                             <div class="relative">
                                 <floating-label label="GitHub Personal Access Token"></floating-label>
                                 <div class="flex gap-2 mt-1">
-                                    <input v-model="jssync.token" :type="showToken ? 'text' : 'password'" placeholder="github_pat_..." class="input input-sm input-bordered flex-1 pt-2 text-sm font-mono">
+                                    <input v-model="syncToken" :type="showToken ? 'text' : 'password'" placeholder="github_pat_..." class="input input-sm input-bordered flex-1 pt-2 text-sm font-mono">
                                     <button @click="showToken = !showToken" class="btn btn-sm btn-ghost btn-square border border-white/10" :title="showToken ? 'Hide' : 'Show'">
                                         <material-icon :icon="showToken ? 'visibility_off' : 'visibility'" :size="16"></material-icon>
                                     </button>
@@ -1701,7 +1718,7 @@
                                 <floating-label label="Gist ID"></floating-label>
                                 <div class="flex gap-2 mt-1">
                                     <input v-model="jssync.gistId" type="text" placeholder="e.g. a1b2c3d4e5f6..." class="input input-sm input-bordered flex-1 pt-2 text-sm font-mono">
-                                    <button @click="handleCreateGist" :disabled="isCreatingGist || !jssync.token" class="btn btn-sm btn-secondary gap-1 shrink-0" title="Create new private Gist automatically">
+                                    <button @click="handleCreateGist" :disabled="isCreatingGist || !syncToken" class="btn btn-sm btn-secondary gap-1 shrink-0" title="Create new private Gist automatically">
                                         <span v-if="isCreatingGist" class="loading loading-spinner loading-xs"></span>
                                         <material-icon v-else icon="add" :size="14"></material-icon>
                                         <span>New</span>
@@ -1796,20 +1813,21 @@
                 useRouter().afterEach((to) => to.meta.genSource && resetNotificationNum(to.meta.genSource));
 
                 onMounted(async () => {
+                    const {syncToken} = useAppStore();
                     const jssync = config.value.jssync;
-                    if (jssync.token && jssync.gistId) {
+                    if (syncToken.value && jssync.gistId) {
                         try {
                             await syncStore.pull();
                         } catch (e) { /* errors handled inside pull */ }
                     }
-                    // Auto-sync on config changes (debounced 5s, push only) — watch only synced sections to avoid firing on UI state
+                    // Auto-sync on config changes (debounced 5s) — pull-then-push so conflicts are detected
                     watch(
                         () => { const c = config.value; return [c.tagTest, c.genConfig, c.genState, c.app, c.gemini, c.danbooru]; },
                         useDebounceFn(() => {
                             const js = config.value.jssync;
-                            if (!js.autoSync || !js.token || !js.gistId) return;
+                            if (!js.autoSync || !syncToken.value || !js.gistId) return;
                             if (syncStore.syncStatus.value === 'conflict') return;
-                            syncStore.push(true);
+                            syncStore.syncNow();
                         }, 5000),
                         { deep: true }
                     );
