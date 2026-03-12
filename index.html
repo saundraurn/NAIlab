@@ -117,11 +117,15 @@
                 _syncMeta: {tagTest:{updatedAt:0}, genConfig:{updatedAt:0}, genState:{updatedAt:0}, app:{updatedAt:0}, gemini:{updatedAt:0}, danbooru:{updatedAt:0}}
             }, {mergeDefaults: true});
 
+            // Guard flag: set true during remote merges so watchers don't stamp _syncMeta
+            const isSyncMerging = ref(false);
+
             // Section-level watchers that stamp _syncMeta on any meaningful change
             const WATCHED_SECTIONS = ['tagTest', 'genConfig', 'genState', 'app', 'gemini', 'danbooru'];
             WATCHED_SECTIONS.forEach(section => {
                 watch(() => config.value[section], () => {
-                    if (config.value._syncMeta) config.value._syncMeta[section].updatedAt = Date.now();
+                    if (isSyncMerging.value || !config.value._syncMeta) return;
+                    config.value._syncMeta[section].updatedAt = Date.now();
                 }, {deep: true});
             });
 
@@ -193,23 +197,25 @@
                 } finally {isDispatcherRunning.value = false;}
             };
 
-            return {config, toasts, addToast, removeToast, notifications, resetNotificationNum: (src) => updateNotification(src, 0), queue, isDispatcherRunning, isApiHalted, addReqs, clearQueueBySource, startDispatcher};
+            return {config, toasts, addToast, removeToast, notifications, resetNotificationNum: (src) => updateNotification(src, 0), queue, isDispatcherRunning, isApiHalted, addReqs, clearQueueBySource, startDispatcher, isSyncMerging};
         });
 
-        // --- Danbooru Proxy Utility ---
+        // --- Danbooru Fetch Utility (proxy-aware with automatic failover) ---
         const _proxyFailures = {};
-        const getProxiedUrl = (url) => {
+        const danbooruFetch = async (url, options) => {
             const {jssync} = useAppStore().config.value;
-            const chain = [jssync.proxyUrl, jssync.proxyUrl2].filter(Boolean);
-            // Find first non-failed proxy, fall back to direct
-            for (const proxy of chain) {
-                if (!_proxyFailures[proxy] || Date.now() - _proxyFailures[proxy] > 60000) {
-                    return `${proxy.replace(/\/$/, '')}/proxy?url=${encodeURIComponent(url)}`;
-                }
+            const proxies = [jssync.proxyUrl, jssync.proxyUrl2]
+                .filter(p => p && (!_proxyFailures[p] || Date.now() - _proxyFailures[p] > 60000));
+            for (const proxy of proxies) {
+                const proxyUrl = `${proxy.replace(/\/$/, '')}/proxy?url=${encodeURIComponent(url)}`;
+                try {
+                    const res = await fetch(proxyUrl, options);
+                    if (!res.ok) { _proxyFailures[proxy] = Date.now(); continue; }
+                    return res;
+                } catch { _proxyFailures[proxy] = Date.now(); }
             }
-            return url; // direct fallback
+            return fetch(url, options); // direct fallback
         };
-        const markProxyFailed = (proxyUrl) => { _proxyFailures[proxyUrl] = Date.now(); };
 
         // --- Sync Store (GitHub Gist REST API) ---
         const useSyncStore = createGlobalState(() => {
@@ -217,6 +223,10 @@
             const syncError = ref(null);
             const syncStatus = ref('idle'); // 'idle'|'pulling'|'pushing'|'conflict'|'error'
             const pendingConflict = ref(null); // { local, remote }
+
+            // Merge helper: replaces arrays wholesale instead of merging element-by-index
+            const mergeWithArrayReplace = (obj, src) =>
+                _.mergeWith({}, obj, src, (_, srcVal) => _.isArray(srcVal) ? _.cloneDeep(srcVal) : undefined);
 
             const SYNCED_SECTIONS = ['tagTest', 'genConfig', 'genState', 'app', 'gemini', 'danbooru', '_syncMeta'];
             const GIST_FILENAME = 'nailab-config.json';
@@ -316,17 +326,22 @@
 
                     // Apply auto-merged sections
                     if (Object.keys(autoMerged).length > 0) {
-                        Object.entries(autoMerged).forEach(([key, val]) => {
-                            if (key === '_syncMeta') return;
-                            cfg[key] = _.merge({}, cfg[key], val);
-                        });
-                        // Merge _syncMeta
-                        if (remote._syncMeta) {
-                            SYNCED_SECTIONS.filter(k => k !== '_syncMeta').forEach(k => {
-                                if (remote._syncMeta[k]?.updatedAt > (cfg._syncMeta[k]?.updatedAt || 0)) {
-                                    cfg._syncMeta[k] = remote._syncMeta[k];
-                                }
+                        appStore.isSyncMerging.value = true;
+                        try {
+                            Object.entries(autoMerged).forEach(([key, val]) => {
+                                if (key === '_syncMeta') return;
+                                cfg[key] = mergeWithArrayReplace(cfg[key], val);
                             });
+                            // Merge _syncMeta
+                            if (remote._syncMeta) {
+                                SYNCED_SECTIONS.filter(k => k !== '_syncMeta').forEach(k => {
+                                    if (remote._syncMeta[k]?.updatedAt > (cfg._syncMeta[k]?.updatedAt || 0)) {
+                                        cfg._syncMeta[k] = remote._syncMeta[k];
+                                    }
+                                });
+                            }
+                        } finally {
+                            appStore.isSyncMerging.value = false;
                         }
                         appStore.addToast({msg: `Pulled ${Object.keys(autoMerged).length} updated section(s).`, type: 'success', source: 'sync', duration: 3000});
                     }
@@ -398,23 +413,28 @@
             const resolveConflict = async (resolved) => {
                 const appStore = useAppStore();
                 const cfg = appStore.config.value;
-                // Apply resolved sections
-                Object.entries(resolved).forEach(([key, val]) => {
-                    if (key === '_syncMeta') return;
-                    cfg[key] = _.merge({}, cfg[key], val);
-                });
-                // Rebuild _syncMeta with max timestamps
-                const conflict = pendingConflict.value;
-                if (conflict) {
-                    SYNCED_SECTIONS.filter(k => k !== '_syncMeta').forEach(k => {
-                        const chosenSide = resolved[k] === conflict.remote[k] ? 'remote' : 'local';
-                        const chosenMeta = conflict[chosenSide]?._syncMeta?.[k];
-                        if (chosenMeta && chosenMeta.updatedAt > (cfg._syncMeta[k]?.updatedAt || 0)) {
-                            cfg._syncMeta[k] = chosenMeta;
-                        }
-                        // Always bump the winner's timestamp to now so it pushes as "newest"
-                        cfg._syncMeta[k] = { updatedAt: Date.now() };
+                appStore.isSyncMerging.value = true;
+                try {
+                    // Apply resolved sections, replacing arrays wholesale
+                    Object.entries(resolved).forEach(([key, val]) => {
+                        if (key === '_syncMeta') return;
+                        cfg[key] = mergeWithArrayReplace(cfg[key], val);
                     });
+                    // Rebuild _syncMeta: preserve existing fields, bump updatedAt to now
+                    const conflict = pendingConflict.value;
+                    if (conflict) {
+                        SYNCED_SECTIONS.filter(k => k !== '_syncMeta').forEach(k => {
+                            const chosenSide = resolved[k] === conflict.remote[k] ? 'remote' : 'local';
+                            const chosenMeta = conflict[chosenSide]?._syncMeta?.[k];
+                            if (chosenMeta && chosenMeta.updatedAt > (cfg._syncMeta[k]?.updatedAt || 0)) {
+                                cfg._syncMeta[k] = chosenMeta;
+                            }
+                            // Bump to now so this push wins over any concurrent remote
+                            cfg._syncMeta[k] = { ...(cfg._syncMeta[k] || {}), updatedAt: Date.now() };
+                        });
+                    }
+                } finally {
+                    appStore.isSyncMerging.value = false;
                 }
                 pendingConflict.value = null;
                 syncStatus.value = 'idle';
@@ -535,7 +555,7 @@
                 const words = sub.slice(start).trim().split(/\s+/), lastWord = _.last(words);
                 if (!words[0]) return {suggestions: []};
 
-                const fetchTags = async (url, map) => { try { return map(await (await fetch(url, {signal})).json()) || []; } catch { return []; } };
+                const fetchTags = async (url, map) => { try { return map(await (await (url.includes('danbooru.donmai.us') ? danbooruFetch(url, {signal}) : fetch(url, {signal}))).json()) || []; } catch { return []; } };
                 try {
                     const {model} = store.config.value.app, frags = Array.from({length: Math.min(3, words.length)}, (_, i) => ({txt: words.slice(-(i+1)).join(' '), s: start + sub.slice(start).lastIndexOf(words.slice(-(i+1)).join(' '))}));
                     const [nai, dan] = await Promise.all([
@@ -677,7 +697,7 @@
                 const route = useRoute(), router = useRouter(), gridRoutes = ['danbooru-grid', 'danbooru-folder'], ratingMeta = [['g','success'],['s','info'],['q','warning'],['e','error']].map(([k,c])=>({k,label:k.toUpperCase(),active:`btn-${c} text-white`,inactive:`glass-nested text-${c}/50 hover:bg-${c}/10`}));
                 const naiTagKnowledge = useSessionStorage('danbooru-tag-knowledge', {}), tagQueues = {nai: [], danbooru: []}, activeReqs = {nai: 0, danbooru: 0}, queuedTags = new Set();
                 const processQueues = () => {
-                    const run = (k, url, cb, lim=1) => { if (activeReqs[k] >= lim || !tagQueues[k].length) return; const tag = tagQueues[k].shift(); activeReqs[k]++; fetch(url(tag)).then(r=>r.json()).then(d=>cb(tag, d)).catch(()=>k==='nai'&&tagQueues.danbooru.push(tag)).finally(()=>{ activeReqs[k]--; setTimeout(processQueues, k==='danbooru'?200:0); }); };
+                    const run = (k, url, cb, lim=1) => { if (activeReqs[k] >= lim || !tagQueues[k].length) return; const tag = tagQueues[k].shift(); activeReqs[k]++; (k==='danbooru' ? danbooruFetch(url(tag)) : fetch(url(tag))).then(r=>r.json()).then(d=>cb(tag, d)).catch(()=>k==='nai'&&tagQueues.danbooru.push(tag)).finally(()=>{ activeReqs[k]--; setTimeout(processQueues, k==='danbooru'?200:0); }); };
                     run('nai', t=>`https://image.novelai.net/ai/generate-image/suggest-tags?model=${app.value.model}&prompt=${encodeURIComponent(t.replace(/_/g,' '))}`, (t,d)=>{ d.tags?.forEach(s=>naiTagKnowledge.value[s.tag.replace(/ /g,'_')]={count:s.count,source:'nai'}); !naiTagKnowledge.value[t]&&tagQueues.danbooru.push(t); }, 5);
                     run('danbooru', t=>`https://danbooru.donmai.us/tags.json?search[name]=${encodeURIComponent(t)}`, (t,d)=>naiTagKnowledge.value[t]={count:d.find(i=>i.name===t)?.post_count||0,source:d.length?'danbooru':'none'});
                 };
@@ -691,7 +711,7 @@
                 const {isLoading, error: err, execute} = useAsyncState(async (tags, page = 1, append = false, signal, clientFilters = []) => {
                     try {
                         const sub = (tags || '').split('|').map(t => t.trim()).filter(Boolean); if (!sub.length) sub.push('');
-                        const results = await Promise.all(sub.map(async t => { const res = await fetch(`https://danbooru.donmai.us/posts.json?tags=${encodeURIComponent(t)}&limit=${Math.ceil(DANBOORU_LIMIT / sub.length)}&page=${page}`, {signal}); return res.ok ? (await res.json()) || [] : []; }));
+                        const results = await Promise.all(sub.map(async t => { const res = await danbooruFetch(`https://danbooru.donmai.us/posts.json?tags=${encodeURIComponent(t)}&limit=${Math.ceil(DANBOORU_LIMIT / sub.length)}&page=${page}`, {signal}); return res.ok ? (await res.json()) || [] : []; }));
                         return {data: _.uniqBy(results.flat(), 'id'), page, append, tags, clientFilters, error: null};
                     } catch (e) {if (e.name !== 'AbortError') throw e; return {aborted: true};}
                 }, null, {
@@ -868,7 +888,7 @@
                 const router = useRouter(), route = useRoute(), activeId = ref(null);
                 const isSingleView = computed(() => route.name === 'danbooru-single'), currentImg = computed(() => activeId.value === null ? null : (_.find(posts.value, {id: activeId.value}) || hoveredImage.value));
                 watch(() => route.params.id, (id) => { activeId.value = id ? Number(id) : null; if (id && rightPanelRef.value) rightPanelRef.value.scrollTop = 0; else if (!id) nextTick(() => rightPanelRef.value && (rightPanelRef.value.scrollTop = lastScrollPos.value)); }, {immediate: true});
-                watch(activeId, async (id) => { if (id && !posts.value.some(p => p.id === id) && hoveredImage.value?.id !== id) try { const d = await (await fetch(`https://danbooru.donmai.us/posts/${id}.json`)).json(); if (d?.id === id && d.large_file_url && !d.is_banned) hoveredImage.value = d; } catch {} });
+                watch(activeId, async (id) => { if (id && !posts.value.some(p => p.id === id) && hoveredImage.value?.id !== id) try { const d = await (await danbooruFetch(`https://danbooru.donmai.us/posts/${id}.json`)).json(); if (d?.id === id && d.large_file_url && !d.is_banned) hoveredImage.value = d; } catch {} });
                 const nav = (o) => { if (!currentImg.value && !posts.value.length) return; const i = posts.value.findIndex(p => p.id === activeId.value); router.push({path: `/danbooru/${posts.value[(i === -1 ? 0 : i + o + posts.value.length) % posts.value.length].id}`, query: route.query}); };
                 onKeyStroke(['ArrowLeft', 'ArrowRight', 'Escape'], (e) => { if (document.activeElement?.closest('input, textarea') || !isSingleView.value) return; e.preventDefault(); e.key === 'Escape' ? router.push({name: 'danbooru-grid', query: route.query}) : nav(e.key === 'ArrowLeft' ? -1 : 1); });
                 return {posts, isLoading, isLoadingMore, hasMorePages, statusMsg, hoveredImage, gridSize, folders, isSingleView, currentImg, showSingle: (p) => router.push({path: `/danbooru/${p.id}`, query: route.query}), showGrid: () => router.push({name: 'danbooru-grid', query: route.query}), nav, closeMenu: (e) => (document.activeElement && e.currentTarget.contains(document.activeElement)) && document.activeElement.blur()};
@@ -1771,13 +1791,17 @@
                             await syncStore.pull();
                         } catch (e) { /* errors handled inside pull */ }
                     }
-                    // Auto-sync on config changes (debounced 5s, push only)
-                    watch(config, useDebounceFn(() => {
-                        const js = config.value.jssync;
-                        if (!js.autoSync || !js.token || !js.gistId) return;
-                        if (syncStore.syncStatus.value === 'conflict') return;
-                        syncStore.push(true);
-                    }, 5000), { deep: true });
+                    // Auto-sync on config changes (debounced 5s, push only) — watch only synced sections to avoid firing on UI state
+                    watch(
+                        () => { const c = config.value; return [c.tagTest, c.genConfig, c.genState, c.app, c.gemini, c.danbooru, c.jssync]; },
+                        useDebounceFn(() => {
+                            const js = config.value.jssync;
+                            if (!js.autoSync || !js.token || !js.gistId) return;
+                            if (syncStore.syncStatus.value === 'conflict') return;
+                            syncStore.push(true);
+                        }, 5000),
+                        { deep: true }
+                    );
                 });
 
                 return {navItems, notifications, syncStatus: syncStore.syncStatus};
@@ -1811,4 +1835,4 @@
         app.mount('#app');
     </script>
 </body>
-</html> 
+</html>
