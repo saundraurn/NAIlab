@@ -285,6 +285,7 @@
                 const appStore = useAppStore();
                 const cfg = appStore.config.value;
                 const token = appStore.syncToken.value;
+                const { gistId, includeApiKeys } = cfg.jssync;
                 if (!token || !gistId) return;
 
                 syncStatus.value = 'pulling'; syncError.value = null;
