@@ -112,8 +112,27 @@
                 app: {apiKey:'', model:'nai-diffusion-4-5-full'},
                 gemini: {apiKey:'', thinkingLevel:'MINIMAL', aspectRatio:'1:1', imageSize:'1K', autoRetry:false},
                 danbooru: {folders:[], nextFolderId:1, gridCols:4, lastPath:'/danbooru', blacklist:'', sortOrder:'id', ratingFilters:{g:true, s:true, q:true, e:true}, savedSearches:[{name:'Trending', prompt:'order:rank'}]},
-                genState: {prompt:'1girl, solo, wearing casual clothes', uc:'multiple views, monochrome, black and white, looking at viewer, pov', charPrompts:[{id:1, val:''}], nextCharPromptId:2}
+                genState: {prompt:'1girl, solo, wearing casual clothes', uc:'multiple views, monochrome, black and white, looking at viewer, pov', charPrompts:[{id:1, val:''}], nextCharPromptId:2},
+                jssync: {gistId:'', proxyUrl:'', proxyUrl2:'', includeApiKeys:false, autoSync:true, lastSyncedAt:null, lastPulledEtag:'', lastSyncedRevs:{}},
+                _syncMeta: {tagTest:{updatedAt:0,rev:0}, genConfig:{updatedAt:0,rev:0}, genState:{updatedAt:0,rev:0}, app:{updatedAt:0,rev:0}, gemini:{updatedAt:0,rev:0}, danbooru:{updatedAt:0,rev:0}}
             }, {mergeDefaults: true});
+
+            // Token held in sessionStorage only — never written to localStorage or synced to Gist
+            const syncToken = useSessionStorage('nai-sync-token', '');
+
+            // Guard flag: set true during remote merges so watchers don't stamp _syncMeta
+            const isSyncMerging = ref(false);
+
+            // Section-level watchers that stamp _syncMeta on any meaningful change
+            const WATCHED_SECTIONS = ['tagTest', 'genConfig', 'genState', 'app', 'gemini', 'danbooru'];
+            WATCHED_SECTIONS.forEach(section => {
+                watch(() => config.value[section], () => {
+                    if (isSyncMerging.value || !config.value._syncMeta) return;
+                    const meta = config.value._syncMeta[section];
+                    meta.rev = (meta.rev || 0) + 1;
+                    meta.updatedAt = Date.now();
+                }, {deep: true});
+            });
 
             const toasts = ref([]), notifications = reactive({}), queue = ref([]), isDispatcherRunning = ref(false), isApiHalted = ref(false);
             let uniqueIdCounter = 0;
@@ -183,7 +202,264 @@
                 } finally {isDispatcherRunning.value = false;}
             };
 
-            return {config, toasts, addToast, removeToast, notifications, resetNotificationNum: (src) => updateNotification(src, 0), queue, isDispatcherRunning, isApiHalted, addReqs, clearQueueBySource, startDispatcher};
+            return {config, toasts, addToast, removeToast, notifications, resetNotificationNum: (src) => updateNotification(src, 0), queue, isDispatcherRunning, isApiHalted, addReqs, clearQueueBySource, startDispatcher, isSyncMerging, syncToken};
+        });
+
+        // --- Danbooru Fetch Utility (proxy-aware with automatic failover) ---
+        const _proxyFailures = {};
+        const danbooruFetch = async (url, options) => {
+            const {jssync} = useAppStore().config.value;
+            const proxies = [jssync.proxyUrl, jssync.proxyUrl2]
+                .filter(p => p && (!_proxyFailures[p] || Date.now() - _proxyFailures[p] > 60000));
+            for (const proxy of proxies) {
+                const proxyUrl = `${proxy.replace(/\/$/, '')}/proxy?url=${encodeURIComponent(url)}`;
+                try {
+                    const res = await fetch(proxyUrl, options);
+                    if (!res.ok) { _proxyFailures[proxy] = Date.now(); continue; }
+                    return res;
+                } catch { _proxyFailures[proxy] = Date.now(); }
+            }
+            return fetch(url, options); // direct fallback
+        };
+
+        // --- Sync Store (GitHub Gist REST API) ---
+        const useSyncStore = createGlobalState(() => {
+            const isSyncing = ref(false);
+            const syncError = ref(null);
+            const syncStatus = ref('idle'); // 'idle'|'pulling'|'pushing'|'conflict'|'error'
+            const pendingConflict = ref(null); // { local, remote }
+
+            // Merge helper: replaces arrays wholesale instead of merging element-by-index
+            const mergeWithArrayReplace = (obj, src) =>
+                _.mergeWith({}, obj, src, (_, srcVal) => _.isArray(srcVal) ? _.cloneDeep(srcVal) : undefined);
+
+            const SYNCED_SECTIONS = ['tagTest', 'genConfig', 'genState', 'app', 'gemini', 'danbooru', '_syncMeta'];
+            const GIST_FILENAME = 'nailab-config.json';
+
+            const getHeaders = (token) => ({
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/vnd.github+json',
+                'X-GitHub-Api-Version': '2022-11-28'
+            });
+
+            const extractSyncPayload = (fullConfig, includeApiKeys) => {
+                const snap = {};
+                SYNCED_SECTIONS.forEach(k => { if (fullConfig[k]) snap[k] = _.cloneDeep(fullConfig[k]); });
+                if (!includeApiKeys) {
+                    if (snap.app) delete snap.app.apiKey;
+                    if (snap.gemini) delete snap.gemini.apiKey;
+                }
+                return snap;
+            };
+
+            const createGist = async (token, content) => {
+                const res = await fetch('https://api.github.com/gists', {
+                    method: 'POST',
+                    headers: getHeaders(token),
+                    body: JSON.stringify({ description: 'NAILab Config Sync', public: false, files: { [GIST_FILENAME]: { content } } })
+                });
+                if (!res.ok) throw new Error(`Failed to create Gist: ${res.status}`);
+                return res.json();
+            };
+
+            const fetchGist = async (token, gistId) => {
+                const res = await fetch(`https://api.github.com/gists/${gistId}`, { headers: getHeaders(token) });
+                if (res.status === 404) throw new Error('Gist not found. Check your Gist ID.');
+                if (res.status === 401) throw new Error('Invalid GitHub token. Check your PAT.');
+                if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
+                return res.json();
+            };
+
+            const updateGist = async (token, gistId, content) => {
+                const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+                    method: 'PATCH',
+                    headers: getHeaders(token),
+                    body: JSON.stringify({ files: { [GIST_FILENAME]: { content } } })
+                });
+                if (!res.ok) throw new Error(`Push failed: ${res.status}`);
+                return res.json();
+            };
+
+            const pull = async () => {
+                const appStore = useAppStore();
+                const cfg = appStore.config.value;
+                const token = appStore.syncToken.value;
+                const { gistId, includeApiKeys } = cfg.jssync;
+                if (!token || !gistId) return;
+
+                syncStatus.value = 'pulling'; syncError.value = null;
+                try {
+                    const gistData = await fetchGist(token, gistId);
+                    const fileContent = gistData.files?.[GIST_FILENAME]?.content;
+                    if (!fileContent) { syncStatus.value = 'idle'; return; } // Gist exists but file not yet created
+
+                    const remote = JSON.parse(fileContent);
+                    // Use same sanitization as remote so API keys don't cause false diffs
+                    const local = extractSyncPayload(cfg, includeApiKeys);
+                    const localMeta = cfg._syncMeta || {};
+                    const remoteMeta = remote._syncMeta || {};
+                    const lastSyncedRevs = cfg.jssync.lastSyncedRevs || {};
+
+                    // Detect per-section conflicts using rev counters (immune to clock skew)
+                    const conflicts = [];
+                    const autoMerged = {};
+                    SYNCED_SECTIONS.filter(k => k !== '_syncMeta').forEach(key => {
+                        if (!remote[key]) return;
+                        const isDifferent = !_.isEqual(local[key], remote[key]);
+                        if (!isDifferent) return; // identical content, nothing to do
+                        const localRev = localMeta[key]?.rev || 0;
+                        const remoteRev = remoteMeta[key]?.rev || 0;
+                        const lastRev = lastSyncedRevs[key] || 0;
+                        const localChanged = localRev > lastRev;
+                        const remoteChanged = remoteRev > lastRev;
+                        if (localChanged && remoteChanged) {
+                            conflicts.push(key);
+                        } else if (remoteChanged) {
+                            autoMerged[key] = remote[key]; // take remote
+                        }
+                        // else: local changed or neither — local wins, keep as-is
+                    });
+
+                    if (conflicts.length > 0) {
+                        pendingConflict.value = {
+                            local: extractSyncPayload(cfg, includeApiKeys),
+                            remote,
+                            conflictKeys: conflicts
+                        };
+                        syncStatus.value = 'conflict';
+                        return;
+                    }
+
+                    // Apply auto-merged sections
+                    if (Object.keys(autoMerged).length > 0) {
+                        appStore.isSyncMerging.value = true;
+                        try {
+                            Object.entries(autoMerged).forEach(([key, val]) => {
+                                if (key === '_syncMeta') return;
+                                cfg[key] = mergeWithArrayReplace(cfg[key], val);
+                            });
+                            // Adopt remote _syncMeta for auto-merged sections
+                            if (remote._syncMeta) {
+                                Object.keys(autoMerged).forEach(k => {
+                                    if (remote._syncMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remote._syncMeta[k]);
+                                });
+                            }
+                            // Record remote revs as last-synced for merged sections
+                            if (!cfg.jssync.lastSyncedRevs) cfg.jssync.lastSyncedRevs = {};
+                            Object.keys(autoMerged).forEach(k => {
+                                cfg.jssync.lastSyncedRevs[k] = remoteMeta[k]?.rev || 0;
+                            });
+                        } finally {
+                            appStore.isSyncMerging.value = false;
+                        }
+                        appStore.addToast({msg: `Pulled ${Object.keys(autoMerged).length} updated section(s).`, type: 'success', source: 'sync', duration: 3000});
+                    }
+
+                    cfg.jssync.lastSyncedAt = Date.now();
+                    cfg.jssync.lastPulledEtag = gistData.updated_at || '';
+                    syncStatus.value = 'idle';
+                } catch (e) {
+                    syncError.value = e.message;
+                    syncStatus.value = 'error';
+                    useAppStore().addToast({msg: `Sync pull failed: ${e.message}`, type: 'error', source: 'sync'});
+                }
+            };
+
+            const push = async (silent = false) => {
+                const appStore = useAppStore();
+                const cfg = appStore.config.value;
+                const token = appStore.syncToken.value;
+                const { gistId, includeApiKeys } = cfg.jssync;
+                if (!token || !gistId) return;
+
+                syncStatus.value = 'pushing'; syncError.value = null;
+                try {
+                    const payload = extractSyncPayload(cfg, includeApiKeys);
+                    const content = JSON.stringify(payload, null, 2);
+                    const updated = await updateGist(token, gistId, content);
+                    cfg.jssync.lastSyncedAt = Date.now();
+                    cfg.jssync.lastPulledEtag = updated.updated_at || '';
+                    // Record current local revs so future pulls know what changed since this push
+                    if (!cfg.jssync.lastSyncedRevs) cfg.jssync.lastSyncedRevs = {};
+                    SYNCED_SECTIONS.filter(k => k !== '_syncMeta').forEach(k => {
+                        cfg.jssync.lastSyncedRevs[k] = cfg._syncMeta?.[k]?.rev || 0;
+                    });
+                    syncStatus.value = 'idle';
+                    if (!silent) appStore.addToast({msg: 'Config pushed to Gist.', type: 'success', source: 'sync', duration: 2500});
+                } catch (e) {
+                    syncError.value = e.message;
+                    syncStatus.value = 'error';
+                    if (!silent) appStore.addToast({msg: `Sync push failed: ${e.message}`, type: 'error', source: 'sync'});
+                }
+            };
+
+            const createAndSetGist = async () => {
+                const appStore = useAppStore();
+                const cfg = appStore.config.value;
+                const token = appStore.syncToken.value;
+                const { includeApiKeys } = cfg.jssync;
+                if (!token) throw new Error('No GitHub token configured.');
+                syncStatus.value = 'pushing'; syncError.value = null;
+                try {
+                    const payload = extractSyncPayload(cfg, includeApiKeys);
+                    const content = JSON.stringify(payload, null, 2);
+                    const gistData = await createGist(token, content);
+                    cfg.jssync.gistId = gistData.id;
+                    cfg.jssync.lastSyncedAt = Date.now();
+                    syncStatus.value = 'idle';
+                    appStore.addToast({msg: 'Gist created! ID saved.', type: 'success', source: 'sync'});
+                    return gistData.id;
+                } catch (e) {
+                    syncError.value = e.message;
+                    syncStatus.value = 'error';
+                    appStore.addToast({msg: `Create Gist failed: ${e.message}`, type: 'error', source: 'sync'});
+                    throw e;
+                }
+            };
+
+            const syncNow = async () => {
+                if (isSyncing.value) return;
+                isSyncing.value = true;
+                try {
+                    await pull();
+                    if (syncStatus.value === 'idle') await push(true);
+                } finally { isSyncing.value = false; }
+            };
+
+            const resolveConflict = async (resolved) => {
+                const appStore = useAppStore();
+                const cfg = appStore.config.value;
+                appStore.isSyncMerging.value = true;
+                try {
+                    // Apply resolved sections, replacing arrays wholesale
+                    Object.entries(resolved).forEach(([key, val]) => {
+                        if (key === '_syncMeta') return;
+                        cfg[key] = mergeWithArrayReplace(cfg[key], val);
+                    });
+                    // Rebuild _syncMeta: preserve existing fields, bump updatedAt to now
+                    const conflict = pendingConflict.value;
+                    if (conflict) {
+                        SYNCED_SECTIONS.filter(k => k !== '_syncMeta').forEach(k => {
+                            const chosenSide = resolved[k] === conflict.remote[k] ? 'remote' : 'local';
+                            const chosenMeta = conflict[chosenSide]?._syncMeta?.[k];
+                            if (chosenMeta && chosenMeta.updatedAt > (cfg._syncMeta[k]?.updatedAt || 0)) {
+                                cfg._syncMeta[k] = chosenMeta;
+                            }
+                            // Bump rev and updatedAt so this push wins over any concurrent remote
+                            cfg._syncMeta[k] = { ...(cfg._syncMeta[k] || {}), rev: (cfg._syncMeta[k]?.rev || 0) + 1, updatedAt: Date.now() };
+                        });
+                    }
+                } finally {
+                    appStore.isSyncMerging.value = false;
+                }
+                pendingConflict.value = null;
+                syncStatus.value = 'idle';
+                isSyncing.value = true;
+                try { await push(false); } finally { isSyncing.value = false; }
+            };
+
+            return { isSyncing, syncStatus, syncError, pendingConflict, pull, push, syncNow, createAndSetGist, resolveConflict, SYNCED_SECTIONS };
         });
 
         // --- Primitives ---
@@ -296,7 +572,7 @@
                 const words = sub.slice(start).trim().split(/\s+/), lastWord = _.last(words);
                 if (!words[0]) return {suggestions: []};
 
-                const fetchTags = async (url, map) => { try { return map(await (await fetch(url, {signal})).json()) || []; } catch { return []; } };
+                const fetchTags = async (url, map) => { try { return map(await (await (url.includes('danbooru.donmai.us') ? danbooruFetch(url, {signal}) : fetch(url, {signal}))).json()) || []; } catch { return []; } };
                 try {
                     const {model} = store.config.value.app, frags = Array.from({length: Math.min(3, words.length)}, (_, i) => ({txt: words.slice(-(i+1)).join(' '), s: start + sub.slice(start).lastIndexOf(words.slice(-(i+1)).join(' '))}));
                     const [nai, dan] = await Promise.all([
@@ -438,7 +714,7 @@
                 const route = useRoute(), router = useRouter(), gridRoutes = ['danbooru-grid', 'danbooru-folder'], ratingMeta = [['g','success'],['s','info'],['q','warning'],['e','error']].map(([k,c])=>({k,label:k.toUpperCase(),active:`btn-${c} text-white`,inactive:`glass-nested text-${c}/50 hover:bg-${c}/10`}));
                 const naiTagKnowledge = useSessionStorage('danbooru-tag-knowledge', {}), tagQueues = {nai: [], danbooru: []}, activeReqs = {nai: 0, danbooru: 0}, queuedTags = new Set();
                 const processQueues = () => {
-                    const run = (k, url, cb, lim=1) => { if (activeReqs[k] >= lim || !tagQueues[k].length) return; const tag = tagQueues[k].shift(); activeReqs[k]++; fetch(url(tag)).then(r=>r.json()).then(d=>cb(tag, d)).catch(()=>k==='nai'&&tagQueues.danbooru.push(tag)).finally(()=>{ activeReqs[k]--; setTimeout(processQueues, k==='danbooru'?200:0); }); };
+                    const run = (k, url, cb, lim=1) => { if (activeReqs[k] >= lim || !tagQueues[k].length) return; const tag = tagQueues[k].shift(); activeReqs[k]++; (k==='danbooru' ? danbooruFetch(url(tag)) : fetch(url(tag))).then(r=>r.json()).then(d=>cb(tag, d)).catch(()=>k==='nai'&&tagQueues.danbooru.push(tag)).finally(()=>{ activeReqs[k]--; setTimeout(processQueues, k==='danbooru'?200:0); }); };
                     run('nai', t=>`https://image.novelai.net/ai/generate-image/suggest-tags?model=${app.value.model}&prompt=${encodeURIComponent(t.replace(/_/g,' '))}`, (t,d)=>{ d.tags?.forEach(s=>naiTagKnowledge.value[s.tag.replace(/ /g,'_')]={count:s.count,source:'nai'}); !naiTagKnowledge.value[t]&&tagQueues.danbooru.push(t); }, 5);
                     run('danbooru', t=>`https://danbooru.donmai.us/tags.json?search[name]=${encodeURIComponent(t)}`, (t,d)=>naiTagKnowledge.value[t]={count:d.find(i=>i.name===t)?.post_count||0,source:d.length?'danbooru':'none'});
                 };
@@ -452,7 +728,7 @@
                 const {isLoading, error: err, execute} = useAsyncState(async (tags, page = 1, append = false, signal, clientFilters = []) => {
                     try {
                         const sub = (tags || '').split('|').map(t => t.trim()).filter(Boolean); if (!sub.length) sub.push('');
-                        const results = await Promise.all(sub.map(async t => { const res = await fetch(`https://danbooru.donmai.us/posts.json?tags=${encodeURIComponent(t)}&limit=${Math.ceil(DANBOORU_LIMIT / sub.length)}&page=${page}`, {signal}); return res.ok ? (await res.json()) || [] : []; }));
+                        const results = await Promise.all(sub.map(async t => { const res = await danbooruFetch(`https://danbooru.donmai.us/posts.json?tags=${encodeURIComponent(t)}&limit=${Math.ceil(DANBOORU_LIMIT / sub.length)}&page=${page}`, {signal}); return res.ok ? (await res.json()) || [] : []; }));
                         return {data: _.uniqBy(results.flat(), 'id'), page, append, tags, clientFilters, error: null};
                     } catch (e) {if (e.name !== 'AbortError') throw e; return {aborted: true};}
                 }, null, {
@@ -629,7 +905,7 @@
                 const router = useRouter(), route = useRoute(), activeId = ref(null);
                 const isSingleView = computed(() => route.name === 'danbooru-single'), currentImg = computed(() => activeId.value === null ? null : (_.find(posts.value, {id: activeId.value}) || hoveredImage.value));
                 watch(() => route.params.id, (id) => { activeId.value = id ? Number(id) : null; if (id && rightPanelRef.value) rightPanelRef.value.scrollTop = 0; else if (!id) nextTick(() => rightPanelRef.value && (rightPanelRef.value.scrollTop = lastScrollPos.value)); }, {immediate: true});
-                watch(activeId, async (id) => { if (id && !posts.value.some(p => p.id === id) && hoveredImage.value?.id !== id) try { const d = await (await fetch(`https://danbooru.donmai.us/posts/${id}.json`)).json(); if (d?.id === id && d.large_file_url && !d.is_banned) hoveredImage.value = d; } catch {} });
+                watch(activeId, async (id) => { if (id && !posts.value.some(p => p.id === id) && hoveredImage.value?.id !== id) try { const d = await (await danbooruFetch(`https://danbooru.donmai.us/posts/${id}.json`)).json(); if (d?.id === id && d.large_file_url && !d.is_banned) hoveredImage.value = d; } catch {} });
                 const nav = (o) => { if (!currentImg.value && !posts.value.length) return; const i = posts.value.findIndex(p => p.id === activeId.value); router.push({path: `/danbooru/${posts.value[(i === -1 ? 0 : i + o + posts.value.length) % posts.value.length].id}`, query: route.query}); };
                 onKeyStroke(['ArrowLeft', 'ArrowRight', 'Escape'], (e) => { if (document.activeElement?.closest('input, textarea') || !isSingleView.value) return; e.preventDefault(); e.key === 'Escape' ? router.push({name: 'danbooru-grid', query: route.query}) : nav(e.key === 'ArrowLeft' ? -1 : 1); });
                 return {posts, isLoading, isLoadingMore, hasMorePages, statusMsg, hoveredImage, gridSize, folders, isSingleView, currentImg, showSingle: (p) => router.push({path: `/danbooru/${p.id}`, query: route.query}), showGrid: () => router.push({name: 'danbooru-grid', query: route.query}), nav, closeMenu: (e) => (document.activeElement && e.currentTarget.contains(document.activeElement)) && document.activeElement.blur()};
@@ -1183,12 +1459,206 @@
             {val: 'nai-diffusion-4-full', text: 'v4 Full'}
         ];
 
+        // --- Conflict Resolution Modal ---
+        const ConflictResolutionModal = {
+            setup() {
+                const syncStore = useSyncStore();
+                const { pendingConflict, syncStatus, resolveConflict } = syncStore;
+                const SECTIONS = [
+                    { key: 'tagTest',   label: 'Tag Test Settings',          icon: 'lab_research',    previewFn: (s) => `${s.prompts?.length || 0} prompt(s), ${(s.tagsToTest||'').split('\n').filter(Boolean).length} tags` },
+                    { key: 'genConfig', label: 'Generation Config',          icon: 'tune',            previewFn: (s) => `${s.width}×${s.height}, ${s.steps} steps, ${s.sampler||''}` },
+                    { key: 'genState',  label: 'Generator Prompt & UC',      icon: 'edit_note',       previewFn: (s) => _.truncate(s.prompt||'', {length: 55}) },
+                    { key: 'app',       label: 'App Settings',               icon: 'settings',        previewFn: (s) => `Model: ${s.model||'—'}` },
+                    { key: 'gemini',    label: 'Gemini Settings',            icon: 'auto_awesome',    previewFn: (s) => `Thinking: ${s.thinkingLevel||'—'}, Size: ${s.imageSize||'—'}` },
+                    { key: 'danbooru',  label: 'Danbooru Folders & Search',  icon: 'package_2',       previewFn: (s) => `${s.folders?.length || 0} folder(s), ${s.savedSearches?.length || 0} saved search(es)` },
+                ];
+                const choices = reactive({});
+                const includeApiKeys = ref(false);
+                const expanded = reactive({});
+
+                watch(pendingConflict, (conflict) => {
+                    if (!conflict) return;
+                    includeApiKeys.value = false;
+                    SECTIONS.forEach(({ key }) => {
+                        const localTime = conflict.local?._syncMeta?.[key]?.updatedAt || 0;
+                        const remoteTime = conflict.remote?._syncMeta?.[key]?.updatedAt || 0;
+                        choices[key] = remoteTime >= localTime ? 'remote' : 'local';
+                    });
+                }, { immediate: true });
+
+                const setAll = (side) => SECTIONS.forEach(({ key }) => choices[key] = side);
+                const isConflicted = (key) => {
+                    if (!pendingConflict.value) return false;
+                    return (pendingConflict.value.conflictKeys || []).includes(key) || !_.isEqual(pendingConflict.value.local?.[key], pendingConflict.value.remote?.[key]);
+                };
+                const fmtTime = (ts) => {
+                    if (!ts) return 'never';
+                    const d = Date.now() - ts, s = Math.floor(d/1000), m = Math.floor(s/60), h = Math.floor(m/60), dy = Math.floor(h/24);
+                    if (dy > 0) return `${dy}d ago`; if (h > 0) return `${h}h ago`; if (m > 0) return `${m}m ago`; if (s < 5) return 'just now'; return `${s}s ago`;
+                };
+
+                const apply = () => {
+                    const conflict = pendingConflict.value; if (!conflict) return;
+                    const resolved = {};
+                    SECTIONS.forEach(({ key }) => {
+                        resolved[key] = _.cloneDeep(conflict[choices[key]]?.[key] || conflict.local[key]);
+                    });
+                    if (!includeApiKeys.value) {
+                        // Preserve current local API keys regardless of section choice
+                        const appStore = useAppStore();
+                        if (resolved.app) resolved.app.apiKey = appStore.config.value.app.apiKey;
+                        if (resolved.gemini) resolved.gemini.apiKey = appStore.config.value.gemini.apiKey;
+                    }
+                    resolveConflict(resolved);
+                };
+                const cancel = () => { syncStore.pendingConflict.value = null; syncStore.syncStatus.value = 'idle'; };
+
+                const redactedJson = (obj) => {
+                    if (!obj) return '';
+                    const redact = (o) => {
+                        if (_.isArray(o)) return o.map(redact);
+                        if (_.isObject(o)) return _.mapValues(o, (v, k) => /apiKey|secret|token/i.test(k) ? '••••••••' : redact(v));
+                        return o;
+                    };
+                    return JSON.stringify(redact(_.cloneDeep(obj)), null, 2);
+                };
+
+                return { pendingConflict, syncStatus, SECTIONS, choices, includeApiKeys, expanded, setAll, isConflicted, apply, cancel, fmtTime, redactedJson };
+            },
+            template: `
+<teleport to="body">
+    <transition name="fade">
+    <div v-if="syncStatus === 'conflict' && pendingConflict" class="fixed inset-0 z-[900] flex items-center justify-center p-4" style="background:rgba(5,4,16,0.85);backdrop-filter:blur(8px)">
+        <div class="bg-base-200 border border-white/10 rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+            <!-- Header -->
+            <div class="flex items-center gap-3 p-5 border-b border-white/10 shrink-0">
+                <div class="w-10 h-10 rounded-xl bg-warning/15 border border-warning/25 flex items-center justify-center shrink-0">
+                    <material-icon icon="sync_problem" :size="22" class="text-warning"></material-icon>
+                </div>
+                <div class="flex-1 min-w-0">
+                    <h3 class="font-bold text-neutral-100 text-base">Sync Conflict Detected</h3>
+                    <p class="text-xs text-neutral-500 mt-0.5">Remote changes differ from your local settings. Choose which version to keep per section.</p>
+                </div>
+                <div class="flex gap-2 shrink-0">
+                    <button @click="setAll('local')" class="btn btn-xs btn-ghost border border-white/10 text-neutral-400 hover:text-white">Use All Local</button>
+                    <button @click="setAll('remote')" class="btn btn-xs btn-ghost border border-white/10 text-neutral-400 hover:text-white">Use All Remote</button>
+                </div>
+            </div>
+
+            <!-- Sections -->
+            <div class="flex-1 overflow-y-auto custom-scroll p-4 space-y-2">
+                <template v-for="sec in SECTIONS" :key="sec.key">
+                    <div v-if="isConflicted(sec.key)" class="glass-nested rounded-xl border border-white/10 overflow-hidden">
+                        <!-- Section header -->
+                        <button class="w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition-colors text-left" @click="expanded[sec.key] = !expanded[sec.key]">
+                            <material-icon :icon="sec.icon" :size="18" class="text-neutral-400 shrink-0"></material-icon>
+                            <span class="flex-1 text-sm font-semibold text-neutral-200">{{ sec.label }}</span>
+                            <span class="badge badge-warning badge-xs font-semibold uppercase tracking-wide mr-1">Conflict</span>
+                            <material-icon :icon="expanded[sec.key] ? 'expand_less' : 'expand_more'" :size="16" class="text-neutral-500 shrink-0"></material-icon>
+                        </button>
+                        <!-- Radio choices -->
+                        <div class="px-4 pb-3 space-y-2">
+                            <label v-for="side in ['local', 'remote']" :key="side" class="flex items-start gap-3 p-2.5 rounded-xl cursor-pointer transition-colors" :class="choices[sec.key] === side ? (side==='local' ? 'bg-primary/10 border border-primary/30' : 'bg-secondary/10 border border-secondary/30') : 'bg-white/3 border border-white/5 hover:bg-white/5'">
+                                <input type="radio" :name="'sec-'+sec.key" :value="side" v-model="choices[sec.key]" class="radio radio-xs mt-0.5 shrink-0" :class="side==='local' ? 'radio-primary' : 'radio-secondary'">
+                                <div class="flex-1 min-w-0">
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-xs font-bold uppercase tracking-wide" :class="side==='local' ? 'text-primary' : 'text-secondary'">{{ side }}</span>
+                                        <span class="text-xs text-neutral-500 font-mono">{{ fmtTime(pendingConflict[side]?._syncMeta?.[sec.key]?.updatedAt) }}</span>
+                                        <span v-if="(pendingConflict[side]?._syncMeta?.[sec.key]?.updatedAt || 0) >= (pendingConflict[side==='local'?'remote':'local']?._syncMeta?.[sec.key]?.updatedAt || 0)" class="badge badge-xs badge-ghost text-neutral-500">newer</span>
+                                    </div>
+                                    <p v-if="pendingConflict[side]?.[sec.key]" class="text-xs text-neutral-400 mt-1 font-mono truncate">{{ sec.previewFn(pendingConflict[side][sec.key]) }}</p>
+                                </div>
+                            </label>
+                        </div>
+                        <!-- Expanded details -->
+                        <transition name="fade">
+                            <div v-if="expanded[sec.key]" class="px-4 pb-3 border-t border-white/5 pt-3">
+                                <div class="grid grid-cols-2 gap-2">
+                                    <div v-for="side in ['local','remote']" :key="side" class="bg-base-300/50 rounded-lg p-2.5">
+                                        <p class="text-xs font-bold uppercase tracking-wide mb-1.5" :class="side==='local' ? 'text-primary' : 'text-secondary'">{{ side }}</p>
+                                        <pre class="text-[10px] text-neutral-400 font-mono leading-relaxed overflow-auto max-h-40 custom-scroll">{{ redactedJson(pendingConflict[side]?.[sec.key]) }}</pre>
+                                    </div>
+                                </div>
+                            </div>
+                        </transition>
+                    </div>
+                    <div v-else class="flex items-center gap-3 px-4 py-2.5 glass-nested rounded-xl border border-white/5 opacity-50">
+                        <material-icon :icon="sec.icon" :size="16" class="text-neutral-500 shrink-0"></material-icon>
+                        <span class="text-xs text-neutral-500 flex-1">{{ sec.label }}</span>
+                        <span class="flex items-center gap-1 text-xs text-success"><material-icon icon="check_circle" :size="14"></material-icon>In sync</span>
+                    </div>
+                </template>
+            </div>
+
+            <!-- Footer -->
+            <div class="p-4 border-t border-white/10 flex items-center gap-3 shrink-0">
+                <label class="flex items-center gap-2 cursor-pointer flex-1" @click.stop>
+                    <input type="checkbox" v-model="includeApiKeys" class="checkbox checkbox-xs checkbox-warning">
+                    <span class="text-xs text-neutral-400">Include API keys in this sync</span>
+                    <span class="badge badge-warning badge-xs">Security risk</span>
+                </label>
+                <button @click="cancel" class="btn btn-sm btn-ghost border border-white/10">Cancel</button>
+                <button @click="apply" class="btn btn-sm btn-primary gap-2">
+                    <material-icon icon="check" :size="16"></material-icon>Apply & Push
+                </button>
+            </div>
+        </div>
+    </div>
+    </transition>
+</teleport>`
+        };
+
         const Settings = {
-            setup: () => ({app: useAppStore().config.value.app, gemini: useAppStore().config.value.gemini, models}),
+            setup() {
+                const appStore = useAppStore();
+                const syncStore = useSyncStore();
+                const app = appStore.config.value.app;
+                const gemini = appStore.config.value.gemini;
+                const jssync = appStore.config.value.jssync;
+                const syncToken = appStore.syncToken;
+                const { isSyncing, syncStatus, syncError } = syncStore;
+
+                const isCreatingGist = ref(false);
+                const showToken = ref(false);
+
+                const statusMeta = computed(() => {
+                    const m = {
+                        idle: { icon: 'cloud_done', color: 'text-success', text: jssync.lastSyncedAt ? `Last synced ${fmtSyncTime(jssync.lastSyncedAt)}` : 'Never synced' },
+                        pulling: { icon: 'cloud_download', color: 'text-info', text: 'Pulling from Gist...' },
+                        pushing: { icon: 'cloud_upload', color: 'text-info', text: 'Pushing to Gist...' },
+                        conflict: { icon: 'sync_problem', color: 'text-warning', text: 'Conflict — resolve below' },
+                        error: { icon: 'cloud_off', color: 'text-error', text: syncError.value || 'Sync error' }
+                    };
+                    return m[syncStatus.value] || m.idle;
+                });
+
+                const fmtSyncTime = (ts) => {
+                    if (!ts) return 'never';
+                    const d = Date.now() - ts, m = Math.floor(d/60000), h = Math.floor(m/60), dy = Math.floor(h/24);
+                    if (dy > 0) return `${dy}d ago`; if (h > 0) return `${h}h ago`; if (m > 0) return `${m}m ago`; return 'just now';
+                };
+
+                const handleCreateGist = async () => {
+                    if (!syncToken.value) return appStore.addToast({msg: 'Enter your GitHub PAT first.', type: 'error', source: 'sync'});
+                    isCreatingGist.value = true;
+                    try { await syncStore.createAndSetGist(); } finally { isCreatingGist.value = false; }
+                };
+
+                const handleSyncNow = () => {
+                    if (!syncToken.value) return appStore.addToast({msg: 'Configure sync first.', type: 'error', source: 'sync'});
+                    if (!jssync.gistId) return appStore.addToast({msg: 'No Gist ID. Create or enter one.', type: 'error', source: 'sync'});
+                    syncStore.syncNow();
+                };
+
+                return { app, gemini, jssync, syncToken, models, isSyncing, syncStatus, syncError, statusMeta, showToken, isCreatingGist, handleCreateGist, handleSyncNow, fmtSyncTime };
+            },
             template:`
                 <div class="max-w-4xl mx-auto p-4 space-y-4 h-full custom-scroll">
                     <collapsible-panel title="API Configuration" storage-key="api-config">
-                        <div class="pt-2 space-y-3"><setting-input v-model="app.apiKey" label="NovelAI API Key" type="password"></setting-input><p class="text-xs text-neutral-500 mt-2 ml-1">Stored locally in your browser.</p></div>
+                        <div class="pt-2 space-y-3">
+                            <setting-input v-model="app.apiKey" label="NovelAI API Key" type="password"></setting-input>
+                            <p class="text-xs text-neutral-500 mt-2 ml-1">Stored locally in your browser.</p>
+                        </div>
                     </collapsible-panel>
                     <collapsible-panel title="Nano Banana Studio (Gemini)" storage-key="banana-api-config">
                         <div class="pt-2 space-y-3">
@@ -1198,6 +1668,108 @@
                     </collapsible-panel>
                     <collapsible-panel title="Application Settings" storage-key="app-settings">
                         <div class="pt-2"><setting-input v-model="app.model" label="NovelAI Model" type="select" :options="models"></setting-input></div>
+                    </collapsible-panel>
+
+                    <!-- Sync Panel -->
+                    <collapsible-panel storage-key="sync-settings">
+                        <template #header>
+                            <span class="flex items-center gap-2">
+                                <material-icon icon="cloud_sync" :size="20" class="text-primary/80 shrink-0"></material-icon>
+                                <span>Cross-Browser Config Sync</span>
+                            </span>
+                            <!-- Status indicator -->
+                            <span v-if="syncToken && jssync.gistId" class="flex items-center gap-1.5 ml-1 shrink-0">
+                                <span v-if="isSyncing" class="loading loading-spinner loading-xs text-info"></span>
+                                <material-icon v-else :icon="statusMeta.icon" :size="16" :class="statusMeta.color"></material-icon>
+                                <span class="text-xs font-medium" :class="statusMeta.color">{{ statusMeta.text }}</span>
+                            </span>
+                        </template>
+                        <template #actions>
+                            <button @click.stop="handleSyncNow" :disabled="isSyncing || !syncToken || !jssync.gistId" class="btn btn-xs btn-ghost border border-white/10 gap-1" title="Sync Now">
+                                <span v-if="isSyncing" class="loading loading-spinner loading-xs"></span>
+                                <material-icon v-else icon="sync" :size="14"></material-icon>
+                                <span>Sync Now</span>
+                            </button>
+                        </template>
+
+                        <div class="pt-1 space-y-4">
+                            <!-- How it works blurb -->
+                            <div class="alert bg-primary/8 border border-primary/15 text-sm gap-2 py-2.5">
+                                <material-icon icon="info" :size="18" class="text-primary/70 shrink-0"></material-icon>
+                                <div class="text-xs text-neutral-400 leading-relaxed">
+                                    Sync your settings across browsers using a private <strong class="text-neutral-300">GitHub Gist</strong>. Requires a GitHub account and a Personal Access Token scoped to <code class="text-primary/80">gist</code> only.
+                                    <a href="https://github.com/settings/tokens/new?scopes=gist&description=NAILab+Sync" target="_blank" class="text-primary hover:underline ml-1">Create PAT ↗</a>
+                                </div>
+                            </div>
+
+                            <!-- GitHub PAT -->
+                            <div class="relative">
+                                <floating-label label="GitHub Personal Access Token"></floating-label>
+                                <div class="flex gap-2 mt-1">
+                                    <input v-model="syncToken" :type="showToken ? 'text' : 'password'" placeholder="github_pat_..." class="input input-sm input-bordered flex-1 pt-2 text-sm font-mono">
+                                    <button @click="showToken = !showToken" class="btn btn-sm btn-ghost btn-square border border-white/10" :title="showToken ? 'Hide' : 'Show'">
+                                        <material-icon :icon="showToken ? 'visibility_off' : 'visibility'" :size="16"></material-icon>
+                                    </button>
+                                </div>
+                                <p class="text-xs text-neutral-600 mt-1 ml-1">Stored locally only. Never synced to Gist.</p>
+                            </div>
+
+                            <!-- Gist ID -->
+                            <div class="relative">
+                                <floating-label label="Gist ID"></floating-label>
+                                <div class="flex gap-2 mt-1">
+                                    <input v-model="jssync.gistId" type="text" placeholder="e.g. a1b2c3d4e5f6..." class="input input-sm input-bordered flex-1 pt-2 text-sm font-mono">
+                                    <button @click="handleCreateGist" :disabled="isCreatingGist || !syncToken" class="btn btn-sm btn-secondary gap-1 shrink-0" title="Create new private Gist automatically">
+                                        <span v-if="isCreatingGist" class="loading loading-spinner loading-xs"></span>
+                                        <material-icon v-else icon="add" :size="14"></material-icon>
+                                        <span>New</span>
+                                    </button>
+                                </div>
+                                <p class="text-xs text-neutral-600 mt-1 ml-1">Leave blank and click "New" to create one automatically.</p>
+                            </div>
+
+                            <!-- Proxy URLs -->
+                            <div class="space-y-2">
+                                <div class="relative">
+                                    <floating-label label="Cloudflare Worker URL (Danbooru Proxy)" color="badge-ghost"></floating-label>
+                                    <input v-model="jssync.proxyUrl" type="text" placeholder="https://my-worker.workers.dev" class="input input-sm input-bordered w-full pt-2 text-sm">
+                                </div>
+                                <div class="relative">
+                                    <floating-label label="Cloudflare Worker URL 2 (Fallback)" color="badge-ghost"></floating-label>
+                                    <input v-model="jssync.proxyUrl2" type="text" placeholder="Optional second worker" class="input input-sm input-bordered w-full pt-2 text-sm">
+                                </div>
+                                <p class="text-xs text-neutral-600 ml-1">Optional. Used as a CORS proxy for Danbooru if direct access fails. See docs for the worker code.</p>
+                            </div>
+
+                            <!-- Options -->
+                            <div class="flex flex-wrap gap-x-6 gap-y-2 py-1">
+                                <label class="flex items-center gap-2 cursor-pointer">
+                                    <input type="checkbox" v-model="jssync.autoSync" class="toggle toggle-xs toggle-primary">
+                                    <span class="text-sm text-neutral-300">Auto-sync on changes</span>
+                                    <span class="text-xs text-neutral-600">(5s debounce)</span>
+                                </label>
+                                <label class="flex items-center gap-2 cursor-pointer" title="Keys are stored locally by default. Syncing them adds risk.">
+                                    <input type="checkbox" v-model="jssync.includeApiKeys" class="toggle toggle-xs toggle-warning">
+                                    <span class="text-sm text-neutral-300">Include API keys</span>
+                                    <span class="badge badge-warning badge-xs ml-1">Risk</span>
+                                </label>
+                            </div>
+
+                            <!-- What gets synced -->
+                            <div class="glass-nested rounded-xl p-3 space-y-1">
+                                <p class="text-xs font-semibold text-neutral-400 uppercase tracking-widest mb-2">What's synced</p>
+                                <div class="grid grid-cols-2 gap-x-4 gap-y-1">
+                                    <div v-for="item in [{icon:'lab_research',label:'Tag Test Settings'},{icon:'tune',label:'Generation Config'},{icon:'edit_note',label:'Generator Prompts'},{icon:'settings',label:'App (Model)'},{icon:'auto_awesome',label:'Gemini Settings'},{icon:'package_2',label:'Danbooru Folders & Searches'}]" :key="item.label" class="flex items-center gap-1.5 text-xs text-neutral-500">
+                                        <material-icon :icon="item.icon" :size="12" class="text-success/70"></material-icon>
+                                        <span>{{ item.label }}</span>
+                                    </div>
+                                </div>
+                                <div class="divider my-1 text-xs text-neutral-600">not synced</div>
+                                <div class="flex flex-wrap gap-x-4 gap-y-0.5">
+                                    <span v-for="item in ['UI layout & panel states','Session state','Gen/chat history (Phase 2)']" :key="item" class="flex items-center gap-1 text-xs text-neutral-600"><material-icon icon="remove" :size="10"></material-icon>{{item}}</span>
+                                </div>
+                            </div>
+                        </div>
                     </collapsible-panel>
                 </div>
             `
@@ -1230,7 +1802,8 @@
         // --- Main App ---
         const App = {
             setup() {
-                const {notifications, resetNotificationNum, config} = useAppStore();
+                const {notifications, resetNotificationNum, config, addToast} = useAppStore();
+                const syncStore = useSyncStore();
                 const navItems = computed(() => [
                     {path:'/gen', icon:'image', label:'NAI Image Generator', source: 'gen'},
                     {path:'/tagtest', icon:'lab_research', label:'NAI Tag Test', source: 'tagTest'},
@@ -1240,7 +1813,28 @@
 
                 useRouter().afterEach((to) => to.meta.genSource && resetNotificationNum(to.meta.genSource));
 
-                return {navItems, notifications};
+                onMounted(async () => {
+                    const {syncToken} = useAppStore();
+                    const jssync = config.value.jssync;
+                    if (syncToken.value && jssync.gistId) {
+                        try {
+                            await syncStore.pull();
+                        } catch (e) { /* errors handled inside pull */ }
+                    }
+                    // Auto-sync on config changes (debounced 5s) — pull-then-push so conflicts are detected
+                    watch(
+                        () => { const c = config.value; return [c.tagTest, c.genConfig, c.genState, c.app, c.gemini, c.danbooru]; },
+                        useDebounceFn(() => {
+                            const js = config.value.jssync;
+                            if (!js.autoSync || !syncToken.value || !js.gistId) return;
+                            if (syncStore.syncStatus.value === 'conflict') return;
+                            syncStore.syncNow();
+                        }, 5000),
+                        { deep: true }
+                    );
+                });
+
+                return {navItems, notifications, syncStatus: syncStore.syncStatus};
             },
             template:`
                 <div class="flex h-screen animated-bg animate-gradientShift">
@@ -1249,19 +1843,26 @@
                             <li v-for="item in navItems" :key="item.path"><nav-link :to="item.path" :icon="item.icon" :notification="notifications[item.source]"></nav-link></li>
                         </ul>
                         <ul class="menu bg-transparent rounded-box p-0 mt-auto pt-2 border-t border-white/10">
-                            <li><nav-link to="/settings" icon="settings"></nav-link></li>
+                            <li>
+                                <div class="indicator p-0 flex justify-center items-center w-14 h-14">
+                                    <span v-if="syncStatus === 'conflict'" class="indicator-item badge badge-warning badge-xs">!</span>
+                                    <span v-else-if="syncStatus === 'error'" class="indicator-item badge badge-error badge-xs">!</span>
+                                    <nav-link to="/settings" icon="settings"></nav-link>
+                                </div>
+                            </li>
                         </ul>
                     </nav>
                     <main class="flex-1 overflow-hidden"><router-view v-slot="{Component}"><keep-alive><component :is="Component" /></keep-alive></router-view></main>
                     <toast-container></toast-container>
+                    <conflict-resolution-modal></conflict-resolution-modal>
                 </div>
             `
         };
         
         const app = createApp(App);
-        Object.entries({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ImageViewer, ToastContainer, PromptInput, FolderDropdown, NavLink, ChatMessage, NanoBananaStudio}).forEach(([n, c]) => app.component(n, c));
+        Object.entries({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ImageViewer, ToastContainer, PromptInput, FolderDropdown, NavLink, ChatMessage, NanoBananaStudio, ConflictResolutionModal}).forEach(([n, c]) => app.component(n, c));
         app.use(router);
         app.mount('#app');
     </script>
 </body>
-</html> 
+</html>
