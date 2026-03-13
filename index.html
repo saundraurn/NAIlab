@@ -27,10 +27,15 @@
     <script src="https://unpkg.com/textarea-caret@3.1.0/index.js"></script>
 
     <script src="https://unpkg.com/@isomorphic-git/lightning-fs@4.6.2"></script>
-    <script src="https://unpkg.com/isomorphic-git@1.37.2"></script>
+    <!-- gitReady resolves once the async esm.sh module finishes loading -->
+    <script>window.gitReady = new Promise(function(r){ window._resolveGitReady = r; });</script>
+    <!-- Load isomorphic-git via esm.sh which bundles all Node.js polyfills (including buffer) automatically -->
     <script type="module">
-        import http from 'https://unpkg.com/isomorphic-git@1.37.2/http/web/index.js';
+        import git from 'https://esm.sh/isomorphic-git@1.37.2';
+        import http from 'https://esm.sh/isomorphic-git@1.37.2/http/web';
+        window.git = git;
         window.gitHttp = http;
+        window._resolveGitReady();
     </script>
 
     <link href="https://fonts.googleapis.com/css2?family=Raleway:wght@300;400;500;600;700&family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
@@ -83,7 +88,7 @@
     <script>
         const {createApp, ref, shallowRef, reactive, computed, onMounted, watch, nextTick, toRefs, toRef, provide, inject, onActivated, onDeactivated, onBeforeUnmount, getCurrentInstance, onScopeDispose} = Vue;
         const {createRouter, createWebHashHistory, useRoute, useRouter} = VueRouter;
-        const {useLocalStorage, useSessionStorage, useFetch, createGlobalState, useAsyncState, useDebounceFn, onKeyStroke, useInfiniteScroll, useTextareaAutosize, useScroll, onClickOutside, useEventListener} = VueUse;
+        const {useLocalStorage, useSessionStorage, createGlobalState, useAsyncState, useDebounceFn, onKeyStroke, useInfiniteScroll, useTextareaAutosize, useScroll, onClickOutside, useEventListener} = VueUse;
         
         const OPUS_DIMENSIONS=Object.freeze([[1024,1024],[960,1088],[1088,960],[896,1152],[1152,896],[832,1216],[1216,832],[768,1344],[1344,768],[704,1472],[1472,704],[640,1600],[1600,640],[576,1792],[1792,576],[512,2048],[2048,512]].map(([width,height])=>({width,height})));
         const DANBOORU_LIMIT = 100;
@@ -94,7 +99,10 @@
 
         // --- Global Utilities ---
         const uid = () => crypto.randomUUID();
-        const imgSrc = (img) => img ? `data:${img.mimeType};base64,${img.data}` : '';
+        // Rescues a plain-object-shaped array (e.g. {0:x,1:y} from a bad lodash merge) back to
+        // a real array. Object.values() preserves data; resetting to [] would lose it.
+        const _ensureArray = (val) => Array.isArray(val) ? val : Object.values(val || {});
+        const imgSrc = (img) => (img && img.data) ? `data:${img.mimeType};base64,${img.data}` : '';
         const uint8ArrayToBase64 = (arr) => {
             let binary = '';
             const chunkSize = 8192;
@@ -104,47 +112,13 @@
             return btoa(binary);
         };
 
-        const WEBP_WORKER_CODE = `
-            import encode from 'https://esm.sh/@jsquash/webp@0.1.4';
-            self.onmessage = async (e) => {
-                const { id, imageData } = e.data;
-                try {
-                    const webpData = new Uint8Array(await encode(imageData, { effort: 6, quality: 100 }));
-                    self.postMessage({ id, webp: webpData }, [webpData.buffer]);
-                } catch (error) {
-                    self.postMessage({ id, error: error.message });
-                }
-            };
-        `;
-        let webpWorkerInstance = null;
-        const getWebPWorker = () => {
-            if (!webpWorkerInstance) {
-                const blob = new Blob([WEBP_WORKER_CODE], { type: 'text/javascript' });
-                webpWorkerInstance = new Worker(URL.createObjectURL(blob), { type: 'module' });
-            }
-            return webpWorkerInstance;
-        };
-
         const blobToWebP = async (blob) => {
             const bitmap = await createImageBitmap(blob);
             const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
             const ctx = canvas.getContext('2d');
             ctx.drawImage(bitmap, 0, 0);
-            const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
-
-            return new Promise((resolve, reject) => {
-                const worker = getWebPWorker();
-                const id = uid();
-                const handler = (e) => {
-                    if (e.data.id === id) {
-                        worker.removeEventListener('message', handler);
-                        if (e.data.error) reject(new Error(e.data.error));
-                        else resolve(e.data.webp);
-                    }
-                };
-                worker.addEventListener('message', handler);
-                worker.postMessage({ id, imageData });
-            });
+            const webpBlob = await canvas.convertToBlob({ type: 'image/webp', quality: 1.0 });
+            return new Uint8Array(await webpBlob.arrayBuffer());
         };
 
         const base64ToWebP = async (base64, mimeType) => {
@@ -178,11 +152,44 @@
                 danbooru: {folders:[], nextFolderId:1, gridCols:4, lastPath:'/danbooru', blacklist:'', sortOrder:'id', ratingFilters:{g:true, s:true, q:true, e:true}, savedSearches:[{name:'Trending', prompt:'order:rank'}]},
                 genState: {prompt:'1girl, solo, wearing casual clothes', uc:'multiple views, monochrome, black and white, looking at viewer, pov', charPrompts:[{id:1, val:''}], nextCharPromptId:2},
                 jssync: {gistId:'', proxyUrl:'', proxyUrl2:'', autoSync:true, lastSyncedAt:null, lastPulledEtag:'', lastSyncedRevs:{}},
-                _syncMeta: {tagTest:{updatedAt:0,rev:0}, genConfig:{updatedAt:0,rev:0}, genState:{updatedAt:0,rev:0}, app:{updatedAt:0,rev:0}, gemini:{updatedAt:0,rev:0}, danbooru:{updatedAt:0,rev:0}}
+                savedConversations: [],
+                imageSync: {
+                    gists: [],            // [{gistId: string, sizeBytes: number}]
+                    manifest: {},         // {imageId: gistIndex | -1}  (-1 = pending push)
+                    pendingIds: [],       // imageIds awaiting push — device-local, not synced
+                    pendingDeletions: {}  // {gistIndex: [imageId, ...]} — device-local, not synced
+                },
+                _syncMeta: {tagTest:{updatedAt:0,rev:0}, genConfig:{updatedAt:0,rev:0}, genState:{updatedAt:0,rev:0}, app:{updatedAt:0,rev:0}, gemini:{updatedAt:0,rev:0}, danbooru:{updatedAt:0,rev:0}, savedConversations:{updatedAt:0,rev:0}, imageSync:{updatedAt:0,rev:0}}
             }, {mergeDefaults: true});
 
-            // Token held in sessionStorage only — never written to localStorage or synced to Gist
-            const syncToken = useSessionStorage('nai-sync-token', '');
+            // Rescue any array fields that VueUse's mergeDefaults (or a past buggy merge) may
+            // have converted to plain objects like {0:convo,1:convo}.
+            const _normalizeArrayFields = (cfg) => {
+                // savedConversations: strip any legacy full-message entries down to metadata only
+                // (full data now lives in localLfs/IndexedDB)
+                if (!Array.isArray(cfg.savedConversations)) cfg.savedConversations = _ensureArray(cfg.savedConversations);
+                cfg.savedConversations = cfg.savedConversations.map(c => {
+                    if (!c || typeof c !== 'object') return c;
+                    // If legacy entry still has messages array, keep only metadata — full data
+                    // was already (or will be) migrated to localLfs by initFromStorage.
+                    const { id, title, preview, timestamp } = c;
+                    return { id, title, preview, timestamp };
+                });
+                if (cfg.imageSync) {
+                    if (!Array.isArray(cfg.imageSync.gists))     cfg.imageSync.gists     = _ensureArray(cfg.imageSync.gists);
+                    if (!Array.isArray(cfg.imageSync.pendingIds)) cfg.imageSync.pendingIds = _ensureArray(cfg.imageSync.pendingIds);
+                    if (cfg.imageSync.pendingDeletions && typeof cfg.imageSync.pendingDeletions === 'object') {
+                        Object.keys(cfg.imageSync.pendingDeletions).forEach(k => {
+                            if (!Array.isArray(cfg.imageSync.pendingDeletions[k]))
+                                cfg.imageSync.pendingDeletions[k] = _ensureArray(cfg.imageSync.pendingDeletions[k]);
+                        });
+                    }
+                }
+            };
+            _normalizeArrayFields(config.value);
+
+            // Token held in localStorage — persists across sessions
+            const syncToken = useLocalStorage('nai-sync-token', '');
 
             // Guard flag: set true during remote merges so watchers don't stamp _syncMeta
             const isSyncMerging = ref(false);
@@ -192,6 +199,10 @@
             WATCHED_SECTIONS.forEach(section => {
                 watch(() => config.value[section], () => {
                     if (isSyncMerging.value || !config.value._syncMeta) return;
+                    // Guard: _syncMeta entry may be absent for sections added after initial localStorage write
+                    if (!config.value._syncMeta[section]) {
+                        config.value._syncMeta[section] = { rev: 0, updatedAt: 0 };
+                    }
                     const meta = config.value._syncMeta[section];
                     meta.rev = (meta.rev || 0) + 1;
                     meta.updatedAt = Date.now();
@@ -287,107 +298,319 @@
         };
 
         // --- Image Store (LightningFS + isomorphic-git) ---
+        const IMAGE_SYNC_TOAST_ID = 'img-sync';
+        let _proxyMissingWarnedThisSession = false;
+
         const useImageStore = createGlobalState(() => {
             const store = useAppStore();
-            let lfs = null;
+            let localLfs = null;          // 'nailab-git' — hot read/write cache
+            const gistLfsMap = {};        // {n: LightningFS} for 'nailab-img-{n}'
+            let isPushRunning = false;
+
+            const _getImageSync = () => store.config.value.imageSync;
+
+            const _getAuthParams = () => {
+                const { jssync } = store.config.value;
+                const proxy = (jssync.proxyUrl || jssync.proxyUrl2 || '').replace(/\/$/, '');
+                return {
+                    corsProxy: proxy ? proxy + '/git' : '',
+                    onAuth: () => ({ username: 'token', password: store.syncToken.value }),
+                    author: { name: 'NAILab', email: 'sync@nailab' }
+                };
+            };
+
+            const _hasProxy = () => {
+                const { jssync } = store.config.value;
+                return !!(jssync.proxyUrl || jssync.proxyUrl2);
+            };
+
+            const _renameMasterToMain = async (lfs) => {
+                try {
+                    const branches = await window.git.listBranches({ fs: lfs, dir: '/' });
+                    if (branches.includes('master') && !branches.includes('main')) {
+                        await window.git.branch({ fs: lfs, dir: '/', ref: 'main', object: 'master' });
+                        await window.git.deleteBranch({ fs: lfs, dir: '/', ref: 'master' });
+                        await window.git.checkout({ fs: lfs, dir: '/', ref: 'main' });
+                    }
+                } catch (e) { /* no commits yet or already on main */ }
+            };
+
+            const _initGistLfs = async (n) => {
+                if (gistLfsMap[n]) return;
+                await window.gitReady;
+                const gistEntry = _getImageSync().gists[n];
+                const gistUrl = 'https://gist.github.com/' + gistEntry.gistId + '.git';
+                const lfs = new LightningFS('nailab-img-' + n);
+                try { await lfs.promises.stat('/.git'); } catch (e) {
+                    await window.git.init({ fs: lfs, dir: '/', defaultBranch: 'main' });
+                }
+                // Always ensure origin is set correctly (handles new repos and URL changes)
+                await window.git.addRemote({ fs: lfs, dir: '/', remote: 'origin', url: gistUrl, force: true });
+                await _renameMasterToMain(lfs);
+                gistLfsMap[n] = lfs;
+            };
 
             const init = async () => {
-                lfs = new LightningFS('nailab-git');
-                try {
-                    await lfs.promises.stat('/.git');
-                } catch (e) {
-                    await window.git.init({ fs: lfs, dir: '/' });
+                await window.gitReady;
+                localLfs = new LightningFS('nailab-git');
+                try { await localLfs.promises.stat('/.git'); } catch (e) {
+                    await window.git.init({ fs: localLfs, dir: '/', defaultBranch: 'main' });
                 }
+                await _renameMasterToMain(localLfs);
+                // Migration: remove legacy conversations.json from localLfs if present
+                try { await localLfs.promises.unlink('/conversations.json'); } catch (e) {}
+            };
+
+            // Fetches remote and aligns local refs — NO checkout.
+            // checkout({ force:true }) is avoided entirely: isomorphic-git issue #1741 means it
+            // can silently delete staged/untracked files and throws internal "filepath" errors on
+            // repos with no prior HEAD. Since our Gist is append-only (UUID filenames), we never
+            // need to reconstruct the working tree — we read blobs directly from the object store.
+            const _fetchAndAlignRef = async (lfs, authParams) => {
+                await window.git.fetch({ fs: lfs, http: window.gitHttp, dir: '/', remote: 'origin', singleBranch: true, ref: 'main', ...authParams });
+                const oid = await window.git.resolveRef({ fs: lfs, dir: '/', ref: 'refs/remotes/origin/main' });
+                await window.git.writeRef({ fs: lfs, dir: '/', ref: 'refs/heads/main', value: oid, force: true });
             };
 
             const saveImage = async (imageId, uint8Array) => {
-                await lfs.promises.writeFile('/' + imageId, uint8Array);
+                // Local hot cache write only — cloud sync removed for Nano Banana
+                await localLfs.promises.writeFile('/' + imageId, uint8Array);
             };
 
             const loadImage = async (imageId) => {
+                // Local hot cache only — cloud pull removed for Nano Banana
                 try {
-                    return await lfs.promises.readFile('/' + imageId);
-                } catch (e) {
-                    return null;
-                }
-            };
-
-            const deleteImage = async (imageId) => {
-                try {
-                    await lfs.promises.unlink('/' + imageId);
+                    const bytes = await localLfs.promises.readFile('/' + imageId);
+                    if (bytes) return bytes;
                 } catch (e) {}
+                return null;
             };
 
-            const saveConversations = async (serialized) => {
-                await lfs.promises.writeFile('/conversations.json', JSON.stringify(serialized));
-            };
-
-            const loadConversations = async () => {
-                try {
-                    const data = await lfs.promises.readFile('/conversations.json', 'utf8');
-                    return JSON.parse(data);
-                } catch (e) {
-                    return null;
-                }
-            };
-
-            const gitSync = async () => {
-                const config = store.config.value;
+            const pushPendingImages = async (silent = false) => {
                 const token = store.syncToken.value;
-                const { gistId, proxyUrl, proxyUrl2 } = config.jssync;
-                if (!token || !gistId) return null;
 
-                const primaryProxy = proxyUrl || proxyUrl2;
-                if (!primaryProxy) {
-                    console.warn('Image sync requires a Cloudflare Worker proxy.');
-                    return null;
+                if (!token || !_hasProxy()) {
+                    if (!silent && !_proxyMissingWarnedThisSession) {
+                        _proxyMissingWarnedThisSession = true;
+                        store.addToast({ msg: 'Images saved locally. Add a proxy URL in Settings to enable remote sync.', type: 'info', duration: 6000, source: 'sync' });
+                    }
+                    return;
                 }
-                const pUrl = primaryProxy.replace(/\/$/, '') + '/git';
-                const authParams = {
-                    onAuth: () => ({ username: 'token', password: token }),
-                    corsProxy: pUrl,
-                    author: { name: 'NAILab', email: 'sync@nailab' }
-                };
+
+                if (isPushRunning) return;
+                isPushRunning = true;
+
+                const imageSync = _getImageSync();
+                // Ensure all array fields are valid before operating on them
+                if (!Array.isArray(imageSync.pendingIds)) imageSync.pendingIds = _ensureArray(imageSync.pendingIds);
+                if (!Array.isArray(imageSync.gists))      imageSync.gists      = _ensureArray(imageSync.gists);
+                if (imageSync.pendingDeletions && typeof imageSync.pendingDeletions === 'object') {
+                    Object.keys(imageSync.pendingDeletions).forEach(k => {
+                        if (!Array.isArray(imageSync.pendingDeletions[k]))
+                            imageSync.pendingDeletions[k] = _ensureArray(imageSync.pendingDeletions[k]);
+                    });
+                }
+
+                if (!silent) store.addToast({ id: IMAGE_SYNC_TOAST_ID, msg: 'Syncing images…', type: 'loading', persistent: true, source: 'sync' });
 
                 try {
-                    store.addToast({ msg: 'Syncing images...', type: 'info', duration: 2000, source: 'sync' });
-                    try {
-                        await lfs.promises.stat('/.git');
-                        await window.git.pull({
-                            fs: lfs, http: window.gitHttp, dir: '/',
-                            ...authParams, singleBranch: true
-                        });
-                    } catch (e) {
-                        // clone if no .git or pull fails drastically on empty repo
-                        await window.git.clone({
-                            fs: lfs, http: window.gitHttp, dir: '/',
-                            url: 'https://gist.github.com/' + gistId + '.git',
-                            depth: 1, ...authParams, singleBranch: true
-                        });
+                    const pendingSnapshot = [...imageSync.pendingIds];
+                    const hasDeletions = Object.keys(imageSync.pendingDeletions || {}).some(k => (imageSync.pendingDeletions[k]?.length || 0) > 0);
+
+                    if (!pendingSnapshot.length && !hasDeletions) {
+                        if (!silent) store.addToast({ id: IMAGE_SYNC_TOAST_ID, msg: 'Images synced.', type: 'success', duration: 3000, source: 'sync' });
+                        return;
                     }
 
-                    const status = await window.git.statusMatrix({ fs: lfs, dir: '/' });
-                    const changed = status.some(row => row[1] !== row[2] || row[2] !== row[3]);
-
-                    if (changed) {
-                        await window.git.add({ fs: lfs, dir: '/', filepath: '.' });
-                        await window.git.commit({ fs: lfs, dir: '/', message: 'Update images', author: authParams.author });
-                        await window.git.push({
-                            fs: lfs, http: window.gitHttp, dir: '/',
-                            ...authParams
-                        });
+                    // Group pending image IDs by target gist index
+                    const activeIdx = imageSync.gists.length > 0 ? imageSync.gists.length - 1 : 0;
+                    const groups = {};
+                    for (const imageId of pendingSnapshot) {
+                        const manifestVal = imageSync.manifest[imageId];
+                        const idx = (manifestVal === -1 || manifestVal === undefined) ? activeIdx : manifestVal;
+                        (groups[idx] = groups[idx] || []).push(imageId);
+                    }
+                    // Ensure gists with pending deletions are also processed even if no new additions
+                    for (const gistIndexStr of Object.keys(imageSync.pendingDeletions || {})) {
+                        const n = parseInt(gistIndexStr);
+                        if ((imageSync.pendingDeletions[n]?.length || 0) > 0 && !groups[n]) groups[n] = [];
                     }
 
-                    const pFreshData = await loadConversations();
-                    store.addToast({ msg: 'Image sync complete!', type: 'success', source: 'sync' });
-                    return pFreshData;
+                    const authParams = _getAuthParams();
+
+                    for (const [gistIndexStr, imageIds] of Object.entries(groups)) {
+                        let n = parseInt(gistIndexStr);
+                        const gistEntry = imageSync.gists[n];
+                        if (!gistEntry) {
+                            // Index no longer valid — re-queue to active gist
+                            for (const imageId of imageIds) {
+                                imageSync.manifest[imageId] = -1;
+                                if (!imageSync.pendingIds.includes(imageId)) imageSync.pendingIds.push(imageId);
+                            }
+                            continue;
+                        }
+
+                        await _initGistLfs(n);
+                        const lfs = gistLfsMap[n];
+
+                        // Align local refs to remote HEAD before staging new images.
+                        // We use fetch+writeRef only (no checkout) to avoid isomorphic-git #1741.
+                        try {
+                            await _fetchAndAlignRef(lfs, authParams);
+                        } catch (e) { console.warn('git fetch+align (pre-push):', e.message); }
+
+                        // Stage pending deletions — unlink from gist LFS and local cache
+                        const deletions = imageSync.pendingDeletions?.[n] || [];
+                        for (const delId of deletions) {
+                            try { await lfs.promises.unlink('/' + delId); } catch (e) {}
+                            try { await localLfs.promises.unlink('/' + delId); } catch (e) {}
+                            delete imageSync.manifest[delId];
+                            try { await window.git.remove({ fs: lfs, dir: '/', filepath: delId }); } catch (e) {}
+                        }
+
+                        // Stage only the specific pending images (not '.') to avoid touching
+                        // README.md or any other file from the remote tree.
+                        for (const imageId of imageIds) {
+                            try { await window.git.add({ fs: lfs, dir: '/', filepath: imageId }); } catch (e) {
+                                console.warn('git add failed for', imageId, e.message);
+                            }
+                        }
+
+                        // Only commit + push if something actually changed
+                        const status = await window.git.statusMatrix({ fs: lfs, dir: '/' });
+                        const changed = status.some(row => row[1] !== row[2] || row[2] !== row[3]);
+                        if (changed) {
+                            await window.git.commit({ fs: lfs, dir: '/', message: 'Update images ' + new Date().toISOString(), author: authParams.author });
+                            await window.git.push({ fs: lfs, http: window.gitHttp, dir: '/', remote: 'origin', ...authParams, ref: 'main' });
+                        }
+
+                        // Finalize manifest and clear pending tracking
+                        for (const imageId of imageIds) {
+                            imageSync.manifest[imageId] = n;
+                            const idx = imageSync.pendingIds.indexOf(imageId);
+                            if (idx !== -1) imageSync.pendingIds.splice(idx, 1);
+                        }
+                        if (imageSync.pendingDeletions?.[n]) delete imageSync.pendingDeletions[n];
+                    }
+
+                    if (!silent) store.addToast({ id: IMAGE_SYNC_TOAST_ID, msg: 'Images synced.', type: 'success', duration: 3000, source: 'sync' });
+                    // Persist updated manifest + cleared pendingIds to config Gist
+                    try { await useSyncStore().push(true); } catch (e) {}
+
                 } catch (e) {
-                    store.addToast({ msg: 'Image sync failed — remote may have new changes. Try syncing again.', type: 'error', duration: 5000, source: 'sync' });
-                    return null;
+                    console.error('Image push error:', e);
+                    if (!silent) store.addToast({ id: IMAGE_SYNC_TOAST_ID, msg: 'Image sync failed — will retry on next save.', type: 'warning', duration: 5000, source: 'sync' });
+                    else store.addToast({ msg: 'Image sync failed — will retry on next save.', type: 'warning', duration: 5000, source: 'sync' });
+                } finally {
+                    isPushRunning = false;
                 }
             };
 
-            return { init, saveImage, loadImage, deleteImage, saveConversations, loadConversations, gitSync, getLfs: () => lfs };
+            const cleanupOrphanedImages = async () => {
+                const metas = store.config.value.savedConversations || [];
+
+                // Collect every imageId still referenced by a saved conversation.
+                const referenced = new Set();
+                for (const meta of metas) {
+                    if (!meta || !meta.id) continue;
+                    try {
+                        const json = await localLfs.promises.readFile(`/convo_${meta.id}.json`, { encoding: 'utf8' });
+                        const convo = JSON.parse(json);
+                        for (const msg of convo.messages || []) {
+                            for (const img of msg.images || []) { if (img.imageId) referenced.add(img.imageId); }
+                            for (const v of msg.variants || []) {
+                                for (const part of v.parts || []) { if (part._imageRef) referenced.add(part._imageRef); }
+                                for (const img of v._images || []) { if (img.imageId) referenced.add(img.imageId); }
+                            }
+                        }
+                        for (const item of convo.gallery || []) { if (item.imageId) referenced.add(item.imageId); }
+                    } catch (e) { /* file not found or parse error — skip */ }
+                }
+
+                // Scan localLfs directly — manifest is no longer populated by saveImage.
+                try {
+                    const files = await localLfs.promises.readdir('/');
+                    for (const f of files) {
+                        if (f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f)) {
+                            localLfs.promises.unlink('/' + f).catch(() => {});
+                        }
+                    }
+                } catch (e) {}
+
+                // Also purge any legacy manifest entries that are now orphaned.
+                const imageSync = _getImageSync();
+                const orphans = Object.keys(imageSync.manifest || {}).filter(id => !referenced.has(id));
+                for (const id of orphans) {
+                    const idx = imageSync.pendingIds.indexOf(id);
+                    if (idx !== -1) imageSync.pendingIds.splice(idx, 1);
+                    delete imageSync.manifest[id];
+                }
+            };
+
+            const recalculateSizeBytes = async (n) => {
+                await _initGistLfs(n);
+                const lfs = gistLfsMap[n];
+                try {
+                    const files = await lfs.promises.readdir('/');
+                    let sum = 0;
+                    for (const f of files) {
+                        if (f.startsWith('img_') && f.endsWith('.webp')) {
+                            const stat = await lfs.promises.stat('/' + f);
+                            sum += stat.size;
+                        }
+                    }
+                    _getImageSync().gists[n].sizeBytes = sum;
+                    try { await useSyncStore().push(true); } catch (e) {}
+                } catch (e) { console.error('recalculateSizeBytes:', e); }
+            };
+
+            const clearAllLocalCaches = async () => {
+                // Clear img files from local hot cache
+                try {
+                    const files = await localLfs.promises.readdir('/');
+                    for (const f of files) {
+                        if (f.startsWith('img_') && f.endsWith('.webp')) {
+                            await localLfs.promises.unlink('/' + f);
+                        }
+                    }
+                } catch (e) {}
+                // Clear img files from each gist LFS working tree
+                // (they'll be re-cloned on next pull; manifest is preserved so routing still works)
+                const imageSync = _getImageSync();
+                for (let n = 0; n < imageSync.gists.length; n++) {
+                    try {
+                        await _initGistLfs(n);
+                        const lfs = gistLfsMap[n];
+                        const files = await lfs.promises.readdir('/');
+                        for (const f of files) {
+                            if (f.startsWith('img_') && f.endsWith('.webp')) {
+                                await lfs.promises.unlink('/' + f);
+                            }
+                        }
+                    } catch (e) {}
+                }
+            };
+
+            const getLfs = () => localLfs;
+
+            // Wipes all imageSync tracking state. Use after manually deleting gists on GitHub
+            // so the app can start fresh (new gist created on next save).
+            const resetImageSync = async () => {
+                const imageSync = _getImageSync();
+                imageSync.gists = [];
+                imageSync.manifest = {};
+                imageSync.pendingIds = [];
+                imageSync.pendingDeletions = {};
+                Object.keys(gistLfsMap).forEach(k => delete gistLfsMap[k]);
+                try { await useSyncStore().push(true); } catch (e) {}
+                store.addToast({ msg: 'Image sync state reset. A new gist will be created on next image save.', type: 'success', duration: 5000, source: 'sync' });
+            };
+
+            return {
+                init, saveImage, loadImage,
+                pushPendingImages,
+                cleanupOrphanedImages, recalculateSizeBytes, clearAllLocalCaches, getLfs, resetImageSync
+            };
         });
 
         // --- Sync Store (GitHub Gist REST API) ---
@@ -396,10 +619,16 @@
             const syncError = ref(null);
             const syncStatus = ref('idle'); // 'idle'|'pulling'|'pushing'|'conflict'|'error'
             const pendingConflict = ref(null); // { local, remote }
+            const lastPushedContent = ref(null); // dirty-check: skip push if payload unchanged
 
-            // Merge helper: replaces arrays wholesale instead of merging element-by-index
-            const mergeWithArrayReplace = (obj, src) =>
-                _.mergeWith({}, obj, src, (_objVal, srcVal) => _.isArray(srcVal) ? _.cloneDeep(srcVal) : undefined);
+            // Merge helper: replaces arrays wholesale instead of merging element-by-index.
+            // CRITICAL: _.mergeWith({}, arrayA, arrayB) starts with {} — lodash treats arrays as
+            // plain objects and converts [c1,c2] → {0:c1,1:c2}. Guard: if src is itself an array,
+            // return a deep clone immediately.
+            const mergeWithArrayReplace = (obj, src) => {
+                if (_.isArray(src)) return _.cloneDeep(src);
+                return _.mergeWith({}, obj, src, (_objVal, srcVal) => _.isArray(srcVal) ? _.cloneDeep(srcVal) : undefined);
+            };
 
             const SYNCED_SECTIONS = ['tagTest', 'genConfig', 'genState', 'app', 'gemini', 'danbooru', '_syncMeta'];
             const GIST_FILENAME = 'nailab-config.json';
@@ -417,6 +646,10 @@
                 // Always exclude API keys from sync
                 if (snap.app) delete snap.app.apiKey;
                 if (snap.gemini) delete snap.gemini.apiKey;
+                // Strip device-local imageSync fields — pendingIds/pendingDeletions are per-device only
+                if (snap.imageSync) {
+                    snap.imageSync = { gists: snap.imageSync.gists || [], manifest: snap.imageSync.manifest || {} };
+                }
                 return snap;
             };
 
@@ -511,6 +744,7 @@
                                 if (key === '_syncMeta') return;
                                 cfg[key] = mergeWithArrayReplace(cfg[key], val);
                             });
+                            _normalizeArrayFields(cfg);
                             // Adopt remote _syncMeta for auto-merged sections
                             if (remote._syncMeta) {
                                 Object.keys(autoMerged).forEach(k => {
@@ -530,6 +764,8 @@
 
                     cfg.jssync.lastSyncedAt = Date.now();
                     cfg.jssync.lastPulledEtag = gistData.updated_at || '';
+                    // Seed the dirty-check baseline so an immediate post-pull push is skipped if nothing changed
+                    lastPushedContent.value = JSON.stringify(extractSyncPayload(cfg), null, 2);
                     syncStatus.value = 'idle';
                 } catch (e) {
                     syncError.value = e.message;
@@ -549,7 +785,15 @@
                 try {
                     const payload = extractSyncPayload(cfg);
                     const content = JSON.stringify(payload, null, 2);
+
+                    // Dirty check — skip the API call if nothing actually changed
+                    if (content === lastPushedContent.value) {
+                        syncStatus.value = 'idle';
+                        return;
+                    }
+
                     const updated = await updateGist(token, gistId, content);
+                    lastPushedContent.value = content;
                     cfg.jssync.lastSyncedAt = Date.now();
                     cfg.jssync.lastPulledEtag = updated.updated_at || '';
                     // Record current local revs so future pulls know what changed since this push
@@ -613,6 +857,7 @@
                         if (key === '_syncMeta') return;
                         cfg[key] = mergeWithArrayReplace(cfg[key], val);
                     });
+                    _normalizeArrayFields(cfg);
                     // Rebuild _syncMeta: preserve existing fields, bump updatedAt to now
                     const conflict = pendingConflict.value;
                     if (conflict) {
@@ -635,7 +880,7 @@
                 try { await push(false); } finally { isSyncing.value = false; }
             };
 
-            return { isSyncing, syncStatus, syncError, pendingConflict, pull, push, syncNow, createAndSetGist, resolveConflict, SYNCED_SECTIONS };
+            return { isSyncing, syncStatus, syncError, pendingConflict, lastPushedContent, pull, push, syncNow, createAndSetGist, resolveConflict, SYNCED_SECTIONS };
         });
 
         // --- Primitives ---
@@ -856,7 +1101,7 @@
                 const generate = () => {
                     const seed = _.random(9007199254740990);
                     store.addReqs([{
-                        source: 'gen', prompt: genState.value.prompt, uc: genState.value.uc, seed, char_captions: createCaptions('positive'), negative_char_captions: createCaptions('negative'), genConfig: prepareGenConfig(genConfig.value),
+                        source: 'gen', prompt: genState.value.prompt, uc: genState.value.uc, seed, charCaptions: createCaptions('positive'), negativeCharCaptions: createCaptions('negative'), genConfig: prepareGenConfig(genConfig.value),
                         callback: (error, {blob, context} = {}) => { if (error) return statusMsg.value = `Error: ${error.message}`; const newImage = {id: Date.now(), url: urlManager.create(blob), seed: context.seed}; genHistory.value.unshift(newImage); viewedImg.value = newImage; statusMsg.value = `Image generated with seed ${context.seed}.`; },
                         onStatusUpdate: (message) => statusMsg.value = message, context: {seed}
                     }]);
@@ -1145,19 +1390,18 @@
         }
         
         // --- Conversation Serialization format ---
-        const serializeConversation = async (messages, gallery) => {
+        // Full conversation data is stored in localLfs (IndexedDB) — NOT in localStorage.
+        // savedConversations config only holds metadata: {id, title, preview, timestamp}.
+        // This prevents localStorage quota errors regardless of conversation size.
+        const serializeConversation = async (messages, gallery, activeConversationId) => {
             const imageStore = useImageStore();
             const serializedMessages = await Promise.all(messages.map(async (msg) => {
-                const sMsg = { ...msg };
-
-                if (sMsg.images && sMsg.images.length > 0) {
-                    sMsg.images = await Promise.all(sMsg.images.map(async (img, idx) => {
+                if (msg.role === 'user') {
+                    // Explicit construction — no spread — prevents any accidental data leakage
+                    const serializedImages = await Promise.all((msg.images || []).map(async (img) => {
                         if (!img.imageId && img.data) {
-                            // If user image isn't WebP yet, we must convert it and mutate the original object in memory
-                            // so it doesn't get processed again on the next debounce.
                             let webpBytes;
                             if (img.mimeType === 'image/webp') {
-                                // If already webp, just decode base64 to bytes
                                 const binStr = atob(img.data);
                                 webpBytes = new Uint8Array(binStr.length);
                                 for (let i = 0; i < binStr.length; i++) webpBytes[i] = binStr.charCodeAt(i);
@@ -1169,48 +1413,76 @@
                             img.imageId = 'img_' + uid() + '.webp';
                             await imageStore.saveImage(img.imageId, webpBytes);
                         }
-                        return { id: img.id, imageId: img.imageId, mimeType: 'image/webp', name: img.name, hidden: img.hidden };
+                        // Whitelist only the fields needed to reconstruct user images
+                        return { id: img.id, imageId: img.imageId, mimeType: 'image/webp', name: img.name || '', hidden: img.hidden || false };
                     }));
+                    return { id: msg.id, role: 'user', text: msg.text || '', images: serializedImages, hidden: msg.hidden || false };
                 }
 
-                if (sMsg.variants && sMsg.variants.length > 0) {
-                    sMsg.variants = await Promise.all(sMsg.variants.map(async (v) => {
-                        const sV = { ...v, _images: v._images.map(img => ({ mimeType: img.mimeType, imageId: img.imageId })) };
+                if (msg.role === 'model') {
+                    const serializedVariants = await Promise.all((msg.variants || []).map(async (v) => {
                         let inlineDataCount = 0;
-                        sV.parts = await Promise.all(v.parts.map(async (part) => {
+                        const serializedParts = await Promise.all((v.parts || []).map(async (part) => {
                             if (part.inlineData) {
-                                let imageId = v._images[inlineDataCount]?.imageId;
+                                let imageId = v._images?.[inlineDataCount]?.imageId;
                                 if (!imageId) {
                                     const webpBytes = await base64ToWebP(part.inlineData.data, part.inlineData.mimeType);
                                     imageId = 'img_' + uid() + '.webp';
                                     await imageStore.saveImage(imageId, webpBytes);
-
-                                    // Mutate the live array so it doesn't get regenerated on the next debounce save
-                                    if (v._images[inlineDataCount]) {
-                                        v._images[inlineDataCount].imageId = imageId;
-                                    }
+                                    if (v._images?.[inlineDataCount]) v._images[inlineDataCount].imageId = imageId;
                                 }
                                 inlineDataCount++;
-                                return { ...part, inlineData: undefined, _imageRef: imageId, _mimeType: 'image/webp' };
+                                // Explicit construction — NEVER spread inlineData, it contains full base64
+                                const sPart = { _imageRef: imageId, _mimeType: 'image/webp' };
+                                if (part.thought) sPart.thought = true;
+                                // thought_signature must be echoed back to the API verbatim on every
+                                // subsequent turn — store under a private key to survive the whitelist
+                                if (part.thought_signature) sPart._thoughtSignature = part.thought_signature;
+                                if (part.text) sPart.text = part.text;
+                                return sPart;
                             }
-                            return part;
+                            // Text part — only keep text, thought flag, and thought_signature
+                            return { text: part.text || '', ...(part.thought ? { thought: true } : {}), ...(part.thought_signature ? { thought_signature: part.thought_signature } : {}) };
                         }));
-                        return sV;
+                        const serializedImages = (v._images || []).map(img => ({
+                            mimeType: img.mimeType || 'image/webp',
+                            imageId: img.imageId || null
+                        }));
+                        // Whitelist variant fields. _thinking is intentionally stripped:
+                        // it can be very large (HIGH mode) and is not needed to resume a conversation.
+                        return {
+                            id: v.id,
+                            parts: serializedParts,
+                            _text: v._text || '',
+                            _thinking: '',   // stripped — regenerable, not needed, can be huge
+                            _images: serializedImages,
+                            _usage: v._usage ? { promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0 } : null,
+                            _error: v._error || null,
+                            _blockReason: v._blockReason || null,
+                            _isPromptBlock: v._isPromptBlock || false,
+                            timestamp: v.timestamp || null
+                        };
                     }));
+                    return { id: msg.id, role: 'model', variants: serializedVariants, activeVariant: msg.activeVariant || 0, hidden: msg.hidden || false };
                 }
-                return sMsg;
+
+                // Fallback for unknown message types — only keep safe scalar fields
+                return { id: msg.id, role: msg.role, hidden: msg.hidden || false };
             }));
 
-            const serializedGallery = gallery.map(item => ({ id: item.id, mimeType: item.mimeType, prompt: item.prompt, timestamp: item.timestamp, imageId: item.imageId }));
-            return { messages: serializedMessages, gallery: serializedGallery };
+            const serializedGallery = (gallery || []).map(item => ({
+                id: item.id, mimeType: item.mimeType || 'image/webp',
+                prompt: item.prompt || '', timestamp: item.timestamp || null, imageId: item.imageId || null
+            }));
+            return { messages: serializedMessages, gallery: serializedGallery, activeConversationId };
         };
 
         const deserializeConversation = async (serializedData) => {
-            if (!serializedData) return { messages: [], gallery: [] };
+            if (!serializedData) return { messages: [], gallery: [], savedConversations: [], activeConversationId: null };
             const imageStore = useImageStore();
             const messages = await Promise.all((serializedData.messages || []).map(async (msg) => {
                 const dMsg = { ...msg };
-
+                
                 if (dMsg.images && dMsg.images.length > 0) {
                     dMsg.images = await Promise.all(dMsg.images.map(async (img) => {
                         const dImg = { ...img };
@@ -1233,10 +1505,14 @@
                             if (part._imageRef) {
                                 const bytes = await imageStore.loadImage(part._imageRef);
                                 if (bytes) {
-                                    return { ...part, inlineData: { data: uint8ArrayToBase64(bytes), mimeType: part._mimeType || 'image/webp' }, _imageRef: undefined, _mimeType: undefined };
+                                    const rPart = { ...part, inlineData: { data: uint8ArrayToBase64(bytes), mimeType: part._mimeType || 'image/webp' }, _imageRef: undefined, _mimeType: undefined, _thoughtSignature: undefined };
+                                    if (part._thoughtSignature) rPart.thought_signature = part._thoughtSignature;
+                                    return rPart;
                                 } else {
                                     console.warn(`Missing image data for ${part._imageRef}`);
-                                    return { ...part, _imageRef: undefined, _mimeType: undefined };
+                                    const rPart = { ...part, _imageRef: undefined, _mimeType: undefined, _thoughtSignature: undefined };
+                                    if (part._thoughtSignature) rPart.thought_signature = part._thoughtSignature;
+                                    return rPart;
                                 }
                             }
                             return part;
@@ -1262,7 +1538,12 @@
                 return item;
             }));
 
-            return { messages, gallery };
+            return { 
+                messages, 
+                gallery, 
+                savedConversations: serializedData.savedConversations || [], 
+                activeConversationId: serializedData.activeConversationId || null 
+            };
         };
 
         // --- Gemini API Composable ---
@@ -1273,6 +1554,7 @@
             const store = useAppStore();
             const messages = ref([]);
             const gallery = ref([]);
+            const activeConversationId = ref(null);
             const generating = ref(false);
             const generatingMsgId = ref(null);
             const abortCtrl = ref(null);
@@ -1280,25 +1562,39 @@
             const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview';
 
             const imageStore = useImageStore();
-            const debouncedSaveConversation = useDebounceFn(async () => {
-                if (isHydrating.value) return;
-                const serialized = await serializeConversation(messages.value, gallery.value);
-                await imageStore.saveConversations(serialized);
-            }, 2000);
+
+            // savedConversations lives in config so it syncs to Gist automatically.
+            // Expose as a computed so callers can still do .value
+            const savedConversations = computed(() => store.config.value.savedConversations || []);
 
             const initFromStorage = async () => {
                 isHydrating.value = true;
-                const stored = await imageStore.loadConversations();
-                if (stored) {
-                    const deserialized = await deserializeConversation(stored);
-                    messages.value = deserialized.messages;
-                    gallery.value = deserialized.gallery;
+                try {
+                    // Migrate any legacy conversations that still have full message data in the
+                    // config (old format) → move them to localLfs (IndexedDB) and strip from config.
+                    const lfs = imageStore.getLfs();
+                    if (lfs) {
+                        const convos = store.config.value.savedConversations || [];
+                        for (const c of convos) {
+                            if (c && c.messages) {
+                                try {
+                                    await lfs.promises.writeFile(
+                                        `/convo_${c.id}.json`,
+                                        JSON.stringify({ messages: c.messages, gallery: c.gallery || [] })
+                                    );
+                                    // Replace in-place with metadata-only entry
+                                    const idx = convos.indexOf(c);
+                                    if (idx !== -1) {
+                                        convos[idx] = { id: c.id, title: c.title, preview: c.preview, timestamp: c.timestamp };
+                                    }
+                                } catch (e) { console.warn('Migration failed for convo', c.id, e); }
+                            }
+                        }
+                    }
+                } finally {
+                    nextTick(() => { isHydrating.value = false; });
                 }
-                isHydrating.value = false;
             };
-
-            watch(messages, debouncedSaveConversation, { deep: true });
-            watch(gallery, debouncedSaveConversation, { deep: true });
 
             const createVariant = () => reactive({id: uid(), parts: [], _thinking: '', _text: '', _images: [], _usage: null, _error: null, _blockReason: null, _isPromptBlock: false, timestamp: null});
 
@@ -1314,7 +1610,10 @@
                 const genCfg = {responseModalities: ['TEXT','IMAGE'], thinkingConfig: {thinkingLevel: cfg.thinkingLevel, includeThoughts: cfg.thinkingLevel === 'HIGH'}};
                 const imgCfg = {};
                 if (cfg.aspectRatio && cfg.aspectRatio !== 'auto') imgCfg.aspectRatio = cfg.aspectRatio;
-                if (cfg.imageSize) imgCfg.imageSize = cfg.imageSize;
+                if (cfg.imageSize) {
+                    // The API uses '512' (no K suffix) for 0.5K; the UI stores '0.5K' for display.
+                    imgCfg.imageSize = cfg.imageSize === '0.5K' ? '512' : cfg.imageSize;
+                }
                 if (Object.keys(imgCfg).length) genCfg.imageConfig = imgCfg;
                 return {contents, generationConfig: genCfg};
             };
@@ -1384,10 +1683,10 @@
                         }
                     }
 
-                    v.parts = allParts;
-                    v.timestamp = Date.now();
+                    v.parts = allParts; 
+                    v.timestamp = Date.now(); 
                     for (const img of v._images) {
-                        gallery.value.push({id: uid(), mimeType: img.mimeType, data: img.data, prompt: promptTxt, timestamp: Date.now(), imageId: img.imageId});
+                        gallery.value.push({id: uid(), mimeType: img.mimeType, data: img.data, prompt: promptTxt, timestamp: Date.now(), imageId: img.imageId}); 
                     }
                 }
             };
@@ -1460,10 +1759,159 @@
                 const idx = messages.value.findIndex(m => m.id === msgId);
                 if (idx !== -1) { messages.value.splice(idx, 1); store.addToast({msg: 'All variants deleted', type: 'success', duration: 2000}); }
             };
-            const newChat = () => { messages.value = []; gallery.value = []; imageStore.saveConversations({messages:[], gallery:[]}); };
+            
+            const newChat = () => { 
+                messages.value = []; 
+                gallery.value = []; 
+                activeConversationId.value = null;
+                // Clean up images that were generated but never saved to a conversation
+                nextTick(() => imageStore.cleanupOrphanedImages().catch(() => {}));
+            };
+            
+            const saveCurrentChat = async (title) => {
+                if (!messages.value.length) return;
+                const id = activeConversationId.value || uid();
+                const actualTitle = (title && title.trim()) ? title.trim() : (messages.value[0]?.text?.substring(0, 40) || 'Untitled Chat');
+                const firstModelMsg = messages.value.find(m => m.role === 'model');
+                const firstVariant = firstModelMsg?.variants?.[firstModelMsg.activeVariant ?? 0] ?? firstModelMsg?.variants?.[0];
+                const previewText = firstVariant?._text || firstVariant?.parts?.find(p => p.text && !p.thought)?.text || '';
+                const preview = previewText.substring(0, 60);
+
+                // Serialize conversation (strips all base64, saves images to LFS)
+                const serialized = await serializeConversation(messages.value, gallery.value, id);
+
+                // Write full conversation data to IndexedDB (localLfs) — NOT localStorage
+                const lfs = imageStore.getLfs();
+                if (lfs) {
+                    try {
+                        await lfs.promises.writeFile(
+                            `/convo_${id}.json`,
+                            JSON.stringify({ messages: serialized.messages, gallery: serialized.gallery })
+                        );
+                    } catch (e) {
+                        console.error('Failed to save conversation to IndexedDB:', e);
+                        store.addToast({ msg: 'Failed to save conversation: ' + e.message, type: 'error' });
+                        return;
+                    }
+                }
+
+                // Store ONLY metadata in config (localStorage). Full data lives in IndexedDB.
+                const list = store.config.value.savedConversations;
+                const idx = list.findIndex(c => c.id === id);
+                const meta = { id, title: actualTitle, preview, timestamp: Date.now() };
+                if (idx !== -1) list[idx] = meta;
+                else list.unshift(meta);
+
+                activeConversationId.value = id;
+                store.addToast({msg: 'Chat saved', type: 'success', duration: 2000});
+                return actualTitle;
+            };
+            
+            const loadConversation = async (id) => {
+                const meta = savedConversations.value.find(c => c.id === id);
+                if (!meta) return;
+                isHydrating.value = true;
+                try {
+                    let convoData = null;
+                    const lfs = imageStore.getLfs();
+
+                    // Primary: read full data from IndexedDB (localLfs)
+                    if (lfs) {
+                        try {
+                            const json = await lfs.promises.readFile(`/convo_${id}.json`, { encoding: 'utf8' });
+                            convoData = JSON.parse(json);
+                        } catch (e) { /* file not yet migrated, or first time */ }
+                    }
+
+                    // Fallback: legacy full data stored in config (migrate it now)
+                    if (!convoData && meta.messages) {
+                        convoData = { messages: meta.messages, gallery: meta.gallery || [] };
+                        // Migrate to IndexedDB and strip from config
+                        if (lfs) {
+                            try {
+                                await lfs.promises.writeFile(`/convo_${id}.json`, JSON.stringify(convoData));
+                                const list = store.config.value.savedConversations;
+                                const idx = list.findIndex(c => c.id === id);
+                                if (idx !== -1) list[idx] = { id: meta.id, title: meta.title, preview: meta.preview, timestamp: meta.timestamp };
+                            } catch (e) {}
+                        }
+                    }
+
+                    if (!convoData) {
+                        store.addToast({ msg: 'Conversation data not found on this device.', type: 'warning' });
+                        return;
+                    }
+
+                    const deserialized = await deserializeConversation(convoData);
+                    messages.value = deserialized.messages;
+                    gallery.value = deserialized.gallery;
+                    activeConversationId.value = id;
+                } finally {
+                    isHydrating.value = false;
+                }
+            };
+
+            const deleteConversation = async (id) => {
+                const list = store.config.value.savedConversations;
+                const idx = list.findIndex(c => c.id === id);
+                if (idx !== -1) {
+                    list.splice(idx, 1);
+                    if (activeConversationId.value === id) newChat();
+                    // Delete full data from IndexedDB
+                    const lfs = imageStore.getLfs();
+                    if (lfs) { lfs.promises.unlink(`/convo_${id}.json`).catch(() => {}); }
+                    store.addToast({msg: 'Removed from saved chats', type: 'success', duration: 2000});
+                    imageStore.cleanupOrphanedImages().catch(() => {});
+                }
+            };
+
+            const renameConversation = (id, newTitle) => {
+                if (!newTitle || !newTitle.trim()) return;
+                const convo = savedConversations.value.find(c => c.id === id);
+                if (convo) convo.title = newTitle.trim();
+            };
+
+            // Auto-save: after each generation finishes, silently re-serialize and write the
+            // updated conversation to IndexedDB so the saved state never lags behind live state.
+            // Only fires when a conversation is already saved (activeConversationId is set) and
+            // we're not mid-generation or hydrating from disk.
+            const _autoSave = useDebounceFn(async () => {
+                const id = activeConversationId.value;
+                if (!id || generating.value || isHydrating.value || !messages.value.length) return;
+                const lfs = imageStore.getLfs();
+                if (!lfs) return;
+                try {
+                    const serialized = await serializeConversation(messages.value, gallery.value, id);
+                    await lfs.promises.writeFile(
+                        `/convo_${id}.json`,
+                        JSON.stringify({ messages: serialized.messages, gallery: serialized.gallery })
+                    );
+                    // Refresh the preview text in the metadata entry
+                    const list = store.config.value.savedConversations;
+                    const meta = list.find(c => c.id === id);
+                    if (meta) {
+                        const firstModelMsg = messages.value.find(m => m.role === 'model');
+                        const firstVariant = firstModelMsg?.variants?.[firstModelMsg.activeVariant ?? 0] ?? firstModelMsg?.variants?.[0];
+                        const previewText = firstVariant?._text || firstVariant?.parts?.find(p => p.text && !p.thought)?.text || '';
+                        meta.preview = previewText.substring(0, 60);
+                        meta.timestamp = Date.now();
+                    }
+                } catch (e) { console.warn('Auto-save failed:', e); }
+            }, 1500);
+
+            // Trigger auto-save when generation ends (not on stream updates mid-flight)
+            watch(generating, (isNowGenerating) => { if (!isNowGenerating) _autoSave(); });
+            // Also auto-save when messages are structurally edited (deletions, hide-toggles)
+            watch(messages, () => { if (!generating.value) _autoSave(); }, { deep: true });
+
             const abort = () => abortCtrl.value?.abort();
 
-            return {messages, gallery, generating, generatingMsgId, sendMessage, regenerateMessage, deleteMessage, deleteAllVariants, newChat, abort, initFromStorage, isHydrating};
+            return {
+                messages, gallery, savedConversations, activeConversationId, 
+                generating, generatingMsgId, sendMessage, regenerateMessage, 
+                deleteMessage, deleteAllVariants, newChat, saveCurrentChat, 
+                loadConversation, deleteConversation, renameConversation, abort, initFromStorage, isHydrating
+            };
         });
 
         // --- ChatMessage Component ---
@@ -1642,19 +2090,24 @@
                 const scrollToBottom = () => nextTick(() => { if (chatEl.value) chatEl.value.scrollTo({top: chatEl.value.scrollHeight, behavior: 'smooth'}); });
 
                 const handleFileUpload = async (files, forEdit = false) => {
-                    const arr = files instanceof FileList ? Array.from(files) : [files];
-                    const valid = arr.filter(f => f?.type.startsWith('image/'));
+                    const arr = files instanceof FileList ? Array.from(files) : Array.isArray(files) ? files : [files];
+                    const valid = arr.filter(f => f?.type?.startsWith('image/'));
                     if (!valid.length) { store.addToast({msg: 'Please upload an image file', type: 'error'}); return; }
-                    const results = await Promise.all(valid.map(async f => {
-                        const b64 = await readBase64(f);
-                        const webpBytes = await base64ToWebP(b64.data, b64.mimeType);
-                        return { data: uint8ArrayToBase64(webpBytes), mimeType: 'image/webp', name: b64.name };
-                    }));
-                    if (forEdit && editState.value) editState.value.images.push(...results.map(r => ({id: uid(), data: r.data, mimeType: r.mimeType, name: r.name, hidden: false})));
-                    else pendingImages.value.push(...results.map(r => ({data: r.data, mimeType: r.mimeType, name: r.name})));
+                    try {
+                        const results = await Promise.all(valid.map(async f => {
+                            const b64 = await readBase64(f);
+                            const webpBytes = await base64ToWebP(b64.data, b64.mimeType);
+                            return { data: uint8ArrayToBase64(webpBytes), mimeType: 'image/webp', name: b64.name };
+                        }));
+                        if (forEdit && editState.value) editState.value.images.push(...results.map(r => ({id: uid(), data: r.data, mimeType: r.mimeType, name: r.name, hidden: false})));
+                        else pendingImages.value.push(...results.map(r => ({data: r.data, mimeType: r.mimeType, name: r.name})));
+                    } catch (err) {
+                        console.error('Failed to convert image:', err);
+                        store.addToast({msg: 'Failed to process image format. Please try another image.', type: 'error'});
+                    }
                 };
                 const removePendingImage = (idx) => pendingImages.value.splice(idx, 1);
-                const useAsInput = (img) => { pendingImages.value.push({data: img.data, mimeType: img.mimeType, name: 'generated.png'}); store.addToast({msg: 'Image added as reference', type: 'success', duration: 2000}); };
+                const useAsInput = (img) => { pendingImages.value.push({data: img.data, mimeType: img.mimeType, name: 'generated.webp'}); store.addToast({msg: 'Image added as reference', type: 'success', duration: 2000}); };
                 const useAsInputFromSrc = (src) => { const m = src.match(/^data:([^;]+);base64,(.+)$/); if (m) { pendingImages.value.push({mimeType: m[1], data: m[2], name: 'image.png'}); store.addToast({msg: 'Image added as reference', type: 'success', duration: 2000}); } };
 
                 const setPrompt = (text) => { if (!promptInputEl.value) return; promptInputEl.value.value = text; promptInputEl.value.style.height = 'auto'; promptInputEl.value.style.height = Math.min(promptInputEl.value.scrollHeight, 160)+'px'; promptInputEl.value.focus(); };
@@ -1671,24 +2124,61 @@
 
                 onKeyStroke('Escape', () => { if (lightboxSrc.value) lightboxSrc.value = null; });
                 if (window.marked) window.marked.setOptions({breaks: true, gfm: true});
+                
+                const { savedConversations, activeConversationId, saveCurrentChat, loadConversation, deleteConversation, renameConversation } = useGeminiAPI();
+                const chatNameInput = ref('');
+                const renamingId = ref(null);
+                const renamingTitle = ref('');
+
+                const saveChatWithName = async () => {
+                    const savedTitle = await saveCurrentChat(chatNameInput.value);
+                    if (savedTitle) chatNameInput.value = savedTitle;
+                };
+
+                const loadConversationAndFillName = async (id) => {
+                    await loadConversation(id);
+                    const convo = savedConversations.value.find(c => c.id === id);
+                    if (convo) chatNameInput.value = convo.title || '';
+                };
+
+                const startRename = (convo) => {
+                    renamingId.value = convo.id;
+                    renamingTitle.value = convo.title || '';
+                    nextTick(() => document.getElementById('rename-input-' + convo.id)?.focus());
+                };
+
+                const commitRename = (id) => {
+                    if (renamingTitle.value.trim()) renameConversation(id, renamingTitle.value);
+                    renamingId.value = null;
+                };
+
+                const cancelRename = () => { renamingId.value = null; };
+
+                const handleNewChat = () => {
+                    newChat();
+                    chatNameInput.value = '';
+                };
 
                 return {
                     messages, gallery, generating, showGallery, editState, pendingImages, lightboxSrc,
                     chatEl, promptInputEl, fileInput, editFileInput,
                     hasApiKey, geminiConfig, aspectRatios, tips, thinkingOpts, imageSizeOpts,
-                    imgSrc, newChat, abort, doSend, isHydrating,
+                    imgSrc, newChat: handleNewChat, abort, doSend, isHydrating,
                     handleFileUpload, removePendingImage, useAsInput, useAsInputFromSrc, downloadImage,
                     setPrompt, autoResize, onKeydown, onPaste,
+                    savedConversations, activeConversationId, saveChatWithName, loadConversationAndFillName,
+                    deleteConversation, chatNameInput,
+                    renamingId, renamingTitle, startRename, commitRename, cancelRename
                 };
             },
             template: `
-<div class="flex flex-col h-full">
+<div class="flex flex-col h-full w-full">
+
   <div class="z-10 shrink-0">
     <collapsible-panel storage-key="banana-settings" flush>
       <template #header>
         <span class="flex items-center gap-2 select-none">
-          <material-icon icon="auto_awesome" :size="20" class="text-accent shrink-0"></material-icon>
-          <span>Nano Banana Studio</span>
+          <span>Nano Banana</span>
         </span>
         <span class="flex items-center gap-1.5 ml-1 shrink-0">
           <span class="status status-sm" :class="hasApiKey ? 'status-success' : 'status-error'"></span>
@@ -1701,7 +2191,6 @@
           <input type="checkbox" v-model="geminiConfig.autoRetry" class="toggle toggle-xs toggle-warning">
         </label>
         <icon-btn icon="photo_library" size="btn-xs" :active="showGallery" color="btn-ghost" tooltip="Gallery" @click.stop="showGallery = !showGallery"></icon-btn>
-        <icon-btn icon="add" size="btn-xs" color="btn-ghost" tooltip="New chat" @click.stop="newChat"></icon-btn>
       </template>
       <div class="flex flex-wrap items-end gap-3 pt-1 pb-1">
         <div class="relative shrink-0 w-[8.5rem]">
@@ -1718,6 +2207,52 @@
       </div>
     </collapsible-panel>
   </div>
+
+  <div class="flex-1 min-h-0 overflow-hidden">
+    <split-pane config-key="splitSizesBanana" :min-size="[200, 300]" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col">
+      <template #left>
+        <div class="p-3 border-b border-white/10 shrink-0 space-y-2">
+          <div class="join w-full border border-white/10 bg-base-100/60 rounded-xl overflow-hidden shadow-sm">
+            <input v-model="chatNameInput" type="text" class="join-item input input-sm input-ghost flex-1 w-full min-w-0 text-xs focus:bg-transparent" placeholder="Name and save current chat..." @keydown.enter.prevent="saveChatWithName">
+            <icon-btn class="join-item shrink-0 border-l border-white/10" icon="save" color="btn-accent btn-sm rounded-none" @click="saveChatWithName" :disabled="!messages.length" tooltip="Save chat"></icon-btn>
+          </div>
+          <button @click="newChat" class="btn btn-sm w-full bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300">
+            <material-icon icon="add" :size="16"></material-icon> New Chat
+          </button>
+        </div>
+        <div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1">
+          <div v-if="!savedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed">
+            No saved chats yet.<br>Type a name above and hit Save.
+          </div>
+          <div v-for="convo in savedConversations" :key="convo.id"
+               @click="renamingId !== convo.id && loadConversationAndFillName(convo.id)"
+               class="group relative p-2 rounded-lg cursor-pointer transition-colors duration-150"
+               :class="activeConversationId === convo.id ? 'bg-accent/20 border border-accent/30' : 'hover:bg-white/5 border border-transparent'">
+            <div v-if="renamingId === convo.id" class="flex items-center gap-1" @click.stop>
+              <input :id="'rename-input-' + convo.id"
+                v-model="renamingTitle"
+                class="input input-xs input-bordered flex-1 min-w-0 text-xs bg-base-100/60 focus:bg-base-100/80"
+                @keydown.enter.prevent="commitRename(convo.id)"
+                @keydown.escape.prevent="cancelRename"
+                @blur="commitRename(convo.id)"
+                @click.stop>
+            </div>
+            <div v-else class="flex justify-between items-start pr-12">
+              <div class="font-medium text-sm text-neutral-200 truncate">{{ convo.title }}</div>
+            </div>
+            <div v-if="renamingId !== convo.id" class="text-xs text-neutral-500 truncate mt-0.5">{{ convo.preview || '' }}</div>
+            <div v-if="renamingId !== convo.id" class="absolute right-1 top-1.5 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+              <button @click.stop="startRename(convo)" class="btn btn-xs btn-ghost btn-square text-neutral-500 hover:text-primary hover:bg-primary/20" title="Rename">
+                <material-icon icon="edit" :size="13"></material-icon>
+              </button>
+              <button @click.stop="deleteConversation(convo.id)" class="btn btn-xs btn-ghost btn-square text-neutral-500 hover:text-error hover:bg-error/20" title="Remove">
+                <material-icon icon="delete" :size="13"></material-icon>
+              </button>
+            </div>
+          </div>
+        </div>
+      </template>
+      <template #right>
 
   <div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4">
     <div v-if="!messages.length && !isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none">
@@ -1750,8 +2285,11 @@
       </div>
       <div v-if="!gallery.length" class="text-center text-xs text-neutral-600 py-3 pb-4">No images generated yet in this session</div>
       <div v-else class="flex gap-2 overflow-x-auto pb-3 px-4 custom-scroll" style="scrollbar-width:thin">
-        <div v-for="g in [...gallery].reverse()" :key="g.id" @click="lightboxSrc = imgSrc(g)" class="shrink-0 w-[72px] h-[72px] rounded-xl overflow-hidden cursor-pointer ring-2 ring-transparent hover:ring-accent transition-all duration-150 shadow-sm">
-          <img :src="imgSrc(g)" class="w-full h-full object-cover">
+        <div v-for="g in [...gallery].reverse()" :key="g.id" @click="imgSrc(g) ? lightboxSrc = imgSrc(g) : null" class="shrink-0 w-[72px] h-[72px] rounded-xl overflow-hidden cursor-pointer ring-2 ring-transparent hover:ring-accent transition-all duration-150 shadow-sm">
+          <img v-if="imgSrc(g)" :src="imgSrc(g)" class="w-full h-full object-cover">
+          <div v-else class="w-full h-full bg-neutral-800 flex items-center justify-center text-neutral-500">
+            <material-icon icon="image_not_supported" :size="20"></material-icon>
+          </div>
         </div>
       </div>
     </div>
@@ -1779,6 +2317,10 @@
 
   <input ref="fileInput" type="file" accept="image/*" multiple class="hidden" @change="e => { if(e.target.files.length) handleFileUpload(e.target.files); e.target.value = ''; }">
   <input ref="editFileInput" type="file" accept="image/*" multiple class="hidden" @change="e => { if(e.target.files.length) handleFileUpload(e.target.files, true); e.target.value = ''; }">
+
+      </template>
+    </split-pane>
+  </div>
 
   <teleport to="body">
     <transition name="fade">
@@ -1813,12 +2355,13 @@
                 const syncStore = useSyncStore();
                 const { pendingConflict, syncStatus, resolveConflict } = syncStore;
                 const SECTIONS = [
-                    { key: 'tagTest',   label: 'Tag Test Settings',          icon: 'lab_research',    previewFn: (s) => `${s.prompts?.length || 0} prompt(s), ${(s.tagsToTest||'').split('\n').filter(Boolean).length} tags` },
-                    { key: 'genConfig', label: 'Generation Config',          icon: 'tune',            previewFn: (s) => `${s.width}×${s.height}, ${s.steps} steps, ${s.sampler||''}` },
-                    { key: 'genState',  label: 'Generator Prompt & UC',      icon: 'edit_note',       previewFn: (s) => _.truncate(s.prompt||'', {length: 55}) },
-                    { key: 'app',       label: 'App Settings',               icon: 'settings',        previewFn: (s) => `Model: ${s.model||'—'}` },
-                    { key: 'gemini',    label: 'Gemini Settings',            icon: 'auto_awesome',    previewFn: (s) => `Thinking: ${s.thinkingLevel||'—'}, Size: ${s.imageSize||'—'}` },
-                    { key: 'danbooru',  label: 'Danbooru Folders & Search',  icon: 'package_2',       previewFn: (s) => `${s.folders?.length || 0} folder(s), ${s.savedSearches?.length || 0} saved search(es)` },
+                    { key: 'tagTest',           label: 'Tag Test Settings',          icon: 'lab_research',    previewFn: (s) => `${s.prompts?.length || 0} prompt(s), ${(s.tagsToTest||'').split('\n').filter(Boolean).length} tags` },
+                    { key: 'genConfig',         label: 'Generation Config',          icon: 'tune',            previewFn: (s) => `${s.width}×${s.height}, ${s.steps} steps, ${s.sampler||''}` },
+                    { key: 'genState',          label: 'Generator Prompt & UC',      icon: 'edit_note',       previewFn: (s) => _.truncate(s.prompt||'', {length: 55}) },
+                    { key: 'app',               label: 'App Settings',               icon: 'settings',        previewFn: (s) => `Model: ${s.model||'—'}` },
+                    { key: 'gemini',            label: 'Gemini Settings',            icon: 'auto_awesome',    previewFn: (s) => `Thinking: ${s.thinkingLevel||'—'}, Size: ${s.imageSize||'—'}` },
+                    { key: 'danbooru',          label: 'Danbooru Folders & Search',  icon: 'package_2',       previewFn: (s) => `${s.folders?.length || 0} folder(s), ${s.savedSearches?.length || 0} saved search(es)` },
+                    { key: 'savedConversations', label: 'Saved Conversations',       icon: 'chat',            previewFn: (s) => Array.isArray(s) ? `${s.length} conversation(s)` : '—' },
                 ];
                 const choices = reactive({});
                 const expanded = reactive({});
@@ -1849,12 +2392,12 @@
                     SECTIONS.forEach(({ key }) => {
                         resolved[key] = _.cloneDeep(conflict[choices[key]]?.[key] || conflict.local[key]);
                     });
-
+                    
                     // Always preserve current local API keys regardless of section choice
                     const appStore = useAppStore();
                     if (resolved.app) resolved.app.apiKey = appStore.config.value.app.apiKey;
                     if (resolved.gemini) resolved.gemini.apiKey = appStore.config.value.gemini.apiKey;
-
+                    
                     resolveConflict(resolved);
                 };
                 const cancel = () => { syncStore.pendingConflict.value = null; syncStore.syncStatus.value = 'idle'; };
@@ -1964,11 +2507,15 @@
                 const showToken = ref(false);
                 const showNaiKey = ref(false);
                 const showGeminiKey = ref(false);
-
+                
                 const isImageSyncing = ref(false);
                 const imageCacheSize = ref(0);
                 const imageCacheCount = ref(0);
-                const imageSyncStatus = ref('');
+                const isRecalculating = ref(false);
+                
+                const imageSync = computed(() => appStore.config.value.imageSync);
+                const pendingCount = computed(() => imageSync.value.pendingIds?.length || 0);
+                const pendingDeletionCount = computed(() => Object.values(imageSync.value.pendingDeletions || {}).reduce((s, arr) => s + arr.length, 0));
 
                 const updateImageCacheStats = async () => {
                     const lfs = imageStore.getLfs();
@@ -1994,42 +2541,37 @@
                 onMounted(updateImageCacheStats);
                 watch(() => useGeminiAPI().gallery.value.length, updateImageCacheStats);
 
-                const handleImageSync = async () => {
+                const handlePushNow = async () => {
                     isImageSyncing.value = true;
-                    imageSyncStatus.value = 'Syncing...';
-
-                    const pUrl = jssync.proxyUrl || jssync.proxyUrl2;
-                    if (!pUrl && jssync.gistId) {
-                        appStore.addToast({ msg: 'Image sync requires a Cloudflare Worker proxy.', type: 'warning', duration: 4000 });
+                    try { await imageStore.pushPendingImages(false); } finally {
                         isImageSyncing.value = false;
-                        imageSyncStatus.value = 'Missing proxy URL';
-                        return;
+                        await updateImageCacheStats();
                     }
+                };
 
-                    await imageStore.gitSync();
-                    imageSyncStatus.value = 'Images synced';
-                    setTimeout(() => imageSyncStatus.value = '', 3000);
-                    isImageSyncing.value = false;
-                    await updateImageCacheStats();
+                const handleRecalculateAll = async () => {
+                    isRecalculating.value = true;
+                    try {
+                        for (let n = 0; n < imageSync.value.gists.length; n++) {
+                            await imageStore.recalculateSizeBytes(n);
+                        }
+                        appStore.addToast({ msg: 'Sizes recalculated.', type: 'success', duration: 2000 });
+                    } finally { isRecalculating.value = false; }
                 };
 
                 const clearImageCache = async () => {
-                    if (!confirm('This removes local image data. Images will re-download on next sync if available in Gist. Are you sure?')) return;
-                    const lfs = imageStore.getLfs();
-                    if (!lfs) return;
+                    if (!confirm('This removes all local image data. Images will re-download from Gist when needed. The manifest is preserved so nothing is lost remotely. Are you sure?')) return;
                     try {
-                        const files = await lfs.promises.readdir('/');
-                        for (const file of files) {
-                            if (file.startsWith('img_') && file.endsWith('.webp')) {
-                                await lfs.promises.unlink('/' + file);
-                            }
-                        }
+                        await imageStore.clearAllLocalCaches();
                         await updateImageCacheStats();
-                        appStore.addToast({ msg: 'Image cache cleared.', type: 'success' });
+                        appStore.addToast({ msg: 'Local image cache cleared.', type: 'success' });
                     } catch (e) {
                         appStore.addToast({ msg: 'Failed to clear cache: ' + e.message, type: 'error' });
                     }
                 };
+
+                const fmtBytes = (b) => b >= 1073741824 ? (b/1073741824).toFixed(2)+' GB' : b >= 1048576 ? (b/1048576).toFixed(1)+' MB' : b >= 1024 ? (b/1024).toFixed(0)+' KB' : b+' B';
+                const gistFillPct = (sizeBytes) => Math.min(100, Math.round((sizeBytes / (800 * 1024 * 1024)) * 100));
 
                 const statusMeta = computed(() => {
                     const m = {
@@ -2060,7 +2602,19 @@
                     syncStore.syncNow();
                 };
 
-                return { app, gemini, jssync, syncToken, models, isSyncing, syncStatus, syncError, statusMeta, showToken, showNaiKey, showGeminiKey, isCreatingGist, handleCreateGist, handleSyncNow, fmtSyncTime, isImageSyncing, imageCacheSize, imageCacheCount, imageSyncStatus, handleImageSync, clearImageCache };
+                const recalcGist = async (n) => {
+                    isRecalculating.value = true;
+                    try { await imageStore.recalculateSizeBytes(n); appStore.addToast({ msg: `Gist ${n} size recalculated.`, type: 'success', duration: 2000 }); }
+                    finally { isRecalculating.value = false; }
+                };
+
+                const handleResetImageSync = async () => {
+                    if (!confirm('This wipes all image sync tracking (gist list, manifest, pending queues). Use this after manually deleting your image gists on GitHub. Local images and saved conversations are NOT affected. A new gist will be created automatically on the next save. Continue?')) return;
+                    await imageStore.resetImageSync();
+                    await updateImageCacheStats();
+                };
+
+                return { app, gemini, jssync, syncToken, models, isSyncing, syncStatus, syncError, statusMeta, showToken, showNaiKey, showGeminiKey, isCreatingGist, handleCreateGist, handleSyncNow, fmtSyncTime, isImageSyncing, imageCacheSize, imageCacheCount, imageSync, pendingCount, pendingDeletionCount, handlePushNow, handleRecalculateAll, recalcGist, clearImageCache, isRecalculating, fmtBytes, gistFillPct, handleResetImageSync };
             },
             template:`
                 <div class="max-w-4xl mx-auto p-4 space-y-4 h-full custom-scroll">
@@ -2077,7 +2631,7 @@
                                 </div>
                                 <p class="text-xs text-neutral-500 mt-2 ml-1">Stored locally in your browser.</p>
                             </div>
-
+                            
                             <div>
                                 <div class="flex gap-2">
                                     <div class="flex-1">
@@ -2191,18 +2745,75 @@
                             </div>
 
                             <div class="divider text-xs text-neutral-500">Image Sync</div>
-                            <div class="flex items-center justify-between gap-4 p-3 glass-nested rounded-xl">
-                                <div>
-                                    <p class="text-sm text-neutral-200">{{ imageCacheCount }} images stored locally (~{{ imageCacheSize }} MB)</p>
-                                    <p class="text-xs text-neutral-500">{{ imageSyncStatus }}</p>
+
+                            <!-- Local cache stats -->
+                            <div class="flex items-center justify-between gap-3 p-3 glass-nested rounded-xl">
+                                <p class="text-sm text-neutral-300">
+                                    <span class="font-semibold">{{ imageCacheCount }}</span>
+                                    <span class="text-neutral-500"> images in local cache (~{{ imageCacheSize }} MB)</span>
+                                </p>
+                                <button @click="clearImageCache" class="btn btn-xs btn-error btn-outline shrink-0" :disabled="imageCacheCount === 0">Clear Cache</button>
+                            </div>
+
+                            <!-- Pending indicators -->
+                            <div v-if="pendingCount > 0 || pendingDeletionCount > 0" class="flex gap-2 flex-wrap">
+                                <div v-if="pendingCount > 0" class="flex items-center gap-1.5 px-3 py-1.5 glass-nested rounded-lg text-xs text-warning border border-warning/20">
+                                    <material-icon icon="schedule" :size="13"></material-icon>
+                                    {{ pendingCount }} image(s) pending push
                                 </div>
-                                <div class="flex gap-2">
-                                    <button @click="clearImageCache" class="btn btn-xs btn-error btn-outline" :disabled="isImageSyncing || imageCacheCount === 0">Clear Cache</button>
-                                    <button @click="handleImageSync" class="btn btn-xs btn-primary gap-1" :disabled="isImageSyncing || !syncToken || !jssync.gistId">
-                                        <span v-if="isImageSyncing" class="loading loading-spinner loading-xs"></span>
-                                        <material-icon v-else icon="sync" :size="14"></material-icon> Sync Images
-                                    </button>
+                                <div v-if="pendingDeletionCount > 0" class="flex items-center gap-1.5 px-3 py-1.5 glass-nested rounded-lg text-xs text-error border border-error/20">
+                                    <material-icon icon="delete_sweep" :size="13"></material-icon>
+                                    {{ pendingDeletionCount }} image(s) staged for removal
                                 </div>
+                            </div>
+
+                            <!-- Per-gist table -->
+                            <div v-if="imageSync.gists.length > 0" class="space-y-2">
+                                <p class="text-xs font-semibold text-neutral-500 uppercase tracking-widest mb-1">Image Gists</p>
+                                <div v-for="(gist, n) in imageSync.gists" :key="n" class="p-3 glass-nested rounded-xl space-y-2">
+                                    <div class="flex items-center justify-between gap-2">
+                                        <div class="flex items-center gap-2 min-w-0">
+                                            <span class="badge badge-sm badge-ghost font-mono shrink-0">{{ n }}</span>
+                                            <span class="text-xs font-mono text-neutral-400 truncate">{{ gist.gistId.substring(0, 14) }}…</span>
+                                            <a :href="'https://gist.github.com/' + gist.gistId" target="_blank" class="text-neutral-500 hover:text-primary transition-colors shrink-0" title="Open Gist">
+                                                <material-icon icon="open_in_new" :size="13"></material-icon>
+                                            </a>
+                                        </div>
+                                        <div class="flex items-center gap-1.5 shrink-0">
+                                            <span class="text-xs text-neutral-500">{{ fmtBytes(gist.sizeBytes) }} / 800 MB</span>
+                                            <button @click="recalcGist(n)" :disabled="isRecalculating" class="btn btn-xs btn-ghost btn-circle" title="Recalculate size">
+                                                <material-icon icon="refresh" :size="13"></material-icon>
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <!-- Fill progress bar -->
+                                    <div class="w-full h-1.5 rounded-full bg-neutral-700 overflow-hidden">
+                                        <div class="h-full rounded-full transition-all duration-500"
+                                             :class="gistFillPct(gist.sizeBytes) >= 90 ? 'bg-error' : gistFillPct(gist.sizeBytes) >= 70 ? 'bg-warning' : 'bg-primary'"
+                                             :style="{ width: gistFillPct(gist.sizeBytes) + '%' }"></div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div v-else class="text-xs text-neutral-600 text-center py-2">
+                                No image Gists yet — one will be created automatically on first save.
+                            </div>
+
+                            <!-- Action buttons -->
+                            <div class="flex gap-2 flex-wrap">
+                                <button @click="handlePushNow" class="btn btn-xs btn-primary gap-1" :disabled="isImageSyncing || !syncToken || !jssync.gistId">
+                                    <span v-if="isImageSyncing" class="loading loading-spinner loading-xs"></span>
+                                    <material-icon v-else icon="cloud_upload" :size="14"></material-icon>
+                                    Push Now
+                                </button>
+                                <button @click="handleRecalculateAll" class="btn btn-xs btn-ghost border border-white/10 gap-1" :disabled="isRecalculating || imageSync.gists.length === 0">
+                                    <span v-if="isRecalculating" class="loading loading-spinner loading-xs"></span>
+                                    <material-icon v-else icon="calculate" :size="14"></material-icon>
+                                    Recalculate All
+                                </button>
+                                <button @click="handleResetImageSync" class="btn btn-xs btn-error btn-outline gap-1" title="Use after manually deleting your image gists on GitHub">
+                                    <material-icon icon="restart_alt" :size="14"></material-icon>
+                                    Reset Sync State
+                                </button>
                             </div>
                         </div>
                     </collapsible-panel>
@@ -2243,7 +2854,7 @@
                     {path:'/gen', icon:'image', label:'NAI Image Generator', source: 'gen'},
                     {path:'/tagtest', icon:'lab_research', label:'NAI Tag Test', source: 'tagTest'},
                     {path: config.value.danbooru.lastPath || '/danbooru', icon:'package_2', label:'Danbooru Browser', source: 'danbooru'},
-                    {path:'/banana', icon:'auto_awesome', label:'Nano Banana Studio', source: 'banana'}
+                    {path:'/banana', icon:'auto_awesome', label:'Nano Banana', source: 'banana'}
                 ]);
 
                 useRouter().afterEach((to) => to.meta.genSource && resetNotificationNum(to.meta.genSource));
@@ -2258,39 +2869,32 @@
                     if (syncToken.value && jssync.gistId) {
                         syncStore.pull().catch(() => {});
                     }
-
+                    
                     await imageStore.init();
 
                     await geminiAPI.initFromStorage();
 
-                    // Auto-sync on config changes (debounced 5s) — pull-then-push so conflicts are detected
-                    // Omit local-only apiKeys from triggering syncs
+                    // Purge any images from prior sessions that were never saved to a conversation
+                    imageStore.cleanupOrphanedImages().catch(() => {});
+
+                    // Single unified watcher: config sections, 60s debounce.
+                    // The push() dirty check means idle tabs with nothing changed never hit the API.
                     watch(
-                        () => { const c = config.value;
-                            return [c.tagTest, c.genConfig, c.genState,
+                        () => {
+                            const c = config.value;
+                            return [
+                                c.tagTest, c.genConfig, c.genState,
                                 { ...c.app, naiApiKey: undefined },
                                 { ...c.gemini, apiKey: undefined },
-                                c.danbooru]; },
+                                c.danbooru
+                            ];
+                        },
                         useDebounceFn(() => {
                             const js = config.value.jssync;
                             if (!js.autoSync || !syncToken.value || !js.gistId) return;
                             if (syncStore.syncStatus.value === 'conflict') return;
                             syncStore.syncNow();
-                        }, 5000),
-                        { deep: true }
-                    );
-
-                    watch(
-                        () => geminiAPI.messages.value,
-                        useDebounceFn(async () => {
-                            const js = config.value.jssync;
-                            if (!syncToken.value || !js.gistId || syncStore.syncStatus.value === 'conflict') return;
-                            const freshData = await imageStore.gitSync();
-                            if (freshData) {
-                                geminiAPI.messages.value = (await deserializeConversation(freshData)).messages;
-                                geminiAPI.gallery.value = (await deserializeConversation(freshData)).gallery;
-                            }
-                        }, 10000),
+                        }, 60000),
                         { deep: true }
                     );
                 });
