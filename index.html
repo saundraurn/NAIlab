@@ -1437,12 +1437,12 @@
                                 if (part.thought) sPart.thought = true;
                                 // thought_signature must be echoed back to the API verbatim on every
                                 // subsequent turn — store under a private key to survive the whitelist
-                                if (part.thought_signature) sPart._thoughtSignature = part.thought_signature;
+                                if (part.thoughtSignature || part.thought_signature) sPart._thoughtSignature = part.thoughtSignature || part.thought_signature;
                                 if (part.text) sPart.text = part.text;
                                 return sPart;
                             }
                             // Text part — only keep text, thought flag, and thought_signature
-                            return { text: part.text || '', ...(part.thought ? { thought: true } : {}), ...(part.thought_signature ? { thought_signature: part.thought_signature } : {}) };
+                            return { text: part.text || '', ...(part.thought ? { thought: true } : {}), ...(part.thoughtSignature || part.thought_signature ? { thoughtSignature: part.thoughtSignature || part.thought_signature } : {}) };
                         }));
                         const serializedImages = (v._images || []).map(img => ({
                             mimeType: img.mimeType || 'image/webp',
@@ -1506,16 +1506,23 @@
                                 const bytes = await imageStore.loadImage(part._imageRef);
                                 if (bytes) {
                                     const rPart = { ...part, inlineData: { data: uint8ArrayToBase64(bytes), mimeType: part._mimeType || 'image/webp' }, _imageRef: undefined, _mimeType: undefined, _thoughtSignature: undefined };
-                                    if (part._thoughtSignature) rPart.thought_signature = part._thoughtSignature;
+                                    if (part._thoughtSignature) rPart.thoughtSignature = part._thoughtSignature;
+                                    if (rPart.thought_signature) { rPart.thoughtSignature = rPart.thought_signature; delete rPart.thought_signature; }
                                     return rPart;
                                 } else {
                                     console.warn(`Missing image data for ${part._imageRef}`);
                                     const rPart = { ...part, _imageRef: undefined, _mimeType: undefined, _thoughtSignature: undefined };
-                                    if (part._thoughtSignature) rPart.thought_signature = part._thoughtSignature;
+                                    if (part._thoughtSignature) rPart.thoughtSignature = part._thoughtSignature;
+                                    if (rPart.thought_signature) { rPart.thoughtSignature = rPart.thought_signature; delete rPart.thought_signature; }
                                     return rPart;
                                 }
                             }
-                            return part;
+                            const textPart = { ...part };
+                            if (textPart.thought_signature) {
+                                textPart.thoughtSignature = textPart.thought_signature;
+                                delete textPart.thought_signature;
+                            }
+                            return textPart;
                         }));
                         dV._images = await Promise.all((v._images || []).map(async (img) => {
                             if (img.imageId) {
