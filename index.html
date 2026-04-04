@@ -1384,24 +1384,20 @@
                 convo.messages = convo.messages.filter(m => {
                     if (m.role !== 'model') return true;
                     const before = m.variants.length;
-                    let numRemovedBeforeActive = 0;
-                    let numRemovedBeforeGen = 0;
+                    const origActive = m.activeVariant;
+                    const origGen = convo.generatingVarIdx;
+                    const isGenMsg = m.id === genMsgId;
+
                     m.variants = m.variants.filter((v, i) => {
-                        if (m.id === genMsgId && i === convo.generatingVarIdx) return true;
-                        const hasImages = v._images?.length > 0;
-                        if (!hasImages) {
-                            if (i < m.activeVariant) numRemovedBeforeActive++;
-                            if (m.id === genMsgId && i < convo.generatingVarIdx) numRemovedBeforeGen++;
-                        }
-                        return hasImages;
+                        if (v._images?.length > 0 || (isGenMsg && i === origGen)) return true;
+                        if (i < origActive) m.activeVariant--;
+                        if (isGenMsg && i < origGen) convo.generatingVarIdx--;
+                        return false;
                     });
-                    m.activeVariant = Math.max(0, m.activeVariant - numRemovedBeforeActive);
-                    if (m.id === genMsgId && convo.generatingVarIdx != null) {
-                        convo.generatingVarIdx = Math.max(0, convo.generatingVarIdx - numRemovedBeforeGen);
-                    }
+
                     pruned += before - m.variants.length;
                     if (!m.variants.length) { _pruneBananaThinkingStates([m.id]); return false; }
-                    m.activeVariant = Math.min(m.activeVariant, m.variants.length - 1);
+                    if (m.activeVariant >= m.variants.length) m.activeVariant = Math.max(0, m.variants.length - 1);
                     return true;
                 });
                 if (pruned) toast.q(`Removed ${pruned} non-image variant${pruned > 1 ? 's' : ''}`);
