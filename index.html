@@ -1734,14 +1734,6 @@
         app.use(router);
 
 
-// Expose for tests
-if (typeof fmtNum !== 'undefined') window.fmtNum = fmtNum;
-if (typeof parsePrompt !== 'undefined') window.parsePrompt = parsePrompt;
-if (typeof prepareGenConfig !== 'undefined') window.prepareGenConfig = prepareGenConfig;
-if (typeof uid !== 'undefined') window.uid = uid;
-if (typeof imgSrc !== 'undefined') window.imgSrc = imgSrc;
-if (typeof updateItemNum !== 'undefined') window.updateItemNum = updateItemNum;
-if (typeof abortableSleep !== 'undefined') window.abortableSleep = abortableSleep;
 app.mount('#app');
 window.__VUE_APP_MOUNTED__ = true;</script>
 </body>
