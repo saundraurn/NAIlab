@@ -154,7 +154,7 @@
             autoRetry: true,
             hideVariantsNoImage: false,
             bananaModel: _FM,
-            flexInference: false,
+            flexInference: true,
         });
         const calcVariantCost = (usage, imageCount, imageSize, model, isFlexInference) => {
             if (!usage) return null;
@@ -957,6 +957,7 @@
                             _images: serializedImages,
                             _imageSize: v._imageSize || '1K',
                             _model: v._model || _FM,
+                            _flexInference: v._flexInference || false,
                             _genTimeMs: v._genTimeMs || null,
                             _usage: v._usage ? _.omitBy({
                                 promptTokenCount: v._usage.promptTokenCount || 0,
@@ -1009,6 +1010,7 @@
                             return img;
                         }));
                         dV._model = v._model || _FM;
+                        dV._flexInference = v._flexInference || false;
                         dV._genTimeMs = v._genTimeMs || null;
                         return dV;
                     }));
@@ -1381,10 +1383,11 @@
                 let pruned = 0;
                 convo.messages = convo.messages.filter(m => {
                     if (m.role !== 'model') return true;
-                    // Never prune the actively-generating message
-                    if (m.id === genMsgId) return true;
                     const before = m.variants.length;
-                    m.variants = m.variants.filter(v => v._images?.length);
+                    m.variants = m.variants.filter((v, i) => {
+                        if (m.id === genMsgId && i === convo.generatingVarIdx) return true;
+                        return v._images?.length;
+                    });
                     pruned += before - m.variants.length;
                     if (!m.variants.length) { _pruneBananaThinkingStates([m.id]); return false; }
                     m.activeVariant = Math.min(m.activeVariant, m.variants.length - 1);
@@ -1553,7 +1556,11 @@
                 const allHiddenFromModel = computed(() => messages.value.length > 0 && messages.value.every(m => m.hidden));
                 const hasNoImageMessages = computed(() => {
                     const genMsgId = activeConvo.value?.generatingMsgId;
-                    return messages.value.some(m => m.role === 'model' && m.id !== genMsgId && m.variants?.some(v => !v._images?.length));
+                    const genVarIdx = activeConvo.value?.generatingVarIdx;
+                    return messages.value.some(m => m.role === 'model' && m.variants?.some((v, i) => {
+                        if (m.id === genMsgId && i === genVarIdx) return false;
+                        return !v._images?.length;
+                    }));
                 });
                 const toggleHideAllFromModel = () => {
                     const hide = !allHiddenFromModel.value;
