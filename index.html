@@ -1733,18 +1733,16 @@
         _.forOwn({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, ToggleBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, HoverCard, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ToastContainer, FolderDropdown, NavLink, HiddenBadge, SpinIcon, ChatMessage, ConvoListItem, NanoBanana, ConflictResolutionModal}, (c, n) => app.component(n, c));
         app.use(router);
 
+
 // Expose for tests
-if (typeof formatDisplayNum !== 'undefined') window.formatDisplayNum = formatDisplayNum;
+if (typeof fmtNum !== 'undefined') window.fmtNum = fmtNum;
 if (typeof parsePrompt !== 'undefined') window.parsePrompt = parsePrompt;
 if (typeof prepareGenConfig !== 'undefined') window.prepareGenConfig = prepareGenConfig;
-if (typeof uid !== 'undefined') window.fmtNum = fmtNum;
-if (typeof window.uid !== "undefined") window.uid = uid;
+if (typeof uid !== 'undefined') window.uid = uid;
 if (typeof imgSrc !== 'undefined') window.imgSrc = imgSrc;
-if (typeof fmtTokens !== 'undefined') window.fmtTokens = fmtTokens;
-if (typeof markdownParse !== 'undefined') window.markdownParse = markdownParse;
 if (typeof updateItemNum !== 'undefined') window.updateItemNum = updateItemNum;
 if (typeof abortableSleep !== 'undefined') window.abortableSleep = abortableSleep;
-window.__VUE_APP_MOUNTED__ = true;
-app.mount('#app');</script>
+app.mount('#app');
+window.__VUE_APP_MOUNTED__ = true;</script>
 </body>
 </html>
