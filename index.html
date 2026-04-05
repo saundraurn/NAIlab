@@ -82,6 +82,11 @@
         .context-barrier::before,.context-barrier::after { content:''; flex:1; height:1px; background:linear-gradient(90deg,transparent,oklch(var(--wa)/0.5),transparent); }
         .context-barrier-above { opacity:0.35; filter:saturate(0.5); }
         .ar-preview { border:1px solid oklch(var(--bc)/0.25); background:oklch(var(--b3)/0.3); border-radius:2px; }
+        .sortable-drag { opacity:0.5; }
+        .sortable-ghost { background:oklch(var(--p)/0.1); border:1px dashed oklch(var(--p)/0.4); border-radius:0.5rem; }
+        .sortable-drop-indicator { height:2px; background:oklch(var(--p)/0.7); border-radius:1px; margin:2px 0; transition:all 0.15s; }
+        .folder-header { cursor:pointer; user-select:none; }
+        .folder-content { overflow:hidden; transition: max-height 0.2s ease; }
     </style>
 </head>
 <body>
@@ -132,6 +137,53 @@
         // lodash mergeWith corrupts arrays into {0:x,1:y} objects; Object.values() recovers data
         const _ensureArray = (val) => Array.isArray(val) ? val : Object.values(val || {});
         const imgSrc = (img) => img?._previewUrl || (img?.data ? `data:${img.mimeType};base64,${img.data}` : '');
+        // --- useSortable composable: reusable HTML5 drag-and-drop ---
+        const useSortable = (options = {}) => {
+            // options: { group, handle, pairSize (1 or 2 for user+model pairs), onReorder(fromIdx, toIdx, item) }
+            const dragState = reactive({dragging: null, dragIdx: -1, overIdx: -1, dropPosition: null});
+            const pairSize = options.pairSize || 1;
+            const onDragStart = (e, idx, item) => {
+                dragState.dragging = item;
+                dragState.dragIdx = pairSize > 1 ? Math.floor(idx / pairSize) * pairSize : idx;
+                e.dataTransfer.effectAllowed = 'move';
+                e.dataTransfer.setData('text/plain', String(idx));
+                if (e.target?.classList) e.target.classList.add('sortable-drag');
+            };
+            const onDragEnd = (e) => {
+                if (e.target?.classList) e.target.classList.remove('sortable-drag');
+                dragState.dragging = null; dragState.dragIdx = -1; dragState.overIdx = -1; dragState.dropPosition = null;
+            };
+            const onDragOver = (e, idx) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                const rect = e.currentTarget.getBoundingClientRect();
+                const mid = rect.top + rect.height / 2;
+                dragState.overIdx = idx;
+                dragState.dropPosition = e.clientY < mid ? 'before' : 'after';
+            };
+            const onDragLeave = () => { dragState.overIdx = -1; dragState.dropPosition = null; };
+            const onDrop = (e, idx, list) => {
+                e.preventDefault();
+                const fromIdx = dragState.dragIdx;
+                let toIdx = pairSize > 1 ? Math.floor(idx / pairSize) * pairSize : idx;
+                if (dragState.dropPosition === 'after') toIdx += pairSize;
+                if (fromIdx === -1 || fromIdx === toIdx) { onDragEnd(e); return; }
+                if (pairSize > 1) {
+                    const items = list.splice(fromIdx, pairSize);
+                    const insertAt = fromIdx < toIdx ? toIdx - pairSize : toIdx;
+                    list.splice(insertAt, 0, ...items);
+                } else {
+                    const [item] = list.splice(fromIdx, 1);
+                    const insertAt = fromIdx < toIdx ? toIdx - 1 : toIdx;
+                    list.splice(insertAt, 0, item);
+                }
+                if (options.onReorder) options.onReorder(fromIdx, toIdx, dragState.dragging);
+                onDragEnd(e);
+            };
+            const isDragOver = (idx) => dragState.overIdx === idx && dragState.dragging !== null;
+            const dropClass = (idx) => isDragOver(idx) ? `sortable-ghost` : '';
+            return { dragState, onDragStart, onDragEnd, onDragOver, onDragLeave, onDrop, isDragOver, dropClass };
+        };
         const uint8ArrayToBase64 = arr => btoa(fflate.strFromU8(arr, true));
         const _FM='gemini-3.1-flash-image-preview',_PM='gemini-3-pro-image-preview',_WP='image/webp';
         const blobToWebP = async (blob) => {
@@ -203,6 +255,8 @@
                 genState: {prompt:'1girl, solo, wearing casual clothes', uc:'multiple views, monochrome, black and white, looking at viewer, pov', charPrompts:[{id:1, val:''}], nextCharPromptId:2},
                 jssync: {gistId:'', proxyUrl:'', autoSync:true, lastSyncedAt:null, lastPulledEtag:'', lastSyncedRevs:{}},
                 savedConversations: [],
+                bananaFolders: [],
+                nextBananaFolderId: 1,
                 _syncMeta: {tagTest:{updatedAt:0,rev:0}, genConfig:{updatedAt:0,rev:0}, genState:{updatedAt:0,rev:0}, app:{updatedAt:0,rev:0}, danbooru:{updatedAt:0,rev:0}}
             }, {mergeDefaults: true});
             _normalizeArrayFields(config.value);
@@ -1007,11 +1061,13 @@
                         if (dImg.imageId) dImg.data = await loadImageAsBase64(dImg.imageId);
                         return dImg;
                     }));
+                    // markRaw on user image objects to prevent deep reactivity on base64 strings
+                    dMsg.images = dMsg.images.map(img => Vue.markRaw(img));
                 }
                 if (dMsg.variants && dMsg.variants.length > 0) {
                     dMsg.variants = await Promise.all(dMsg.variants.map(async (v) => {
                         const dV = { ...v };
-                        dV.parts = await Promise.all(v.parts.map(async (part) => {
+                        dV.parts = Vue.markRaw(await Promise.all(v.parts.map(async (part) => {
                             if (part._imageRef) {
                                 const imgB64 = await loadImageAsBase64(part._imageRef);
                                 if (!imgB64) console.warn(`Missing image data for ${part._imageRef}`);
@@ -1023,11 +1079,11 @@
                             const textPart = _.omit(part, ['thought_signature']);
                             if (part.thought_signature) textPart.thoughtSignature = part.thought_signature;
                             return textPart;
-                        }));
-                        dV._images = await Promise.all((v._images || []).map(async (img) => {
+                        })));
+                        dV._images = Vue.markRaw(await Promise.all((v._images || []).map(async (img) => {
                             if (img.imageId) return { ...img, data: await loadImageAsBase64(img.imageId) };
                             return img;
-                        }));
+                        })));
                         dV._model = v._model || _FM;
                         dV._flexInference = v._flexInference || false;
                         dV._genTimeMs = v._genTimeMs || null;
@@ -1701,12 +1757,81 @@
                 onKeyStroke('Escape', () => { if (lightboxSrc.value) lightboxSrc.value = null; });
                 const renamingId = ref(null);
                 const renamingTitle = ref('');
-                const _sortNewest = arr => _.orderBy(arr, 'timestamp', 'desc');
-                const openConversations = computed(() => _sortNewest([...conversationMap.values()]));
-                const closedSavedConversations = computed(() => {
-                    const openIds = new Set(conversationMap.keys());
-                    return _sortNewest((savedConversations.value || []).filter(c => !openIds.has(c.id)));
+                // Unified conversation list: merge open and saved, array order = display order
+                const unifiedConversations = computed(() => {
+                    const openMap = new Map([...conversationMap].map(([id, c]) => [id, c]));
+                    const list = [];
+                    // First, add all saved conversations in their array order
+                    for (const meta of (savedConversations.value || [])) {
+                        if (openMap.has(meta.id)) {
+                            list.push(openMap.get(meta.id));
+                            openMap.delete(meta.id);
+                        } else {
+                            list.push({...meta, _isClosed: true});
+                        }
+                    }
+                    // Then add any open-but-unsaved conversations at the top
+                    const unsaved = [...openMap.values()].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+                    list.unshift(...unsaved);
+                    return list;
                 });
+                // Folders
+                const bananaFolders = computed(() => store.config.value.bananaFolders || []);
+                const nextFolderId = computed(() => store.config.value.nextBananaFolderId || 1);
+                const folderStates = reactive({}); // collapsed states
+                const createFolder = (name) => {
+                    const id = store.config.value.nextBananaFolderId || 1;
+                    store.config.value.nextBananaFolderId = id + 1;
+                    const folders = store.config.value.bananaFolders || [];
+                    folders.push({id, name: name || 'New Folder', convoIds: []});
+                    store.config.value.bananaFolders = folders;
+                    return id;
+                };
+                const deleteFolder = (folderId) => {
+                    const folders = store.config.value.bananaFolders || [];
+                    const idx = folders.findIndex(f => f.id === folderId);
+                    if (idx !== -1) folders.splice(idx, 1);
+                    toast.q('Folder removed (conversations kept)');
+                };
+                const renameFolder = (folderId, name) => {
+                    const f = (store.config.value.bananaFolders || []).find(f => f.id === folderId);
+                    if (f && name?.trim()) f.name = name.trim();
+                };
+                const addToFolder = (convoId, folderId) => {
+                    const f = (store.config.value.bananaFolders || []).find(f => f.id === folderId);
+                    if (f && !f.convoIds.includes(convoId)) f.convoIds.push(convoId);
+                };
+                const removeFromFolder = (convoId, folderId) => {
+                    const f = (store.config.value.bananaFolders || []).find(f => f.id === folderId);
+                    if (f) f.convoIds = f.convoIds.filter(id => id !== convoId);
+                };
+                const getConvoFolder = (convoId) => (store.config.value.bananaFolders || []).find(f => f.convoIds.includes(convoId));
+                // Unfiled conversations (not in any folder)
+                const unfiledConversations = computed(() => {
+                    const allFoldered = new Set((store.config.value.bananaFolders || []).flatMap(f => f.convoIds));
+                    return unifiedConversations.value.filter(c => !allFoldered.has(c.id));
+                });
+                const folderConversations = (folderId) => {
+                    const f = (store.config.value.bananaFolders || []).find(f => f.id === folderId);
+                    if (!f) return [];
+                    return f.convoIds.map(id => unifiedConversations.value.find(c => c.id === id)).filter(Boolean);
+                };
+                // Drag-and-drop for sidebar conversations
+                const convoSortable = useSortable({
+                    onReorder: (fromIdx, toIdx) => {
+                        // Reorder savedConversations to match new display order
+                    }
+                });
+                // Drag-and-drop for pending images
+                const imageSortable = useSortable();
+                const reorderPendingImages = (fromIdx, toIdx) => {
+                    const arr = pendingImages.value;
+                    const [item] = arr.splice(fromIdx, 1);
+                    arr.splice(toIdx > fromIdx ? toIdx - 1 : toIdx, 0, item);
+                };
+                const newFolderName = ref('');
+                const editingFolderId = ref(null);
+                const editingFolderName = ref('');
                 const startRename = (convo) => {
                     renamingId.value = convo.id;
                     renamingTitle.value = convo.title || '';
@@ -1741,7 +1866,10 @@
                     removePendingImage, useAsInput, useAsInputFromSrc, downloadImage,
                     autoResize, onKeydown, onPaste,
                     activeConvoId, activeConvo, conversationMap,
-                    openConversations, closedSavedConversations,
+                    unifiedConversations, unfiledConversations, folderConversations,
+                    bananaFolders, createFolder, deleteFolder, renameFolder, addToFolder, removeFromFolder,
+                    folderStates, newFolderName, editingFolderId, editingFolderName,
+                    convoSortable, imageSortable, reorderPendingImages,
                     switchConversation, closeConversation, saveConversation, loadConversation, deleteConversation,
                     renamingId, renamingTitle, startRename, commitRename, cancelRename,
                     allHiddenFromModel, toggleHideAllFromModel,
@@ -1753,7 +1881,7 @@
                     fmtAgo
                 };
             },
-            template: `<div class="flex flex-col h-full w-full"><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><div class="z-10 shrink-0"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0"><floating-label label="Aspect Ratio"/><div class="mt-1 pt-1 flex items-center gap-1.5"><template v-for="ar in aspectRatiosWithCustom || aspectRatios" :key="typeof ar==='object'?ar.val:ar"><button v-if="(typeof ar==='object'?ar.val:ar)==='_custom'" @click="customAR.active=!customAR.active; if(customAR.active&&activeConvo?.params) activeConvo.params.aspectRatio=''" class="btn btn-xs min-h-0 h-8 px-2 transition-all duration-200 border-white/10" :class="customAR.active ? 'btn-primary text-white shadow-md' : 'glass-nested text-white/60 hover:bg-white/5 hover:text-white'" title="Custom aspect ratio"><material-icon icon="aspect_ratio" :size="14"/></button><button v-else @click="convoParams.aspectRatio=typeof ar==='object'?ar.val:ar; customAR.active=false" class="btn btn-xs min-h-0 h-8 px-1.5 gap-1 transition-all duration-200 border-white/10" :class="!customAR.active && convoParams.aspectRatio===(typeof ar==='object'?ar.val:ar) ? 'btn-primary text-white shadow-md' : 'glass-nested text-white/60 hover:bg-white/5 hover:text-white'"><div class="ar-preview" :style="arPreviewStyle(ar)"></div><span class="text-[10px]">{{typeof ar==='object'?ar.text:ar}}</span></button></template></div><div v-if="customAR.active" class="flex items-center gap-1.5 mt-1.5"><input v-model.number="customAR.w" type="number" min="1" max="9999" class="input input-xs input-bordered w-14 text-center font-mono" @change="applyCustomAR"><span class="text-neutral-500 text-xs font-bold">:</span><input v-model.number="customAR.h" type="number" min="1" max="9999" class="input input-xs input-bordered w-14 text-center font-mono" @change="applyCustomAR"><span class="badge badge-xs badge-ghost ml-1">📐 {{customAR.w}}:{{customAR.h}}</span></div></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></div><div class="flex-1 min-h-0 overflow-hidden"><split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><convo-list-item v-for="convo in openConversations" :key="convo.id" :convo="convo" :is-active="activeConvoId===convo.id" is-open :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&switchConversation(convo.id)" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><span v-if="convo.generating" class="loading loading-spinner loading-xs text-primary shrink-0"></span><material-icon v-else-if="convo.isTemp" icon="schedule" :size="14" class="text-neutral-500 shrink-0"/><span v-else-if="convo._lastGenStatus==='success'" class="w-2 h-2 rounded-full bg-success/60 shrink-0 inline-block"></span><span v-else-if="convo._lastGenStatus==='error'" class="w-2 h-2 rounded-full bg-error/60 shrink-0 inline-block"></span><material-icon v-else icon="bookmark" :size="14" class="text-primary/70 shrink-0"/></template><template v-if="convo.messages.length" #preview><span class="truncate flex-1">{{convo.preview||convo.messages[0]?.text?.substring(0,60)||''}}</span><span class="shrink-0 text-neutral-600 tabular-nums">· {{convo.messages.length}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn v-if="convo.isTemp&&convo.messages.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/><icon-btn icon="close" @click.stop="closeConversation(convo.id)" title="Close" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item><template v-if="closedSavedConversations.length"><div class="divider text-xs text-neutral-600 my-2 select-none">Saved ({{ closedSavedConversations.length }})</div><convo-list-item v-for="convo in closedSavedConversations" :key="convo.id" :convo="convo" :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&loadConversation(convo.id)" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><material-icon icon="bookmark" :size="14" class="text-neutral-500 shrink-0"/></template><template #preview><span class="truncate flex-1">{{convo.preview||''}}</span><span class="shrink-0 text-neutral-600 tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn icon="delete" @click.stop="deleteConversation(convo.id)" title="Delete" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item></template><div v-if="!openConversations.length && !closedSavedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div class="relative flex-1 flex flex-col overflow-hidden"><div ref="chatEl" @scroll="checkNearBottom" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><template v-for="msg in messages" :key="msg.id"><div v-if="contextBarrierMsgId === msg.id" class="context-barrier"><span class="text-xs text-warning/70 font-semibold whitespace-nowrap flex items-center gap-1"><material-icon icon="vertical_align_top" :size="12"/>Context starts here</span><button @click="clearContextBarrier" class="btn btn-xs btn-ghost text-warning/50 hover:text-warning min-h-0 h-5 px-1" title="Remove barrier"><material-icon icon="close" :size="12"/></button></div><chat-message :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" :gen-elapsed="genElapsed" :is-above-barrier="isAboveBarrier(msg.id)" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()" @copy-ar="copyArFromImage($event)"></chat-message></template></div><transition name="fade"><button v-if="!isNearBottom" @click="scrollToBottom" class="absolute bottom-3 right-3 z-10 btn btn-circle btn-sm bg-base-200/80 border-white/15 text-neutral-300 hover:text-white hover:bg-base-200 shadow-lg backdrop-blur-sm" title="Scroll to bottom"><material-icon icon="keyboard_arrow_down" :size="20"/></button></transition></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="customArChip && !pendingImages.length" class="flex items-center gap-1.5 mb-2 text-xs text-warning/70"><span class="badge badge-xs badge-warning badge-outline">📐 Custom AR {{customAR.w}}:{{customAR.h}}</span><span class="text-neutral-600">Transparent spoof image will be injected</span></div><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><image-preview-card v-for="(img, idx) in pendingImages" :key="idx" :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane></div><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport></div>`
+            template: `<div class="flex flex-col h-full w-full"><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><div class="z-10 shrink-0"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0"><floating-label label="Aspect Ratio"/><div class="mt-1 pt-1 flex items-center gap-1.5"><template v-for="ar in aspectRatiosWithCustom || aspectRatios" :key="typeof ar==='object'?ar.val:ar"><button v-if="(typeof ar==='object'?ar.val:ar)==='_custom'" @click="customAR.active=!customAR.active; if(customAR.active&&activeConvo?.params) activeConvo.params.aspectRatio=''" class="btn btn-xs min-h-0 h-8 px-2 transition-all duration-200 border-white/10" :class="customAR.active ? 'btn-primary text-white shadow-md' : 'glass-nested text-white/60 hover:bg-white/5 hover:text-white'" title="Custom aspect ratio"><material-icon icon="aspect_ratio" :size="14"/></button><button v-else @click="convoParams.aspectRatio=typeof ar==='object'?ar.val:ar; customAR.active=false" class="btn btn-xs min-h-0 h-8 px-1.5 gap-1 transition-all duration-200 border-white/10" :class="!customAR.active && convoParams.aspectRatio===(typeof ar==='object'?ar.val:ar) ? 'btn-primary text-white shadow-md' : 'glass-nested text-white/60 hover:bg-white/5 hover:text-white'"><div class="ar-preview" :style="arPreviewStyle(ar)"></div><span class="text-[10px]">{{typeof ar==='object'?ar.text:ar}}</span></button></template></div><div v-if="customAR.active" class="flex items-center gap-1.5 mt-1.5"><input v-model.number="customAR.w" type="number" min="1" max="9999" class="input input-xs input-bordered w-14 text-center font-mono" @change="applyCustomAR"><span class="text-neutral-500 text-xs font-bold">:</span><input v-model.number="customAR.h" type="number" min="1" max="9999" class="input input-xs input-bordered w-14 text-center font-mono" @change="applyCustomAR"><span class="badge badge-xs badge-ghost ml-1">📐 {{customAR.w}}:{{customAR.h}}</span></div></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></div><div class="flex-1 min-h-0 overflow-hidden"><split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button><button @click="createFolder('New Folder')" class="btn btn-sm bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300" title="Create folder"><material-icon icon="create_new_folder" :size="16"/></button></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><template v-for="folder in bananaFolders" :key="folder.id"><div class="folder-header flex items-center gap-1.5 p-1.5 rounded-lg hover:bg-white/5 transition-colors" @click="folderStates[folder.id] = !folderStates[folder.id]"><material-icon :icon="folderStates[folder.id] ? 'folder' : 'folder_open'" :size="14" class="text-warning/60 shrink-0"/><template v-if="editingFolderId===folder.id"><input v-model="editingFolderName" class="convo-rename" @keydown.enter.prevent="renameFolder(folder.id, editingFolderName); editingFolderId=null" @keydown.escape.prevent="editingFolderId=null" @blur="renameFolder(folder.id, editingFolderName); editingFolderId=null" @click.stop></template><span v-else class="text-xs font-semibold text-neutral-400 truncate flex-1" @click.stop="editingFolderId=folder.id; editingFolderName=folder.name">{{folder.name}}</span><span class="text-[10px] text-neutral-600">{{folder.convoIds.length}}</span><icon-btn icon="delete" @click.stop="deleteFolder(folder.id)" title="Delete folder" color="btn-ghost text-neutral-600 hover:text-error" size="btn-xs opacity-0 group-hover:opacity-100"/></div><div v-if="!folderStates[folder.id]" class="pl-3 space-y-0.5"><convo-list-item v-for="convo in folderConversations(folder.id)" :key="convo.id" :convo="convo" :is-active="activeConvoId===convo.id" :is-open="!convo._isClosed" :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&(convo._isClosed?loadConversation(convo.id):switchConversation(convo.id))" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><span v-if="convo.generating" class="loading loading-spinner loading-xs text-primary shrink-0"></span><material-icon v-else-if="convo.isTemp" icon="schedule" :size="14" class="text-neutral-500 shrink-0"/><span v-else-if="convo._lastGenStatus==='success'" class="w-2 h-2 rounded-full bg-success/60 shrink-0 inline-block"></span><span v-else-if="convo._lastGenStatus==='error'" class="w-2 h-2 rounded-full bg-error/60 shrink-0 inline-block"></span><material-icon v-else-if="convo._isClosed" icon="bookmark" :size="14" class="text-neutral-500 shrink-0"/><material-icon v-else icon="bookmark" :size="14" class="text-primary/70 shrink-0"/></template><template v-if="convo.messages?.length || convo.preview" #preview><span class="truncate flex-1">{{convo.preview||convo.messages?.[0]?.text?.substring(0,60)||''}}</span><span class="shrink-0 text-neutral-600 tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn icon="folder_off" @click.stop="removeFromFolder(convo.id, folder.id)" title="Remove from folder" color="btn-ghost text-neutral-500 hover:text-warning" size="btn-xs"/><icon-btn v-if="convo._isClosed" icon="delete" @click.stop="deleteConversation(convo.id)" title="Delete" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/><template v-else><icon-btn v-if="convo.isTemp&&convo.messages?.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/><icon-btn icon="close" @click.stop="closeConversation(convo.id)" title="Close" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></template></convo-list-item></div></template><convo-list-item v-for="convo in unfiledConversations" :key="convo.id" :convo="convo" :is-active="activeConvoId===convo.id" :is-open="!convo._isClosed" :renaming-id="renamingId" v-model:renaming-title="renamingTitle" draggable="true" @dragstart="convoSortable.onDragStart($event, unfiledConversations.indexOf(convo), convo)" @dragend="convoSortable.onDragEnd($event)" @dragover="convoSortable.onDragOver($event, unfiledConversations.indexOf(convo))" @dragleave="convoSortable.onDragLeave()" @drop="convoSortable.onDrop($event, unfiledConversations.indexOf(convo), unfiledConversations)" @click="renamingId!==convo.id&&(convo._isClosed?loadConversation(convo.id):switchConversation(convo.id))" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><span v-if="convo.generating" class="loading loading-spinner loading-xs text-primary shrink-0"></span><material-icon v-else-if="convo.isTemp" icon="schedule" :size="14" class="text-neutral-500 shrink-0"/><span v-else-if="convo._lastGenStatus==='success'" class="w-2 h-2 rounded-full bg-success/60 shrink-0 inline-block"></span><span v-else-if="convo._lastGenStatus==='error'" class="w-2 h-2 rounded-full bg-error/60 shrink-0 inline-block"></span><material-icon v-else-if="convo._isClosed" icon="bookmark" :size="14" class="text-neutral-500 shrink-0"/><material-icon v-else icon="bookmark" :size="14" class="text-primary/70 shrink-0"/></template><template v-if="convo.messages?.length || convo.preview" #preview><span class="truncate flex-1">{{convo.preview||convo.messages?.[0]?.text?.substring(0,60)||''}}</span><span class="shrink-0 text-neutral-600 tabular-nums">· {{convo.messages?.length||''}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><div class="dropdown dropdown-end" @click.stop><label tabindex="0" class="btn btn-ghost btn-xs text-neutral-500 hover:text-warning"><material-icon icon="folder" :size="12"/></label><ul tabindex="0" class="dropdown-content z-[100] menu p-1 shadow-lg bg-base-200 rounded-lg w-40 border border-white/10"><li v-for="f in bananaFolders" :key="f.id"><a @click="addToFolder(convo.id, f.id)" class="text-xs py-1.5">{{f.name}}</a></li><li v-if="!bananaFolders.length"><span class="text-xs text-neutral-500 py-1.5 px-2">No folders</span></li></ul></div><icon-btn v-if="convo._isClosed" icon="delete" @click.stop="deleteConversation(convo.id)" title="Delete" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/><template v-else><icon-btn v-if="convo.isTemp&&convo.messages?.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/><icon-btn icon="close" @click.stop="closeConversation(convo.id)" title="Close" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></template></convo-list-item><div v-if="!unifiedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div class="relative flex-1 flex flex-col overflow-hidden"><div ref="chatEl" @scroll="checkNearBottom" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><template v-for="msg in messages" :key="msg.id"><div v-if="contextBarrierMsgId === msg.id" class="context-barrier"><span class="text-xs text-warning/70 font-semibold whitespace-nowrap flex items-center gap-1"><material-icon icon="vertical_align_top" :size="12"/>Context starts here</span><button @click="clearContextBarrier" class="btn btn-xs btn-ghost text-warning/50 hover:text-warning min-h-0 h-5 px-1" title="Remove barrier"><material-icon icon="close" :size="12"/></button></div><chat-message :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" :gen-elapsed="genElapsed" :is-above-barrier="isAboveBarrier(msg.id)" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()" @copy-ar="copyArFromImage($event)"></chat-message></template></div><transition name="fade"><button v-if="!isNearBottom" @click="scrollToBottom" class="absolute bottom-3 right-3 z-10 btn btn-circle btn-sm bg-base-200/80 border-white/15 text-neutral-300 hover:text-white hover:bg-base-200 shadow-lg backdrop-blur-sm" title="Scroll to bottom"><material-icon icon="keyboard_arrow_down" :size="20"/></button></transition></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="customArChip && !pendingImages.length" class="flex items-center gap-1.5 mb-2 text-xs text-warning/70"><span class="badge badge-xs badge-warning badge-outline">📐 Custom AR {{customAR.w}}:{{customAR.h}}</span><span class="text-neutral-600">Transparent spoof image will be injected</span></div><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><div v-for="(img, idx) in pendingImages" :key="idx" draggable="true" @dragstart="imageSortable.onDragStart($event, idx, img)" @dragend="imageSortable.onDragEnd($event)" @dragover="imageSortable.onDragOver($event, idx)" @drop="reorderPendingImages(imageSortable.dragState.dragIdx, idx); imageSortable.onDragEnd($event)"><image-preview-card :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane></div><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport></div>`
         };
         const ConflictResolutionModal = {
             setup() {
