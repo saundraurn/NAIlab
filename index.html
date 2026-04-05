@@ -105,7 +105,14 @@
             {val: 'nai-diffusion-4-5-curated', text: 'v4.5 Curated'},
             {val: 'nai-diffusion-4-full', text: 'v4 Full'}
         ];
-        const SYNC_DATA_SECTIONS = ['tagTest', 'genConfig', 'genState', 'app', 'danbooru'];
+        const _CONFLICT_SECTIONS = [
+            { key: 'tagTest',   label: 'Tag Test Settings',         icon: 'lab_research', previewFn: (s) => `${s.prompts?.length || 0} prompt(s), ${_.compact((s.tagsToTest||'').split('\n')).length} tags` },
+            { key: 'genConfig', label: 'Generation Config',         icon: 'tune',         previewFn: (s) => `${s.width}×${s.height}, ${s.steps} steps, ${s.sampler||''}` },
+            { key: 'genState',  label: 'Generator Prompt & UC',     icon: 'edit_note',    previewFn: (s) => _.truncate(s.prompt||'', {length: 55}) },
+            { key: 'app',       label: 'App Settings',              icon: 'settings',     previewFn: (s) => `Model: ${s.model||'—'}` },
+            { key: 'danbooru',  label: 'Danbooru Folders & Search', icon: 'package_2',    previewFn: (s) => `${s.folders?.length || 0} folder(s), ${s.savedSearches?.length || 0} saved search(es)` },
+        ];
+        const SYNC_DATA_SECTIONS = _CONFLICT_SECTIONS.map(s => s.key);
         const _normalizeArrayFields = (cfg) => {
             if (!Array.isArray(cfg.savedConversations)) cfg.savedConversations = _ensureArray(cfg.savedConversations);
             cfg.savedConversations = cfg.savedConversations.map(c => {
@@ -169,6 +176,7 @@
             signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('', 'AbortError')); }, {once: true});
         });
         const mkErr = (msg, props) => Object.assign(new Error(msg), props);
+        const RETRYABLE_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
         const CONVO_META_KEYS = ['id', 'title', 'preview', 'timestamp'];
@@ -238,7 +246,7 @@
                             catch (e) { return {success: false, msg: upd?.(`Error: ${e.message}`)}; }
                         }
                         if (res.status === 401) {isApiHalted.value = true; req.source && clearQueueBySource(req.source); return {success: false, msg: 'Invalid API Key.'};}
-                        if (![429, 502, 503, 504].includes(res.status)) return {success: false, msg: upd?.(`Error ${res.status}`)};
+                        if (!RETRYABLE_HTTP_STATUSES.has(res.status)) return {success: false, msg: upd?.(`Error ${res.status}`)};
                         if (i === 5) return {success: false, msg: upd?.('Request timed out.')};
                         upd?.(`${res.status === 429 ? "Busy" : "Error"}, retrying... (${i}/5)`); toastId && addToast({id: toastId, msg: 'Retrying...', type: 'warning', persistent: true});
                         await abortableSleep(getDelay(i - 1));
@@ -1115,7 +1123,7 @@
                 if (!res.ok) {
                     const errData = await res.json().catch(() => null);
                     const msg = errData?.error?.message || `HTTP ${res.status}`;
-                    throw mkErr(msg, {status:res.status, isRetryable:[429,500,502,503,504].includes(res.status)||(res.status===400&&/quota|resource.?exhausted/i.test(msg))});
+                    throw mkErr(msg, {status:res.status, isRetryable:RETRYABLE_HTTP_STATUSES.has(res.status)||(res.status===400&&/quota|resource.?exhausted/i.test(msg))});
                 }
                 const allParts = []; let finalFinishReason = null;
                 let _streamThinking = '', _streamText = '', _streamImages = [];
@@ -1234,19 +1242,16 @@
                 await _runGenerationLoop(convo, modelMsg, contents);
                 if (activeConvoId.value === convo.id) scrollFn?.();
             };
-            const regenerateMessage = async (msgId) => {
-                const convo = activeConvo.value;
-                if (!convo) return;
+            const withActiveConvo = (fn) => { const convo = activeConvo.value; if (convo) return fn(convo); };
+            const regenerateMessage = async (msgId) => withActiveConvo(async convo => {
                 const msg = _findMsg(convo, msgId);
                 if (!msg || msg.role !== 'model' || convo.generating) return;
                 if (!_requireGeminiKey()) return;
                 msg.variants.push(createVariant(convo.params)); msg.activeVariant = msg.variants.length - 1;
                 const contents = _getContents(convo.messages, convo.messages.indexOf(msg));
                 await _runGenerationLoop(convo, msg, contents);
-            };
-            const regenerateUserMessage = async (msgId) => {
-                const convo = activeConvo.value;
-                if (!convo) return;
+            });
+            const regenerateUserMessage = async (msgId) => withActiveConvo(async convo => {
                 const idx = _findMsgIdx(convo, msgId);
                 if (idx === -1 || convo.messages[idx].role !== 'user' || convo.generating) return;
                 if (!_requireGeminiKey()) return;
@@ -1256,10 +1261,8 @@
                 convo.messages.splice(idx + 1, 0, modelMsg);
                 const contents = _getContents(convo.messages, convo.messages.indexOf(modelMsg));
                 await _runGenerationLoop(convo, modelMsg, contents);
-            };
-            const deleteMessage = (msgId) => {
-                const convo = activeConvo.value;
-                if (!convo) return;
+            });
+            const deleteMessage = (msgId) => withActiveConvo(convo => {
                 const msg = _findMsg(convo, msgId); if (!msg) return;
                 if (msg.role === 'model' && msg.variants?.length > 1) {
                     const vi = msg.activeVariant; msg.variants.splice(vi, 1); msg.activeVariant = Math.min(vi, msg.variants.length - 1);
@@ -1267,13 +1270,11 @@
                 }
                 if (msg.role === 'model') _pruneBananaThinkingStates([msgId]);
                 const idx = _findMsgIdx(convo, msgId); if (idx !== -1) { convo.messages.splice(idx, 1); toast.q('Message deleted'); }
-            };
-            const deleteAllVariants = (msgId) => {
-                const convo = activeConvo.value;
-                if (!convo) return;
+            });
+            const deleteAllVariants = (msgId) => withActiveConvo(convo => {
                 const idx = _findMsgIdx(convo, msgId);
                 if (idx !== -1) { _pruneBananaThinkingStates([msgId]); convo.messages.splice(idx, 1); toast.q('All variants deleted'); }
-            };
+            });
             const newChat = () => {
                 const convo = _createConvoState({ isTemp: true });
                 conversationMap.set(convo.id, convo);
@@ -1370,8 +1371,7 @@
                 const savedConvo = _.find(savedConversations.value, {id});
                 if (savedConvo) savedConvo.title = newTitle.trim();
             };
-            const pruneNoImageMessages = () => {
-                const convo = activeConvo.value; if (!convo) return;
+            const pruneNoImageMessages = () => withActiveConvo(convo => {
                 const genMsgId = convo.generatingMsgId;
                 let pruned = 0;
                 convo.messages = convo.messages.filter(m => {
@@ -1394,7 +1394,7 @@
                     return true;
                 });
                 if (pruned) toast.q(`Removed ${pruned} non-image variant${pruned > 1 ? 's' : ''}`);
-            };
+            });
             const abort = () => { const convo = activeConvo.value; if (convo?.abortCtrl) convo.abortCtrl.abort(); };
 
             const _autoSave = useDebounceFn(() => {
@@ -1630,13 +1630,6 @@
         };
         const _SYNCED_ITEMS = [{icon:'lab_research',label:'Tag Test Settings'},{icon:'tune',label:'Generation Config'},{icon:'edit_note',label:'Generator Prompts'},{icon:'settings',label:'App (Model)'},{icon:'package_2',label:'Danbooru Folders & Searches'}];
         const _NOT_SYNCED_ITEMS = ['UI layout & panel states','Session state','Gen history','Nano Banana params (per-chat)'];
-        const _CONFLICT_SECTIONS = [
-            { key: 'tagTest',   label: 'Tag Test Settings',         icon: 'lab_research', previewFn: (s) => `${s.prompts?.length || 0} prompt(s), ${_.compact((s.tagsToTest||'').split('\n')).length} tags` },
-            { key: 'genConfig', label: 'Generation Config',         icon: 'tune',         previewFn: (s) => `${s.width}×${s.height}, ${s.steps} steps, ${s.sampler||''}` },
-            { key: 'genState',  label: 'Generator Prompt & UC',     icon: 'edit_note',    previewFn: (s) => _.truncate(s.prompt||'', {length: 55}) },
-            { key: 'app',       label: 'App Settings',              icon: 'settings',     previewFn: (s) => `Model: ${s.model||'—'}` },
-            { key: 'danbooru',  label: 'Danbooru Folders & Search', icon: 'package_2',    previewFn: (s) => `${s.folders?.length || 0} folder(s), ${s.savedSearches?.length || 0} saved search(es)` },
-        ];
         const Settings = {
             setup() {
                 const appStore = useAppStore();
