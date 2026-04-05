@@ -169,7 +169,7 @@
             signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('', 'AbortError')); }, {once: true});
         });
         const mkErr = (msg, props) => Object.assign(new Error(msg), props);
-        const getDelay = (retryCount) => Math.min(1000 * Math.pow(2, retryCount - 1), 32000);
+        const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
         const CONVO_META_KEYS = ['id', 'title', 'preview', 'timestamp'];
         // Migration: API renamed from snake_case to camelCase; saved data may use either
@@ -214,7 +214,6 @@
                 return item.id;
             };
             const updateNotification = (src, n) => src && (notifications[src] = Math.max(0, n ? (notifications[src] || 0) + n : 0));
-            const getDelay = c => Math.min(2**c * 500 + Math.random() * 1000, 6e4);
             const addReqs = (reqs) => {queue.value.push(...reqs.map(r => ({...r, id: ++uniqueIdCounter}))); startDispatcher();};
             const clearQueueBySource = (src) => _.remove(queue.value, {source: src});
             const generateImage = async (req, toastId) => {
@@ -1162,7 +1161,7 @@
                 if (err.name === 'AbortError') { setVarError(v, 'Request cancelled.'); return false; }
                 if (err.isRetryable) {
                     retryCount.value++;
-                    const delay = getDelay(retryCount.value);
+                    const delay = getDelay(retryCount.value - 1);
                     toast.warn(`${err.status === 429 ? 'Rate limited' : 'Server error'}, retrying in ${Math.round(delay/1000)}s…`, undefined, delay + 500);
                     try { await abortableSleep(delay, convo.abortCtrl?.signal); } catch { setVarError(v, 'Request cancelled.'); return false; }
                     return true;
