@@ -140,6 +140,8 @@
         };
 
         const _GEMINI_IMG_TOKENS = {'0.5K': 747, '1K': 1120, '2K': 1680, '4K': 2520};
+        const IMAGE_ARRIVAL_ANIM_MS = 350;
+        const UNDO_DELETE_TIMEOUT_MS = 5000;
         const _MODEL_PRICING = {
             [_FM]: { inPerM: 0.50, txtPerM: 3, imgPerM: 60, label: 'Nano Banana 2', shortLabel: 'NB2', tooltipPricing: '$0.50/M in · $3/M text · $60/M img' },
             [_PM]: { inPerM: 1.25, txtPerM: 5, imgPerM: 120, label: 'Nano Banana Pro', shortLabel: 'NBPro', tooltipPricing: '$1.25/M in · $5/M text · $120/M img' },
@@ -1255,7 +1257,7 @@
                 if (didSucceed) {
                     if (genVariant) {
                         genVariant._justCompleted = true;
-                        setTimeout(() => { genVariant._justCompleted = false; }, 450);
+                        setTimeout(() => { genVariant._justCompleted = false; }, IMAGE_ARRIVAL_ANIM_MS);
                     }
                     if (convo.params?.completionSound) playCompletionSound();
                     const isViewingThis = activeConvoId.value === convo.id && window.location.hash.includes('/banana');
@@ -1472,7 +1474,7 @@
                     if (!v) return;
                     const start = Date.now();
                     genElapsedMs.value = 0;
-                    genTimer = setInterval(() => { genElapsedMs.value = Date.now() - start; }, 100);
+                    genTimer = setInterval(() => { genElapsedMs.value = Date.now() - start; }, 250);
                 }, {immediate: true});
                 onScopeDispose(() => { if (genTimer) clearInterval(genTimer); });
                 const isEditing = computed(() => props.editState?.msgId === props.msg.id);
@@ -1485,7 +1487,7 @@
                     const vars = props.msg.variants || [];
                     const withImg = vars.filter(v => v?._images?.length > 0).length;
                     const withErr = vars.filter(v => v?._error).length;
-                    return `${props.msg.activeVariant + 1}/${vars.length} · ${withImg}🖼 ${withErr}✗`;
+                    return `${props.msg.activeVariant + 1}/${vars.length} · ${withImg}img ${withErr}err`;
                 });
                 const toggleHideImage = (imgId) => { const img = _.find(props.msg.images, {id:imgId}); if (img) { img.hidden = !img.hidden; toast.q(img.hidden ? 'Image hidden from model' : 'Image shown to model', 1500); } };
                 const deleteImage = (imgId) => { if (!props.msg.images) return; const i = _.findIndex(props.msg.images, {id:imgId}); if (i !== -1) props.msg.images.splice(i, 1); };
@@ -1594,9 +1596,9 @@
                         toast.q('Restored');
                         pendingDeleteUndo.value = null;
                     };
-                    const timer = setTimeout(() => { pendingDeleteUndo.value = null; }, 5000);
+                    const timer = setTimeout(() => { pendingDeleteUndo.value = null; }, UNDO_DELETE_TIMEOUT_MS);
                     pendingDeleteUndo.value = {convoId: convo.id, timer};
-                    store.addToast({msg: 'Message deleted', type: 'info', duration: 5000, actionLabel: 'Undo', action: undo});
+                    store.addToast({msg: 'Message deleted', type: 'info', duration: UNDO_DELETE_TIMEOUT_MS, actionLabel: 'Undo', action: undo});
                 };
                 const deleteMessageWithUndo = (msgId) => withUndoDelete(msgId, () => {
                     const m = _.find(messages.value, {id: msgId});
