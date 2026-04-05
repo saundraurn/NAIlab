@@ -1531,7 +1531,6 @@
                 const isAwaitingContent = computed(() => isGen.value && !variant.value?._text && !variant.value?._error && !variant.value?._images?.length);
                 const isEditing = computed(() => props.editState?.msgId === props.msg.id);
                 const imageRevealed = ref(new Set());
-                const prevImageCount = ref(0);
                 watch(() => variant.value?._images?.length, (newLen, oldLen) => {
                     if (newLen && newLen > (oldLen || 0) && !isActiveVarGenerating.value) {
                         for (let i = (oldLen || 0); i < newLen; i++) imageRevealed.value.add(i);
@@ -1599,7 +1598,7 @@
                 const availableImageSizes = computed(() => convoParams.value.bananaModel === _PM ? ['1K','2K','4K'] : _BANANA_IMAGE_SIZES);
                 const scrollToBottom = () => nextTick(() => { if (chatEl.value) chatEl.value.scrollTo({top: chatEl.value.scrollHeight, behavior: 'smooth'}); });
                 // Smart scroll: only auto-scroll during streaming if user is near bottom
-                const _SCROLL_THRESHOLD = 150;
+                const _SCROLL_THRESHOLD = 150; // px from bottom; allows minor scroll without interrupting reading
                 const isNearBottom = ref(true);
                 const checkNearBottom = () => {
                     if (!chatEl.value) return;
@@ -1661,10 +1660,13 @@
                     }
                 };
                 const customArChip = computed(() => customAR.active ? `${customAR.w}:${customAR.h}` : null);
+                const _AR_MATCH_TOLERANCE = 0.02; // Close enough to snap to named ratio
+                const _MAX_SIMPLE_RATIO = 50; // Simplify ratios above this to avoid e.g. 1920:1080
                 const generateSpoofWebP = async (w, h) => {
                     const canvas = new OffscreenCanvas(w, h);
                     const ctx = canvas.getContext('2d');
                     ctx.clearRect(0, 0, w, h);
+                    // Minimal quality: image is purely for AR metadata, not display
                     const blob = await canvas.convertToBlob({type: _WP, quality: 0.01});
                     const arr = new Uint8Array(await blob.arrayBuffer());
                     return btoa(fflate.strFromU8(arr, true));
@@ -1681,15 +1683,15 @@
                             const val = typeof ar === 'object' ? ar.val : ar;
                             if (!val) return false;
                             const [aw, ah] = val.split(':').map(Number);
-                            return Math.abs(aw / ah - w / h) < 0.02;
+                            return Math.abs(aw / ah - w / h) < _AR_MATCH_TOLERANCE;
                         });
                         if (named && activeConvo.value?.params) {
                             activeConvo.value.params.aspectRatio = typeof named === 'object' ? named.val : named;
                             customAR.active = false;
                             toast.q(`Aspect ratio set to ${activeConvo.value.params.aspectRatio}`);
                         } else {
-                            customAR.w = rw > 50 ? Math.round(w / h * 10) : rw;
-                            customAR.h = rw > 50 ? 10 : rh;
+                            customAR.w = rw > _MAX_SIMPLE_RATIO ? Math.round(w / h * 10) : rw;
+                            customAR.h = rw > _MAX_SIMPLE_RATIO ? 10 : rh;
                             customAR.active = true;
                             if (activeConvo.value?.params) activeConvo.value.params.aspectRatio = '';
                             toast.q(`Custom AR set to ${customAR.w}:${customAR.h}`);
@@ -1819,7 +1821,12 @@
                 // Drag-and-drop for sidebar conversations
                 const convoSortable = useSortable({
                     onReorder: (fromIdx, toIdx) => {
-                        // Reorder savedConversations to match new display order
+                        // Persist reorder by updating savedConversations array position
+                        const list = store.config.value.savedConversations || [];
+                        if (fromIdx >= 0 && toIdx >= 0 && fromIdx < list.length && toIdx < list.length) {
+                            const [item] = list.splice(fromIdx, 1);
+                            list.splice(toIdx > fromIdx ? toIdx - 1 : toIdx, 0, item);
+                        }
                     }
                 });
                 // Drag-and-drop for pending images
