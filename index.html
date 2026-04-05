@@ -1487,7 +1487,7 @@
                     const vars = props.msg.variants || [];
                     const withImg = vars.filter(v => v?._images?.length > 0).length;
                     const withErr = vars.filter(v => v?._error).length;
-                    return `${props.msg.activeVariant + 1}/${vars.length} · ${withImg}img ${withErr}err`;
+                    return `${props.msg.activeVariant + 1}/${vars.length} · ${withImg} img · ${withErr} err`;
                 });
                 const toggleHideImage = (imgId) => { const img = _.find(props.msg.images, {id:imgId}); if (img) { img.hidden = !img.hidden; toast.q(img.hidden ? 'Image hidden from model' : 'Image shown to model', 1500); } };
                 const deleteImage = (imgId) => { if (!props.msg.images) return; const i = _.findIndex(props.msg.images, {id:imgId}); if (i !== -1) props.msg.images.splice(i, 1); };
