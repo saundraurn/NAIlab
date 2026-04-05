@@ -193,7 +193,7 @@
                 gemini: {apiKey:''},
                 danbooru: {folders:[], nextFolderId:1, gridCols:4, lastPath:'/danbooru', blacklist:'', sortOrder:'id', ratingFilters:{g:true, s:true, q:true, e:true}, savedSearches:[{name:'Trending', prompt:'order:rank'}]},
                 genState: {prompt:'1girl, solo, wearing casual clothes', uc:'multiple views, monochrome, black and white, looking at viewer, pov', charPrompts:[{id:1, val:''}], nextCharPromptId:2},
-                jssync: {gistId:'', proxyUrl:'', autoSync:true, lastSyncedAt:null, lastPulledEtag:'', lastSyncedRevs:{}},
+                jssync: {gistId:'', proxyUrl:'', gitProxyUrl:'', autoSync:true, syncConversations:true, lastSyncedAt:null, lastPulledEtag:'', lastSyncedRevs:{}},
                 savedConversations: [],
                 _syncMeta: {tagTest:{updatedAt:0,rev:0}, genConfig:{updatedAt:0,rev:0}, genState:{updatedAt:0,rev:0}, app:{updatedAt:0,rev:0}, danbooru:{updatedAt:0,rev:0}}
             }, {mergeDefaults: true});
@@ -364,12 +364,143 @@
             const syncStatus = ref('idle');
             const pendingConflict = ref(null);
             const lastPushedContent = ref(null);
+            const convoSyncDirty = ref(true);
             const mergeWithArrayReplace = (obj, src) => {
                 // lodash mergeWith treats arrays as objects; guard by cloning arrays directly
                 if (_.isArray(src)) return _.cloneDeep(src);
                 return _.mergeWith({}, obj, src, (_objVal, srcVal) => _.isArray(srcVal) ? _.cloneDeep(srcVal) : undefined);
             };
             const appStore = useAppStore();
+            const imageStore = useImageStore();
+            const _syncAuthor = { name: 'NAIlab Sync', email: 'sync@nailab.local' };
+            const _convoFileRegex = /^convo_(.+)\.json$/;
+            const _imgFileRegex = /^img_.+\.webp$/;
+            const markConversationSyncDirty = () => { convoSyncDirty.value = true; };
+            const _normalizeGitProxyUrl = (raw) => {
+                const v = (raw || '').trim().replace(/\/$/, '');
+                if (!v) return 'https://cors.isomorphic-git.org';
+                if (v.includes('cors.isomorphic-git.org')) return v;
+                return v.endsWith('/git') ? v : `${v}/git`;
+            };
+            const _gitAuth = (token) => ({ username: token, password: 'x-oauth-basic' });
+            const _resolveRemoteRef = async (url, token, corsProxy) => {
+                try {
+                    const refs = await window.git.listServerRefs({ http: window.gitHttp, url, corsProxy, onAuth: () => _gitAuth(token), prefixes: ['refs/heads/'] });
+                    const names = refs.map(r => (r.ref || '').replace('refs/heads/', ''));
+                    if (names.includes('main')) return 'main';
+                    if (names.includes('master')) return 'master';
+                    return names[0] || 'main';
+                } catch {
+                    return 'main';
+                }
+            };
+            const _ensureLocalMain = async (lfs) => {
+                const branches = await window.git.listBranches({ fs: lfs, dir: '/' }).catch(() => []);
+                if (!branches.includes('main')) {
+                    try { await window.git.branch({ fs: lfs, dir: '/', ref: 'main', checkout: true }); }
+                    catch {}
+                }
+                try { await window.git.checkout({ fs: lfs, dir: '/', ref: 'main' }); } catch {}
+            };
+            const _isSyncTrackedPath = (filepath) => filepath === 'nailab-config.json' || _convoFileRegex.test(filepath) || _imgFileRegex.test(filepath);
+            const _stageSyncFiles = async (lfs) => {
+                const matrix = await window.git.statusMatrix({ fs: lfs, dir: '/' });
+                let changed = false;
+                for (const [filepath, head, workdir, stage] of matrix) {
+                    if (!_isSyncTrackedPath(filepath)) continue;
+                    if (workdir === 0 && head !== 0) {
+                        await window.git.remove({ fs: lfs, dir: '/', filepath }).catch(() => {});
+                        if (stage !== 0) changed = true;
+                        continue;
+                    }
+                    if (workdir !== stage) {
+                        await window.git.add({ fs: lfs, dir: '/', filepath }).catch(() => {});
+                        changed = true;
+                    }
+                }
+                return changed;
+            };
+            const _commitIfNeeded = async (lfs, message) => {
+                const changed = await _stageSyncFiles(lfs);
+                if (!changed) return false;
+                await window.git.commit({ fs: lfs, dir: '/', message, author: _syncAuthor });
+                return true;
+            };
+            const _previewFromMessages = (msgs = []) => {
+                const firstModelMsg = msgs.find(m => m.role === 'model');
+                const firstVariant = firstModelMsg?.variants?.[firstModelMsg.activeVariant ?? 0] ?? firstModelMsg?.variants?.[0];
+                const previewText = firstVariant?._text || firstVariant?.parts?.find(p => p.text && !p.thought)?.text || '';
+                if (previewText) return previewText.substring(0, 60);
+                const firstUserMsg = msgs.find(m => m.role === 'user');
+                return (firstUserMsg?.text || '').substring(0, 60);
+            };
+            const _reconcileSavedConversationMeta = async (lfs) => {
+                const lp = lfs.promises;
+                const cfg = appStore.config.value;
+                const files = await lp.readdir('/').catch(() => []);
+                const metas = [];
+                for (const f of files) {
+                    const m = f.match(_convoFileRegex);
+                    if (!m) continue;
+                    try {
+                        const json = await lp.readFile('/' + f, { encoding: 'utf8' });
+                        const parsed = JSON.parse(json);
+                        const messages = parsed?.messages || [];
+                        const timestamp = _.max(messages.map(msg => msg?.timestamp || 0)) || Date.now();
+                        metas.push({ id: m[1], title: (cfg.savedConversations || []).find(c => c.id === m[1])?.title || 'Saved Chat', preview: _previewFromMessages(messages), timestamp });
+                    } catch {}
+                }
+                cfg.savedConversations = _.orderBy(metas, ['timestamp'], ['desc']).map(c => _.pick(c, CONVO_META_KEYS));
+            };
+            const _syncConversationGit = async () => {
+                const cfg = appStore.config.value;
+                const token = appStore.syncToken.value;
+                const { gistId, syncConversations } = cfg.jssync || {};
+                if (!token || !gistId || !syncConversations) return;
+                const lfs = imageStore.getLfs();
+                if (!lfs) return;
+                await _ensureLocalMain(lfs);
+                const corsProxy = _normalizeGitProxyUrl(cfg.jssync.gitProxyUrl || cfg.jssync.proxyUrl);
+                const url = `https://gist.github.com/${gistId}.git`;
+                const remoteRef = await _resolveRemoteRef(url, token, corsProxy);
+                await _commitIfNeeded(lfs, 'Sync local conversation state');
+                try {
+                    await window.git.pull({
+                        fs: lfs, http: window.gitHttp, dir: '/', ref: 'main', remoteRef,
+                        singleBranch: true, fastForwardOnly: false, author: _syncAuthor,
+                        url, corsProxy, onAuth: () => _gitAuth(token)
+                    });
+                } catch {}
+                await _reconcileSavedConversationMeta(lfs);
+                const committed = await _commitIfNeeded(lfs, 'Sync conversations and images');
+                if (!committed && !convoSyncDirty.value) return;
+                try {
+                    await window.git.push({
+                        fs: lfs, http: window.gitHttp, dir: '/', ref: 'main', remoteRef,
+                        url, corsProxy, onAuth: () => _gitAuth(token), force: false
+                    });
+                    convoSyncDirty.value = false;
+                } catch (e) {
+                    if (String(e?.message || '').toLowerCase().includes('non-fast-forward')) {
+                        try {
+                            await window.git.pull({
+                                fs: lfs, http: window.gitHttp, dir: '/', ref: 'main', remoteRef,
+                                singleBranch: true, fastForwardOnly: false, author: _syncAuthor,
+                                url, corsProxy, onAuth: () => _gitAuth(token)
+                            });
+                            await _reconcileSavedConversationMeta(lfs);
+                            await _commitIfNeeded(lfs, 'Resolve conversation sync divergence');
+                            await window.git.push({
+                                fs: lfs, http: window.gitHttp, dir: '/', ref: 'main', remoteRef,
+                                url, corsProxy, onAuth: () => _gitAuth(token), force: false
+                            });
+                            convoSyncDirty.value = false;
+                        } catch {}
+                    } else {
+                        throw e;
+                    }
+                }
+            };
             const _finalizePush = (cfg, etag) => {
                 _stampSyncTime(cfg, etag);
                 if (!cfg.jssync.lastSyncedRevs) cfg.jssync.lastSyncedRevs = {};
@@ -520,6 +651,13 @@
                 return withFlag(isSyncing, async () => {
                     await pull();
                     if (syncStatus.value === 'idle') await push(true);
+                    if (syncStatus.value === 'idle') {
+                        try { await _syncConversationGit(); }
+                        catch (e) {
+                            _setSyncError(e);
+                            toast.err(`Conversation sync failed: ${e.message}`, 'sync');
+                        }
+                    }
                 });
             };
             const resolveConflict = async (resolved) => {
@@ -543,7 +681,7 @@
                 syncStatus.value = 'idle';
                 return withFlag(isSyncing, () => push(false));
             };
-            return { isSyncing, syncStatus, syncError, pendingConflict, lastPushedContent, pull, push, syncNow, createAndSetGist, resolveConflict };
+            return { isSyncing, syncStatus, syncError, pendingConflict, lastPushedContent, convoSyncDirty, pull, push, syncNow, createAndSetGist, resolveConflict, markConversationSyncDirty, syncConversationGit: _syncConversationGit, reconcileSavedConversationMeta: _reconcileSavedConversationMeta };
         });
         const TAG_COLORS={artist:['badge-warning','bg-warning/20'],character:['badge-success','bg-success/20'],copyright:['badge-accent','bg-accent/20'],meta:['badge-info','bg-info/20'],default:['badge-primary','bg-primary/20']};
         const useDropdown=()=>{const isOpen=ref(false),root=ref(null);return{isOpen,root,close:()=>{isOpen.value=false;if(document.activeElement&&root.value?.contains(document.activeElement))document.activeElement.blur();}};};
@@ -1025,6 +1163,7 @@
         const useGeminiAPI = createGlobalState(() => {
             const store = useAppStore();
             const imageStore = useImageStore();
+            const syncStore = useSyncStore();
             const conversationMap = reactive(new Map());
             const activeConvoId = ref(null);
             const _createConvoState = (opts = {}) => reactive({
@@ -1191,6 +1330,7 @@
                 try {
                     const serialized = await serializeConversation(convo.messages);
                     await _writeConvoToLfs(lfs, convo.id, serialized.messages, convo.params);
+                    syncStore.markConversationSyncDirty();
                     const list = getList();
                     const meta = _.find(list, {id: convo.id});
                     if (meta) { meta.preview = _getConvoPreview(convo.messages); meta.timestamp = Date.now(); }
@@ -1310,6 +1450,7 @@
                 const list = getList();
                 const idx = _.findIndex(list, {id: convo.id});
                 if (idx !== -1) list[idx] = meta; else list.unshift(meta);
+                syncStore.markConversationSyncDirty();
                 toast.q('Chat saved');
                 return actualTitle;
             };
@@ -1360,6 +1501,7 @@
                     const lfs = imageStore.getLfs();
                     if (lfs) { lfs.promises.unlink(_convoPath(id)).catch(() => {}); }
                 }
+                syncStore.markConversationSyncDirty();
                 if (conversationMap.has(id)) closeConversation(id);
                 toast.q('Removed from saved chats');
                 imageStore.cleanupOrphanedImages().catch(() => {});
@@ -1370,6 +1512,7 @@
                 if (convo) convo.title = newTitle.trim();
                 const savedConvo = _.find(savedConversations.value, {id});
                 if (savedConvo) savedConvo.title = newTitle.trim();
+                syncStore.markConversationSyncDirty();
             };
             const pruneNoImageMessages = () => withActiveConvo(convo => {
                 const genMsgId = convo.generatingMsgId;
@@ -1628,8 +1771,8 @@
             },
             template: `<teleport to="body"><transition name="fade"><div v-if="syncStatus === 'conflict' && pendingConflict" class="fixed inset-0 z-[900] flex-center p-4" style="background:rgba(5,4,16,0.85);backdrop-filter:blur(8px)"><div class="bg-base-200 border border-white/10 rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col"><div class="flex items-center gap-3 p-5 border-b border-white/10 shrink-0"><div class="w-10 h-10 rounded-xl bg-warning/15 border border-warning/25 flex-center shrink-0"><material-icon icon="sync_problem" :size="22" class="text-warning"/></div><div class="flex-1 min-w-0"><h3 class="font-bold text-neutral-100 text-base">Sync Conflict Detected</h3><p class="text-xs text-neutral-500 mt-0.5">Remote changes differ from your local settings. Choose which version to keep per section.</p></div><div class="flex gap-2 shrink-0"><button @click="setAll('local')" class="btn btn-xs btn-wborder text-neutral-400 hover:text-white">Use All Local</button><button @click="setAll('remote')" class="btn btn-xs btn-wborder text-neutral-400 hover:text-white">Use All Remote</button></div></div><div class="flex-1 overflow-y-auto custom-scroll p-4 space-y-2"><template v-for="sec in SECTIONS" :key="sec.key"><div v-if="isConflicted(sec.key)" class="glass-nested rounded-xl border border-white/10 overflow-hidden"><button class="w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition-colors text-left" @click="expanded[sec.key] = !expanded[sec.key]"><material-icon :icon="sec.icon" :size="18" class="text-neutral-400 shrink-0"/><span class="flex-1 text-sm font-semibold text-neutral-200">{{ sec.label }}</span><span class="badge badge-warning badge-xs font-semibold uppercase tracking-wide mr-1">Conflict</span><material-icon :icon="expanded[sec.key] ? 'expand_less' : 'expand_more'" :size="16" class="text-neutral-500 shrink-0"/></button><div class="px-4 pb-3 space-y-2"><label v-for="side in ['local', 'remote']" :key="side" class="flex items-start gap-3 p-2.5 rounded-xl cursor-pointer transition-colors" :class="choices[sec.key] === side ? (side==='local' ? 'bg-primary/10 border border-primary/30' : 'bg-secondary/10 border border-secondary/30') : 'bg-white/3 border border-white/5 hover:bg-white/5'"><input type="radio" :name="'sec-'+sec.key" :value="side" v-model="choices[sec.key]" class="radio radio-xs mt-0.5 shrink-0" :class="side==='local' ? 'radio-primary' : 'radio-secondary'"><div class="flex-1 min-w-0"><div class="flex-row-gap"><span class="text-xs font-bold uppercase tracking-wide" :class="side==='local' ? 'text-primary' : 'text-secondary'">{{ side }}</span><span class="text-xs text-neutral-500 font-mono">{{ fmtAgo(pendingConflict[side]?._syncMeta?.[sec.key]?.updatedAt) }}</span><span v-if="(pendingConflict[side]?._syncMeta?.[sec.key]?.updatedAt || 0) >= (pendingConflict[side==='local'?'remote':'local']?._syncMeta?.[sec.key]?.updatedAt || 0)" class="badge badge-xs badge-ghost text-neutral-500">newer</span></div><p v-if="pendingConflict[side]?.[sec.key]" class="text-xs text-neutral-400 mt-1 font-mono truncate">{{ sec.previewFn(pendingConflict[side][sec.key]) }}</p></div></label></div><transition name="fade"><div v-if="expanded[sec.key]" class="px-4 pb-3 border-t border-white/5 pt-3"><div class="grid grid-cols-2 gap-2"><div v-for="side in ['local','remote']" :key="side" class="bg-base-300/50 rounded-lg p-2.5"><p class="text-xs font-bold uppercase tracking-wide mb-1.5" :class="side==='local' ? 'text-primary' : 'text-secondary'">{{ side }}</p><pre class="text-[10px] text-neutral-400 font-mono leading-relaxed overflow-auto max-h-40 custom-scroll">{{ redactedJson(pendingConflict[side]?.[sec.key]) }}</pre></div></div></div></transition></div><div v-else class="flex items-center gap-3 px-4 py-2.5 glass-nested rounded-xl border border-white/5 opacity-50"><material-icon :icon="sec.icon" :size="16" class="text-neutral-500 shrink-0"/><span class="text-xs text-neutral-500 flex-1">{{ sec.label }}</span><span class="flex items-center gap-1 text-xs text-success"><material-icon icon="check_circle" :size="14"/>In sync</span></div></template></div><div class="p-4 border-t border-white/10 flex items-center gap-3 shrink-0 justify-end"><button @click="cancel" class="btn btn-sm btn-wborder">Cancel</button><button @click="apply" class="btn btn-sm btn-primary gap-2"><material-icon icon="check" :size="16"/>Apply & Push </button></div></div></div></transition></teleport>`
         };
-        const _SYNCED_ITEMS = [{icon:'lab_research',label:'Tag Test Settings'},{icon:'tune',label:'Generation Config'},{icon:'edit_note',label:'Generator Prompts'},{icon:'settings',label:'App (Model)'},{icon:'package_2',label:'Danbooru Folders & Searches'}];
-        const _NOT_SYNCED_ITEMS = ['UI layout & panel states','Session state','Gen history','Nano Banana params (per-chat)'];
+        const _SYNCED_ITEMS = [{icon:'lab_research',label:'Tag Test Settings'},{icon:'tune',label:'Generation Config'},{icon:'edit_note',label:'Generator Prompts'},{icon:'settings',label:'App (Model)'},{icon:'package_2',label:'Danbooru Folders & Searches'},{icon:'chat',label:'Saved conversations (metadata + content)'},{icon:'image',label:'Conversation images'}];
+        const _NOT_SYNCED_ITEMS = ['UI layout & panel states','Session state','Gen history'];
         const Settings = {
             setup() {
                 const appStore = useAppStore();
@@ -1661,7 +1804,7 @@
                 return { app, gemini, jssync, syncToken, models, isSyncing, syncStatus, syncError, statusMeta, isCreatingGist, handleCreateGist, handleSyncNow,
                     syncedItems: _SYNCED_ITEMS, notSyncedItems: _NOT_SYNCED_ITEMS };
             },
-            template:`<div class="max-w-4xl mx-auto p-4 space-y-4 h-full custom-scroll"><collapsible-panel title="API Configuration" storage-key="api-config"><div class="pt-2 space-y-5"><setting-input type="password" v-model="app.apiKey" label="NovelAI API Key" help-text="Stored locally in your browser."></setting-input><setting-input type="password" v-model="gemini.apiKey" label="Vertex AI API Key" placeholder="AIzaSy..." help-text="Get a key from &lt;a href='https://console.cloud.google.com/apis/credentials' target='_blank' class='text-primary hover:underline'&gt;Google Cloud Console → APIs &amp; Services → Credentials&lt;/a&gt;. Stored locally."></setting-input></div></collapsible-panel><collapsible-panel title="Application Settings" storage-key="app-settings"><div class="pt-2"><setting-input v-model="app.model" label="NovelAI Model" type="select" :options="models"></setting-input></div></collapsible-panel><collapsible-panel storage-key="sync-settings"><template #header><span class="flex-row-gap"><material-icon icon="cloud_sync" :size="20" class="text-primary/80 shrink-0"/><span>Cross-Browser Config Sync</span></span><span v-if="syncToken && jssync.gistId" class="flex items-center gap-1.5 ml-1 shrink-0"><spin-icon :loading="isSyncing" :icon="statusMeta.icon" :size="16" :class="isSyncing ? 'text-info' : statusMeta.color"></spin-icon><span class="text-xs font-medium" :class="statusMeta.color">{{ statusMeta.text }}</span></span></template><template #actions><button @click.stop="handleSyncNow" :disabled="isSyncing || !syncToken || !jssync.gistId" class="btn btn-xs btn-wborder gap-1" title="Sync Now"><spin-icon :loading="isSyncing" icon="sync" :size="14"></spin-icon><span>Sync Now</span></button></template><div class="pt-1 space-y-4"><div class="alert bg-primary/8 border border-primary/15 text-sm gap-2 py-2.5"><material-icon icon="info" :size="18" class="text-primary/70 shrink-0"/><div class="text-xs text-neutral-400 leading-relaxed"> Sync your settings across browsers using a private <strong class="text-neutral-300">GitHub Gist</strong>. Requires a GitHub account and a Personal Access Token scoped to <code class="text-primary/80">gist</code> only. <a href="https://github.com/settings/tokens/new?scopes=gist&description=NAILab+Sync" target="_blank" class="text-primary hover:underline ml-1">Create PAT ↗</a></div></div><setting-input type="password" v-model="syncToken" label="GitHub Personal Access Token" placeholder="github_pat_..." help-text="Stored locally only. Never synced to Gist."></setting-input><div class="relative"><floating-label label="Gist ID"/><div class="flex gap-2 mt-1"><input v-model="jssync.gistId" placeholder="e.g. a1b2c3d4e5f6..." class="input input-sm input-bordered flex-1 pt-2 text-sm font-mono"><button @click="handleCreateGist" :disabled="isCreatingGist || !syncToken" class="btn btn-sm btn-secondary gap-1 shrink-0" title="Create new private Gist automatically"><spin-icon :loading="isCreatingGist" icon="add" :size="14"></spin-icon><span>New</span></button></div><p class="text-xs text-neutral-600 mt-1 ml-1">Leave blank and click "New" to create one automatically.</p></div><div class="space-y-2"><setting-input v-model="jssync.proxyUrl" label="Cloudflare Worker URL (Image Proxy)" label-color="badge-ghost" placeholder="https://my-worker.workers.dev"></setting-input><p class="text-xs text-neutral-600 ml-1">Used to proxy Danbooru images through your worker. API/JSON calls go direct. Leave blank to load images without a proxy (may not work in all browsers).</p></div><div class="flex flex-wrap gap-x-6 gap-y-2 py-1"><label class="flex-row-gap cursor-pointer"><input type="checkbox" v-model="jssync.autoSync" class="toggle toggle-xs toggle-primary"><span class="text-sm text-neutral-300">Auto-sync on changes</span><span class="text-xs text-neutral-600">(1 min debounce)</span></label></div><div class="glass-nested rounded-xl p-3 space-y-1"><p class="text-xs font-semibold text-neutral-400 uppercase tracking-widest mb-2">What's synced</p><div class="grid grid-cols-2 gap-x-4 gap-y-1"><div v-for="item in syncedItems" :key="item.label" class="flex items-center gap-1.5 text-xs text-neutral-500"><material-icon :icon="item.icon" :size="12" class="text-success/70"/><span>{{ item.label }}</span></div></div><div class="divider my-1 text-xs text-neutral-600">not synced</div><div class="flex flex-wrap gap-x-4 gap-y-0.5"><span v-for="item in notSyncedItems" :key="item" class="flex items-center gap-1 text-xs text-neutral-600"><material-icon icon="remove" :size="10"/>{{item}}</span></div></div></div></collapsible-panel></div>`
+            template:`<div class="max-w-4xl mx-auto p-4 space-y-4 h-full custom-scroll"><collapsible-panel title="API Configuration" storage-key="api-config"><div class="pt-2 space-y-5"><setting-input type="password" v-model="app.apiKey" label="NovelAI API Key" help-text="Stored locally in your browser."></setting-input><setting-input type="password" v-model="gemini.apiKey" label="Vertex AI API Key" placeholder="AIzaSy..." help-text="Get a key from &lt;a href='https://console.cloud.google.com/apis/credentials' target='_blank' class='text-primary hover:underline'&gt;Google Cloud Console → APIs &amp; Services → Credentials&lt;/a&gt;. Stored locally."></setting-input></div></collapsible-panel><collapsible-panel title="Application Settings" storage-key="app-settings"><div class="pt-2"><setting-input v-model="app.model" label="NovelAI Model" type="select" :options="models"></setting-input></div></collapsible-panel><collapsible-panel storage-key="sync-settings"><template #header><span class="flex-row-gap"><material-icon icon="cloud_sync" :size="20" class="text-primary/80 shrink-0"/><span>Cross-Browser Gist Sync</span></span><span v-if="syncToken && jssync.gistId" class="flex items-center gap-1.5 ml-1 shrink-0"><spin-icon :loading="isSyncing" :icon="statusMeta.icon" :size="16" :class="isSyncing ? 'text-info' : statusMeta.color"></spin-icon><span class="text-xs font-medium" :class="statusMeta.color">{{ statusMeta.text }}</span></span></template><template #actions><button @click.stop="handleSyncNow" :disabled="isSyncing || !syncToken || !jssync.gistId" class="btn btn-xs btn-wborder gap-1" title="Sync Now"><spin-icon :loading="isSyncing" icon="sync" :size="14"></spin-icon><span>Sync Now</span></button></template><div class="pt-1 space-y-4"><div class="alert bg-primary/8 border border-primary/15 text-sm gap-2 py-2.5"><material-icon icon="info" :size="18" class="text-primary/70 shrink-0"/><div class="text-xs text-neutral-400 leading-relaxed"> Sync settings, saved conversations, and conversation images across browsers using a private <strong class="text-neutral-300">GitHub Gist</strong> git repo. Requires a GitHub account and a Personal Access Token scoped to <code class="text-primary/80">gist</code> only. <a href="https://github.com/settings/tokens/new?scopes=gist&description=NAILab+Sync" target="_blank" class="text-primary hover:underline ml-1">Create PAT ↗</a></div></div><setting-input type="password" v-model="syncToken" label="GitHub Personal Access Token" placeholder="github_pat_..." help-text="Stored locally only. Never synced to Gist."></setting-input><div class="relative"><floating-label label="Gist ID"/><div class="flex gap-2 mt-1"><input v-model="jssync.gistId" placeholder="e.g. a1b2c3d4e5f6..." class="input input-sm input-bordered flex-1 pt-2 text-sm font-mono"><button @click="handleCreateGist" :disabled="isCreatingGist || !syncToken" class="btn btn-sm btn-secondary gap-1 shrink-0" title="Create new private Gist automatically"><spin-icon :loading="isCreatingGist" icon="add" :size="14"></spin-icon><span>New</span></button></div><p class="text-xs text-neutral-600 mt-1 ml-1">Leave blank and click "New" to create one automatically.</p></div><div class="space-y-2"><setting-input v-model="jssync.proxyUrl" label="Cloudflare Worker URL (Image Proxy)" label-color="badge-ghost" placeholder="https://my-worker.workers.dev"></setting-input><p class="text-xs text-neutral-600 ml-1">Used to proxy Danbooru images through your worker.</p></div><div class="space-y-2"><setting-input v-model="jssync.gitProxyUrl" label="Git CORS Proxy URL (Gist Sync)" label-color="badge-ghost" placeholder="https://cors.isomorphic-git.org"></setting-input><p class="text-xs text-neutral-600 ml-1">Used for browser git pull/push to your gist. If empty, defaults to <code>https://cors.isomorphic-git.org</code>. For Cloudflare Worker proxy, use your worker base URL.</p></div><div class="flex flex-wrap gap-x-6 gap-y-2 py-1"><label class="flex-row-gap cursor-pointer"><input type="checkbox" v-model="jssync.autoSync" class="toggle toggle-xs toggle-primary"><span class="text-sm text-neutral-300">Auto-sync on changes</span><span class="text-xs text-neutral-600">(1 min debounce)</span></label><label class="flex-row-gap cursor-pointer"><input type="checkbox" v-model="jssync.syncConversations" class="toggle toggle-xs toggle-primary"><span class="text-sm text-neutral-300">Sync conversations & images</span></label></div><div class="glass-nested rounded-xl p-3 space-y-1"><p class="text-xs font-semibold text-neutral-400 uppercase tracking-widest mb-2">What's synced</p><div class="grid grid-cols-2 gap-x-4 gap-y-1"><div v-for="item in syncedItems" :key="item.label" class="flex items-center gap-1.5 text-xs text-neutral-500"><material-icon :icon="item.icon" :size="12" class="text-success/70"/><span>{{ item.label }}</span></div></div><div class="divider my-1 text-xs text-neutral-600">not synced</div><div class="flex flex-wrap gap-x-4 gap-y-0.5"><span v-for="item in notSyncedItems" :key="item" class="flex items-center gap-1 text-xs text-neutral-600"><material-icon icon="remove" :size="10"/>{{item}}</span></div></div></div></collapsible-panel></div>`
         };
         const routes = [
             {path:'/', redirect:'/tagtest'},
@@ -1701,11 +1844,11 @@
                     const jssync = config.value.jssync;
                     const imageStore = useImageStore();
                     const geminiAPI = useGeminiAPI();
-                    if (syncToken.value && jssync.gistId) {
-                        syncStore.pull().catch(() => {});
-                    }
                     await imageStore.init();
                     await geminiAPI.initFromStorage();
+                    if (syncToken.value && jssync.gistId) {
+                        syncStore.syncNow().catch(() => {});
+                    }
                     imageStore.cleanupOrphanedImages().catch(() => {});
                     watch(
                         () => {
@@ -1713,7 +1856,9 @@
                             return [
                                 c.tagTest, c.genConfig, c.genState,
                                 c.app.model,
-                                c.danbooru
+                                c.danbooru,
+                                c.savedConversations,
+                                c.jssync.syncConversations
                             ];
                         },
                         useDebounceFn(() => {
