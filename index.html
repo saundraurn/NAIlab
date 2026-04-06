@@ -1421,7 +1421,10 @@ const TagCountBadge={
                     fetch(`https://api.github.com/gists/${gistId}`, {
                         method: 'PATCH', headers: _getGistHeaders(token),
                         body: JSON.stringify({ description: `NAILab: ${t}` })
-                    }).catch(e => console.warn('Failed to update gist description:', e));
+                    }).catch(e => {
+                        console.warn('Failed to update gist description:', e);
+                        toast.warn('Failed to update cloud title', 'sync', 3000);
+                    });
                 }
             };
             const pruneNoImageMessages = () => withActiveConvo(convo => {
@@ -1585,7 +1588,8 @@ const TagCountBadge={
                         } catch (e) {
                             convoSyncStatus[id] = 'error';
                             console.warn('Convo gist sync failed:', e);
-                            toast.warn(`Auto-sync failed for conversation: ${e.message}`, 'sync', 5000);
+                            const title = _.find(savedConversations.value, {id})?.title || id;
+                            toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
                         }
                     }
                 } finally {
