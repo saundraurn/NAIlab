@@ -413,12 +413,12 @@
                             _applySectionDict(cfg, autoMerged);
                             _normalizeArrayFields(cfg);
                             if (remote._syncMeta) {
-                                _.forOwn(autoMerged, (_, k) => {
+                                _.forOwn(autoMerged, (_v, k) => {
                                     if (remote._syncMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remote._syncMeta[k]);
                                 });
                             }
                             cfg.jssync.lastSyncedRevs ??= {};
-                            _.forOwn(autoMerged, (_, k) => {
+                            _.forOwn(autoMerged, (_v, k) => {
                                 cfg.jssync.lastSyncedRevs[k] = remoteMeta[k]?.rev || 0;
                             });
                         });
