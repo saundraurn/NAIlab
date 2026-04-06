@@ -117,20 +117,15 @@
         const toast={ok:(msg,src,dur=3000)=>_t(msg,'success',src,dur),err:(msg,src)=>_t(msg,'error',src),warn:(msg,src,dur=4000)=>_t(msg,'warning',src,dur),info:(msg,src,dur=3000)=>_t(msg,'info',src,dur),q:(msg,dur=2000)=>_t(msg,'success',undefined,dur)};
         const splitTagString = (str) => _.compact((str || '').split(' '));
         const TAG_CATEGORIES = 'artist,copyright,character,general,meta'.split(',');
-        const getPostTags = (post) => TAG_CATEGORIES.flatMap(type =>
-            splitTagString(post[`tag_string_${type}`]).map(name => ({name, type}))
-        );
-        const loadImageAsBase64 = async (imageId) => {
-            const bytes = await useImageStore().loadImage(imageId);
-            return bytes ? uint8ArrayToBase64(bytes) : null;
-        };
+        const getPostTags = (post) => TAG_CATEGORIES.flatMap(type => splitTagString(post[`tag_string_${type}`]).map(name => ({name, type})));
+        const loadImageAsBase64 = async (imageId) => { const bytes = await useImageStore().loadImage(imageId); return bytes ? uint8ArrayToBase64(bytes) : null; };
         const models = [['4-5-full','v4.5 Full'],['4-5-curated','v4.5 Curated'],['4-full','v4 Full']].map(([s,text])=>({val:'nai-diffusion-'+s,text}));
         const _CONFLICT_SECTIONS = [
-            { key: 'tagTest',   label: 'Tag Test Settings',         icon: 'lab_research', previewFn: (s) => `${s.prompts?.length || 0} prompt(s), ${_.compact((s.tagsToTest||'').split('\n')).length} tags` },
-            { key: 'genConfig', label: 'Generation Config',         icon: 'tune',         previewFn: (s) => `${s.width}×${s.height}, ${s.steps} steps, ${s.sampler||''}` },
-            { key: 'genState',  label: 'Generator Prompt & UC',     icon: 'edit_note',    previewFn: (s) => _.truncate(s.prompt||'', {length: 55}) },
-            { key: 'app',       label: 'App Settings',              icon: 'settings',     previewFn: (s) => `Model: ${s.model||'—'}` },
-            { key: 'danbooru',  label: 'Danbooru Folders & Search', icon: 'package_2',    previewFn: (s) => `${s.folders?.length || 0} folder(s), ${s.savedSearches?.length || 0} saved search(es)` },
+            {key:'tagTest', label:'Tag Test Settings', icon:'lab_research', previewFn:(s)=>`${s.prompts?.length||0} prompt(s), ${_.compact((s.tagsToTest||'').split('\n')).length} tags`},
+            {key:'genConfig', label:'Generation Config', icon:'tune', previewFn:(s)=>`${s.width}×${s.height}, ${s.steps} steps, ${s.sampler||''}`},
+            {key:'genState', label:'Generator Prompt & UC', icon:'edit_note', previewFn:(s)=>_.truncate(s.prompt||'',{length:55})},
+            {key:'app', label:'App Settings', icon:'settings', previewFn:(s)=>`Model: ${s.model||'—'}`},
+            {key:'danbooru', label:'Danbooru Folders & Search', icon:'package_2', previewFn:(s)=>`${s.folders?.length||0} folder(s), ${s.savedSearches?.length||0} saved search(es)`},
         ];
         const _SYNC_KEYS = _CONFLICT_SECTIONS.map(s => s.key);
         const _normalizeArrayFields = (cfg) => {
@@ -141,42 +136,15 @@
         const imgSrc = (img) => img?._previewUrl || (img?.data ? `data:${img.mimeType};base64,${img.data}` : '');
         const uint8ArrayToBase64 = arr => btoa(fflate.strFromU8(arr, true));
         const _FM='gemini-3.1-flash-image-preview',_PM='gemini-3-pro-image-preview',_WP='image/webp';
-        const blobToWebP = async (blob) => {
-            const bm = await createImageBitmap(blob), c = new OffscreenCanvas(bm.width, bm.height);
-            c.getContext('2d').drawImage(bm, 0, 0);
-            return new Uint8Array(await (await c.convertToBlob({ type: _WP, quality: 1 })).arrayBuffer());
-        };
-
+        const blobToWebP = async (blob) => { const bm = await createImageBitmap(blob), c = new OffscreenCanvas(bm.width, bm.height); c.getContext('2d').drawImage(bm, 0, 0); return new Uint8Array(await (await c.convertToBlob({type:_WP,quality:1})).arrayBuffer()); };
         const _GIT = {'0.5K': 747, '1K': 1120, '2K': 1680, '4K': 2520};
-        const _MODEL_PRICING = {
-            [_FM]: { inPerM: 0.50, txtPerM: 3, imgPerM: 60, label: 'Nano Banana 2', shortLabel: 'NB2', tooltipPricing: '$0.50/M in · $3/M text · $60/M img' },
-            [_PM]: { inPerM: 1.25, txtPerM: 5, imgPerM: 120, label: 'Nano Banana Pro', shortLabel: 'NBPro', tooltipPricing: '$1.25/M in · $5/M text · $120/M img' },
-        };
+        const _MODEL_PRICING = {[_FM]:{inPerM:0.50,txtPerM:3,imgPerM:60,label:'Nano Banana 2',shortLabel:'NB2',tooltipPricing:'$0.50/M in · $3/M text · $60/M img'},[_PM]:{inPerM:1.25,txtPerM:5,imgPerM:120,label:'Nano Banana Pro',shortLabel:'NBPro',tooltipPricing:'$1.25/M in · $5/M text · $120/M img'}};
         const _BANANA_MODELS = Object.entries(_MODEL_PRICING).map(([val,{label:text}])=>({val,text}));
-        const _DCP = () => ({
-            thinkingLevel: 'MINIMAL',
-            aspectRatio: '9:16',
-            imageSize: '0.5K',
-            autoRetry: true,
-            hideVariantsNoImage: false,
-            bananaModel: _FM,
-            flexInference: true,
-        });
-        const calcVariantCost = (usage, imageCount, imageSize, model, isFlexInference) => {
-            if (!usage) return null;
-            const p = _MODEL_PRICING[model] || _MODEL_PRICING[_FM];
-            const d = usage.candidatesTokensDetails?.find(d => d.modality === 'IMAGE');
-            const imgT = d ? (d.tokenCount || 0) : (imageCount || 0) * (_GIT[imageSize] || _GIT['1K']);
-            const cost = ((usage.promptTokenCount || 0) * p.inPerM + Math.max(0, (usage.candidatesTokenCount || 0) - imgT) * p.txtPerM + imgT * p.imgPerM) / 1e6;
-            return isFlexInference ? cost * 0.5 : cost;
-        };
+        const _DCP = () => ({thinkingLevel:'MINIMAL', aspectRatio:'9:16', imageSize:'0.5K', autoRetry:true, hideVariantsNoImage:false, bananaModel:_FM, flexInference:true});
+        const calcVariantCost = (usage, imageCount, imageSize, model, isFlexInference) => { if (!usage) return null; const p = _MODEL_PRICING[model] || _MODEL_PRICING[_FM], d = usage.candidatesTokensDetails?.find(d => d.modality === 'IMAGE'), imgT = d ? (d.tokenCount || 0) : (imageCount || 0) * (_GIT[imageSize] || _GIT['1K']), cost = ((usage.promptTokenCount || 0) * p.inPerM + Math.max(0, (usage.candidatesTokenCount || 0) - imgT) * p.txtPerM + imgT * p.imgPerM) / 1e6; return isFlexInference ? cost * 0.5 : cost; };
         const fmtCost = (c) => c === null ? '' : c < 0.0001 ? '~$0' : '$' + c.toFixed(4);
         const downloadImage = (src, name) => { const a = document.createElement('a'); a.href = src; a.download = name || 'gemini-'+Date.now()+'.webp'; document.body.appendChild(a); a.click(); a.remove(); };
-        const abortableSleep = (ms, signal) => new Promise((resolve, reject) => {
-            if (signal?.aborted) return reject(new DOMException('', 'AbortError'));
-            const t = setTimeout(resolve, ms);
-            signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('', 'AbortError')); }, {once: true});
-        });
+        const abortableSleep = (ms, signal) => new Promise((resolve, reject) => { if (signal?.aborted) return reject(new DOMException('', 'AbortError')); const t = setTimeout(resolve, ms); signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('', 'AbortError')); }, {once: true}); });
         const mkErr = (msg, props) => Object.assign(new Error(msg), props);
         const _RETRY_CODES = new Set([429, 500, 502, 503, 504]);
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
@@ -1360,14 +1328,12 @@ const TagCountBadge={
                     const origActive = m.activeVariant;
                     const origGen = convo.generatingVarIdx;
                     const isGenMsg = m.id === genMsgId;
-
                     m.variants = m.variants.filter((v, i) => {
                         if (v._images?.length > 0 || (isGenMsg && i === origGen)) return true;
                         if (i < origActive) m.activeVariant--;
                         if (isGenMsg && i < origGen) convo.generatingVarIdx--;
                         return false;
                     });
-
                     pruned += before - m.variants.length;
                     if (!m.variants.length) { _pruneBananaThinkingStates([m.id]); return false; }
                     if (m.activeVariant >= m.variants.length) m.activeVariant = Math.max(0, m.variants.length - 1);
@@ -1376,7 +1342,6 @@ const TagCountBadge={
                 if (pruned) toast.q(`Removed ${pruned} non-image variant${pruned > 1 ? 's' : ''}`);
             });
             const abort = () => { const convo = activeConvo.value; if (convo?.abortCtrl) convo.abortCtrl.abort(); };
-
             const _autoSave = useDebounceFn(() => {
                 const convo = activeConvo.value;
                 if (convo && !convo.isTemp && !convo.generating && !convo.isHydrating) _saveConvoDirect(convo);
@@ -1642,25 +1607,13 @@ const TagCountBadge={
         };
         const routes = [
             {path:'/', redirect:'/tagtest'},
-            {path:'/gen', component:NAIImageGenerator, name: 'gen', meta: {genSource: 'gen'}},
-            {path:'/tagtest', component:NAITagTest, name: 'tagTest', meta: {genSource: 'tagTest'}},
-            {
-                path:'/danbooru',
-                component:DanbooruBrowser,
-                children: [
-                    {path: '', component: DanbooruGrid, name: 'danbooru-grid'},
-                    {path: ':id(\\d+)', component: DanbooruGrid, name: 'danbooru-single'},
-                    {path: 'folder/:folderId', component: DanbooruGrid, name: 'danbooru-folder'}
-                ]
-            },
-            {path:'/settings', component:Settings, name: 'settings'},
-            {path:'/banana', component:NanoBanana, name: 'banana', meta: {genSource: 'banana'}}
+            {path:'/gen', component:NAIImageGenerator, name:'gen', meta:{genSource:'gen'}},
+            {path:'/tagtest', component:NAITagTest, name:'tagTest', meta:{genSource:'tagTest'}},
+            {path:'/danbooru', component:DanbooruBrowser, children:[{path:'', component:DanbooruGrid, name:'danbooru-grid'},{path:':id(\\d+)', component:DanbooruGrid, name:'danbooru-single'},{path:'folder/:folderId', component:DanbooruGrid, name:'danbooru-folder'}]},
+            {path:'/settings', component:Settings, name:'settings'},
+            {path:'/banana', component:NanoBanana, name:'banana', meta:{genSource:'banana'}}
         ];
-        const router = createRouter({
-            history:createWebHashHistory(),
-            routes,
-            scrollBehavior: (to, from, savedPos) => savedPos || {top: 0, behavior: 'smooth'},
-        });
+        const router = createRouter({history:createWebHashHistory(), routes, scrollBehavior:(to,from,savedPos)=>savedPos||{top:0,behavior:'smooth'}});
         const App = {
             setup() {
                 const {notifications, resetNotificationNum, config, syncToken} = useAppStore();
@@ -1709,8 +1662,6 @@ const TagCountBadge={
         const app = createApp(App);
         _.forOwn({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, ToggleBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, HoverCard, ImagePreviewCard, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ToastContainer, FolderDropdown, NavLink, HiddenBadge, SpinIcon, ChatMessage, ConvoListItem, NanoBanana, ConflictResolutionModal}, (c, n) => app.component(n, c));
         app.use(router);
-
-
 app.mount('#app');
 window.__VUE_APP_MOUNTED__ = true;</script>
 </body>
