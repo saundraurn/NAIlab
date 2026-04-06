@@ -431,7 +431,13 @@
                     if (remote._conversations || remote._conversationGists) {
                         const gemini = useGeminiAPI();
                         if (remote._conversations) {
-                            gemini.savedConversations.value = _.unionBy(gemini.savedConversations.value, remote._conversations, 'id');
+                            const localById = _.keyBy(gemini.savedConversations.value, 'id');
+                            for (const rc of remote._conversations) {
+                                const lc = localById[rc.id];
+                                if (!lc) { localById[rc.id] = rc; }
+                                else if ((rc.timestamp || 0) > (lc.timestamp || 0)) { Object.assign(lc, rc); }
+                            }
+                            gemini.savedConversations.value = Object.values(localById);
                         }
                         if (remote._conversationGists) {
                             gemini.conversationGists.value = { ...remote._conversationGists, ...gemini.conversationGists.value };
@@ -1296,22 +1302,22 @@ const TagCountBadge={
             const _fetchConvoFromGist = async (gistId) => {
                 const token = store.syncToken.value;
                 if (!token || !gistId) return null;
-                const res = await fetch(`https://api.github.com/gists/${gistId}`, {
-                    method: 'GET', headers: _getGistHeaders(token)
-                });
-                if (!res.ok) return null;
-                const gistData = await res.json();
-                const convoFile = gistData.files?.['conversation.json'];
-                if (!convoFile) return null;
-                let content = convoFile.content;
-                if ((convoFile.truncated || typeof content !== 'string') && convoFile.raw_url) {
                 try {
                     const res = await fetch(`https://api.github.com/gists/${gistId}`, {
                         method: 'GET', headers: _getGistHeaders(token)
                     });
                     if (!res.ok) return null;
                     const gistData = await res.json();
-                    const content = gistData.files?.['conversation.json']?.content;
+                    const convoFile = gistData.files?.['conversation.json'];
+                    if (!convoFile) return null;
+                    let content = convoFile.content;
+                    if ((convoFile.truncated || typeof content !== 'string') && convoFile.raw_url) {
+                        const rawRes = await fetch(convoFile.raw_url, {
+                            method: 'GET', headers: _getGistHeaders(token)
+                        });
+                        if (!rawRes.ok) return null;
+                        content = await rawRes.text();
+                    }
                     if (!content) return null;
                     try { return JSON.parse(content); } catch { return null; }
                 } catch {
@@ -1592,31 +1598,36 @@ const TagCountBadge={
                 await _pushConvoImages(gistId, imageIds, localFs);
             };
             let _gistSyncInProgress = false;
+            let _gistSyncPromise = null;
             const _gistSyncDirty = new Set();
-            const _runGistSync = async () => {
-                if (_gistSyncInProgress) return;
+            const _runGistSync = () => {
+                if (_gistSyncInProgress) return _gistSyncPromise || Promise.resolve();
                 _gistSyncInProgress = true;
-                try {
-                    const ids = [..._gistSyncDirty];
-                    _gistSyncDirty.clear();
-                    for (const id of ids) {
-                        const gistId = conversationGists.value[id];
-                        if (!gistId) continue;
-                        convoSyncStatus[id] = 'syncing';
-                        try {
-                            await _syncConversationToItsGist(id);
-                            convoSyncStatus[id] = 'synced';
-                        } catch (e) {
-                            convoSyncStatus[id] = 'error';
-                            console.warn('Convo gist sync failed:', e);
-                            const title = _.find(savedConversations.value, {id})?.title || id;
-                            toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
+                _gistSyncPromise = (async () => {
+                    try {
+                        const ids = [..._gistSyncDirty];
+                        _gistSyncDirty.clear();
+                        for (const id of ids) {
+                            const gistId = conversationGists.value[id];
+                            if (!gistId) continue;
+                            convoSyncStatus[id] = 'syncing';
+                            try {
+                                await _syncConversationToItsGist(id);
+                                convoSyncStatus[id] = 'synced';
+                            } catch (e) {
+                                convoSyncStatus[id] = 'error';
+                                console.warn('Convo gist sync failed:', e);
+                                const title = _.find(savedConversations.value, {id})?.title || id;
+                                toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
+                            }
                         }
+                    } finally {
+                        _gistSyncInProgress = false;
+                        _gistSyncPromise = null;
+                        if (_gistSyncDirty.size) await _runGistSync();
                     }
-                } finally {
-                    _gistSyncInProgress = false;
-                    if (_gistSyncDirty.size) _runGistSync();
-                }
+                })();
+                return _gistSyncPromise;
             };
             const _autoSyncGist = useDebounceFn(_runGistSync, 30000);
             const syncConversationNow = async (id) => {
