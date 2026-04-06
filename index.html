@@ -428,6 +428,15 @@
                         });
                         toast.ok(`Pulled ${_.size(autoMerged)} updated section(s).`, 'sync', 3000);
                     }
+                    if (remote._conversations || remote._conversationGists) {
+                        const gemini = useGeminiAPI();
+                        if (remote._conversations) {
+                            gemini.savedConversations.value = _.unionBy(gemini.savedConversations.value, remote._conversations, 'id');
+                        }
+                        if (remote._conversationGists) {
+                            gemini.conversationGists.value = { ...remote._conversationGists, ...gemini.conversationGists.value };
+                        }
+                    }
                     _stampSyncTime(cfg, pulledEtag);
                     syncStatus.value = 'idle';
                 } catch (e) {
@@ -443,11 +452,17 @@
                 syncStatus.value = 'pushing'; syncError.value = null;
                 try {
                     const hasLocalChanges = _SYNC_KEYS.some(k => (cfg._syncMeta?.[k]?.rev || 0) > (cfg.jssync.lastSyncedRevs?.[k] || 0));
-                    if (!hasLocalChanges) { syncStatus.value = 'idle'; return; }
                     const payload = extractSyncPayload(cfg);
+                    const gemini = useGeminiAPI();
+                    payload._conversations = gemini.savedConversations.value;
+                    payload._conversationGists = gemini.conversationGists.value;
+                    const convoChanged = !_.isEqual(payload._conversations, cfg.jssync._lastPushedConvos) || !_.isEqual(payload._conversationGists, cfg.jssync._lastPushedConvoGists);
+                    if (!hasLocalChanges && !convoChanged) { syncStatus.value = 'idle'; return; }
                     const content = JSON.stringify(payload, null, 2);
                     const [, pushedEtag] = await gistRequest(token, 'PATCH', `https://api.github.com/gists/${gistId}`, { files: { ['nailab-config.json']: { content } } });
                     _finalizePush(cfg, pushedEtag);
+                    cfg.jssync._lastPushedConvos = _.cloneDeep(payload._conversations);
+                    cfg.jssync._lastPushedConvoGists = _.cloneDeep(payload._conversationGists);
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config pushed to Gist.', 'sync', 2500);
                 } catch (e) {
@@ -462,10 +477,15 @@
                 syncStatus.value = 'pushing'; syncError.value = null;
                 try {
                     const payload = extractSyncPayload(cfg);
+                    const gemini = useGeminiAPI();
+                    payload._conversations = gemini.savedConversations.value;
+                    payload._conversationGists = gemini.conversationGists.value;
                     const content = JSON.stringify(payload, null, 2);
                     const [gistData, createdEtag] = await gistRequest(token, 'POST', 'https://api.github.com/gists', { description: 'NAILab Config Sync', public: false, files: { ['nailab-config.json']: { content } } });
                     cfg.jssync.gistId = gistData.id;
                     _finalizePush(cfg, createdEtag);
+                    cfg.jssync._lastPushedConvos = _.cloneDeep(payload._conversations);
+                    cfg.jssync._lastPushedConvoGists = _.cloneDeep(payload._conversationGists);
                     syncStatus.value = 'idle';
                     toast.ok('Gist created! ID saved.', 'sync');
                     return gistData.id;
@@ -1273,6 +1293,58 @@ const TagCountBadge={
                 }
                 return actualTitle;
             };
+            const _fetchConvoFromGist = async (gistId) => {
+                const token = store.syncToken.value;
+                if (!token || !gistId) return null;
+                const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+                    method: 'GET', headers: _getGistHeaders(token)
+                });
+                if (!res.ok) return null;
+                const gistData = await res.json();
+                const content = gistData.files?.['conversation.json']?.content;
+                if (!content) return null;
+                try { return JSON.parse(content); } catch { return null; }
+            };
+            const _pullMissingImages = async (convoData, gistId, localFs) => {
+                const imageIds = _collectImageIds(convoData);
+                if (!imageIds.size) return [];
+                const missing = [];
+                for (const imgId of imageIds) {
+                    try { await localFs.promises.stat('/' + imgId); } catch { missing.push(imgId); }
+                }
+                if (!missing.length) return [...imageIds];
+                const corsProxy = _buildCorsProxy();
+                if (!corsProxy) return [...imageIds];
+                const token = store.syncToken.value;
+                if (!token) return [...imageIds];
+                const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
+                const tmpFs = new LightningFS(`nailab-convo-pull-${safeGistId}`, { wipe: true });
+                const dir = '/repo';
+                try { await tmpFs.promises.mkdir(dir); } catch {}
+                const gitUrl = `https://gist.github.com/${gistId}.git`;
+                const onAuth = () => ({ username: 'oauth2', password: token });
+                try {
+                    await window.git.clone({ fs: tmpFs, http: window.gitHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1, onAuth });
+                    const pulled = [];
+                    for (const imgId of missing) {
+                        try {
+                            const data = await tmpFs.promises.readFile(dir + '/' + imgId);
+                            await localFs.promises.writeFile('/' + imgId, data);
+                            pulled.push(imgId);
+                        } catch {}
+                    }
+                    // Fix 4: bootstrap _syncedConvoImages with all image IDs found in the cloned repo
+                    const clonedFiles = await tmpFs.promises.readdir(dir);
+                    const clonedImageIds = clonedFiles.filter(f => f.startsWith('img_') && f.endsWith('.webp'));
+                    if (clonedImageIds.length) {
+                        _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: clonedImageIds };
+                    }
+                    return [...imageIds];
+                } catch (e) {
+                    console.warn('Failed to pull images from gist:', e);
+                    return [...imageIds];
+                }
+            };
             const loadConversation = async (id) => {
                 if (conversationMap.has(id)) { activeConvoId.value = id; return; }
                 const meta = _.find(savedConversations.value, {id});
@@ -1301,11 +1373,23 @@ const TagCountBadge={
                             } catch {}
                         }
                     }
+                    // Fix 2: fall back to fetching from the conversation's Gist
+                    const gistId = conversationGists.value[id];
+                    if (!convoData && gistId) {
+                        convoData = await _fetchConvoFromGist(gistId);
+                        if (convoData && lfs) {
+                            try { await _writeConvoToLfs(lfs, id, convoData.messages, convoData.params); } catch {}
+                        }
+                    }
                     if (!convoData) {
                         toast.warn('Conversation data not found on this device.');
                         conversationMap.delete(id);
                         if (activeConvoId.value === id) { const r = [...conversationMap.keys()]; activeConvoId.value = r.length ? r[r.length-1] : newChat(); }
                         return;
+                    }
+                    // Fix 3 + 4: pull missing images from gist before deserialization
+                    if (gistId && lfs) {
+                        await _pullMissingImages(convoData, gistId, lfs);
                     }
                     if (convoData.params) Object.assign(convo.params, convoData.params);
                     const deserialized = await deserializeConversation(convoData);
@@ -1331,6 +1415,14 @@ const TagCountBadge={
                 if (convo) convo.title = t;
                 const s = _.find(savedConversations.value, {id});
                 if (s) s.title = t;
+                const gistId = conversationGists.value[id];
+                const token = store.syncToken.value;
+                if (gistId && token) {
+                    fetch(`https://api.github.com/gists/${gistId}`, {
+                        method: 'PATCH', headers: _getGistHeaders(token),
+                        body: JSON.stringify({ description: `NAILab: ${t}` })
+                    }).catch(e => console.warn('Failed to update gist description:', e));
+                }
             };
             const pruneNoImageMessages = () => withActiveConvo(convo => {
                 const genMsgId = convo.generatingMsgId;
@@ -1409,6 +1501,7 @@ const TagCountBadge={
                 const gistData = await res.json();
                 conversationGists.value = { ...conversationGists.value, [id]: gistData.id };
                 await _syncConversationToItsGist(id);
+                useSyncStore().push(true).catch(() => {});
                 return gistData.id;
             };
             const _patchConvoText = async (gistId, convoJson) => {
@@ -1492,6 +1585,7 @@ const TagCountBadge={
                         } catch (e) {
                             convoSyncStatus[id] = 'error';
                             console.warn('Convo gist sync failed:', e);
+                            toast.warn(`Auto-sync failed for conversation: ${e.message}`, 'sync', 5000);
                         }
                     }
                 } finally {
@@ -1501,16 +1595,24 @@ const TagCountBadge={
             };
             const _autoSyncGist = useDebounceFn(_runGistSync, 30000);
             const syncConversationNow = async (id) => {
-                convoSyncStatus[id] = 'syncing';
-                try {
-                    if (!conversationGists.value[id]) await createConversationGist(id);
-                    else await _syncConversationToItsGist(id);
-                    convoSyncStatus[id] = 'synced';
-                    toast.q('Synced to cloud');
-                } catch (e) {
-                    convoSyncStatus[id] = 'error';
-                    toast.err('Sync failed: ' + e.message);
+                if (!conversationGists.value[id]) {
+                    convoSyncStatus[id] = 'syncing';
+                    try {
+                        await createConversationGist(id);
+                        convoSyncStatus[id] = 'synced';
+                        toast.q('Synced to cloud');
+                    } catch (e) {
+                        convoSyncStatus[id] = 'error';
+                        toast.err('Sync failed: ' + e.message);
+                    }
+                    return;
                 }
+                convoSyncStatus[id] = 'pending';
+                _gistSyncDirty.add(id);
+                await _runGistSync();
+                const status = convoSyncStatus[id];
+                if (status === 'synced') toast.q('Synced to cloud');
+                else if (status === 'error') toast.err('Sync failed');
             };
             const deleteConversationGist = async (id) => {
                 const gistId = conversationGists.value[id];
