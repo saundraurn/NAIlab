@@ -11,7 +11,9 @@ async function handleRequest(request) {
         status: 200,
         headers: {
           'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
           'Access-Control-Allow-Headers': '*',
+          'Access-Control-Max-Age': '86400'
         }
       });
     }
@@ -31,6 +33,7 @@ async function handleRequest(request) {
     const modifiedResponse = new Response(response.body, response);
     modifiedResponse.headers.set('Access-Control-Allow-Origin', '*');
     modifiedResponse.headers.set('Access-Control-Allow-Headers', '*');
+    modifiedResponse.headers.set('Access-Control-Expose-Headers', '*');
 
     // Do NOT add Cache-Control, git relies on accurate fresh responses.
 
