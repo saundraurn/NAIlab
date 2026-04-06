@@ -1015,7 +1015,7 @@ const TagCountBadge={
                 // Migrate savedConversations from old config location
                 const oldConvos = store.config.value.savedConversations;
                 if (Array.isArray(oldConvos) && oldConvos.length && !savedConversations.value.length) {
-                    savedConversations.value = oldConvos.map(c => c && typeof c === 'object' ? _.pick(c, _META_KEYS) : c).filter(Boolean);
+                    savedConversations.value = oldConvos.filter(c => c && typeof c === 'object').map(c => _.pick(c, _META_KEYS));
                     delete store.config.value.savedConversations;
                 }
                 const lfs = imageStore.getLfs();
