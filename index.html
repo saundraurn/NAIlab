@@ -1305,14 +1305,18 @@ const TagCountBadge={
                 if (!convoFile) return null;
                 let content = convoFile.content;
                 if ((convoFile.truncated || typeof content !== 'string') && convoFile.raw_url) {
-                    const rawRes = await fetch(convoFile.raw_url, {
+                try {
+                    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
                         method: 'GET', headers: _getGistHeaders(token)
                     });
-                    if (!rawRes.ok) return null;
-                    content = await rawRes.text();
+                    if (!res.ok) return null;
+                    const gistData = await res.json();
+                    const content = gistData.files?.['conversation.json']?.content;
+                    if (!content) return null;
+                    try { return JSON.parse(content); } catch { return null; }
+                } catch {
+                    return null;
                 }
-                if (!content) return null;
-                try { return JSON.parse(content); } catch { return null; }
             };
             const _pullMissingImages = async (convoData, gistId, localFs) => {
                 const imageIds = _collectImageIds(convoData);
