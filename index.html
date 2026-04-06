@@ -1648,9 +1648,18 @@ const TagCountBadge={
                 await _runGistSync();
                 // Poll until status resolves (handles case where sync was already in flight)
                 const deadline = Date.now() + 120000;
+                const gistSyncWaitTimedOut = Symbol('gistSyncWaitTimedOut');
                 while (convoSyncStatus[id] === 'pending' && Date.now() < deadline) {
                     await new Promise(r => setTimeout(r, 500));
-                    if (_gistSyncPromise) await _gistSyncPromise;
+                    if (_gistSyncPromise) {
+                        const remaining = deadline - Date.now();
+                        if (remaining <= 0) break;
+                        const result = await Promise.race([
+                            _gistSyncPromise,
+                            new Promise(resolve => setTimeout(() => resolve(gistSyncWaitTimedOut), remaining))
+                        ]);
+                        if (result === gistSyncWaitTimedOut) break;
+                    }
                 }
                 const status = convoSyncStatus[id];
                 if (status === 'synced') toast.q('Synced to cloud');
