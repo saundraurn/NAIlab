@@ -1427,7 +1427,9 @@ const TagCountBadge={
                 const maybeOrphaned = syncedArr.filter(id => !imageIds.has(id));
                 if (!newImages.length && !maybeOrphaned.length) return;
                 const corsProxy = _buildCorsProxy();
-                if (!corsProxy) return;
+                if (!corsProxy) {
+                    throw new Error('A CORS proxy URL is required to sync conversation images.');
+                }
                 const token = store.syncToken.value;
                 const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
                 const syncFs = new LightningFS(`nailab-convo-push-${safeGistId}`, { wipe: true });
