@@ -1006,6 +1006,8 @@ const TagCountBadge={
             };
             const savedConversations = useLocalStorage('nai-saved-conversations', []);
             const conversationGists = useLocalStorage('nai-conversation-gists', {});
+            const _syncedConvoImages = useLocalStorage('nai-synced-convo-images', {});
+            const convoSyncStatus = reactive({});
             const getList = () => savedConversations.value;
             const _requireGeminiKey = () => {
                 if (!store.config.value.gemini?.apiKey) { toast.err('Gemini API key required — set it in Settings'); return false; }
@@ -1266,6 +1268,9 @@ const TagCountBadge={
                 const idx = _.findIndex(list, {id: convo.id});
                 if (idx !== -1) list[idx] = meta; else list.unshift(meta);
                 toast.q('Chat saved');
+                if (store.syncToken.value && store.config.value.jssync.autoSync && !conversationGists.value[id]) {
+                    syncConversationNow(id).catch(e => console.warn('Auto-create gist failed:', e));
+                }
                 return actualTitle;
             };
             const loadConversation = async (id) => {
@@ -1316,6 +1321,7 @@ const TagCountBadge={
                     if (lfs) { lfs.promises.unlink(_convoPath(id)).catch(() => {}); }
                 }
                 if (conversationMap.has(id)) closeConversation(id);
+                deleteConversationGist(id).catch(() => {});
                 toast.q('Removed from saved chats');
                 imageStore.cleanupOrphanedImages(savedConversations.value).catch(() => {});
             };
@@ -1351,7 +1357,14 @@ const TagCountBadge={
             const abort = () => { const convo = activeConvo.value; if (convo?.abortCtrl) convo.abortCtrl.abort(); };
             const _autoSave = useDebounceFn(() => {
                 const convo = activeConvo.value;
-                if (convo && !convo.isTemp && !convo.generating && !convo.isHydrating) _saveConvoDirect(convo);
+                if (convo && !convo.isTemp && !convo.generating && !convo.isHydrating) {
+                    _saveConvoDirect(convo);
+                    if (conversationGists.value[convo.id] && store.syncToken.value && store.config.value.jssync.autoSync) {
+                        if (convoSyncStatus[convo.id] !== 'syncing') convoSyncStatus[convo.id] = 'pending';
+                        _gistSyncDirty.add(convo.id);
+                        _autoSyncGist();
+                    }
+                }
             }, 1500);
             watch(() => activeConvo.value && !activeConvo.value.isTemp ? activeConvo.value.messages : null, (msgs) => {
                 if (msgs) _autoSave();
@@ -1394,16 +1407,63 @@ const TagCountBadge={
                 });
                 if (!res.ok) throw new Error(`Create gist failed: ${res.status}`);
                 const gistData = await res.json();
-                await _syncConversationToItsGist(id, gistData.id);
                 conversationGists.value = { ...conversationGists.value, [id]: gistData.id };
+                await _syncConversationToItsGist(id);
                 return gistData.id;
             };
-            const _syncConversationToItsGist = async (id, gistIdOverride) => {
+            const _patchConvoText = async (gistId, convoJson) => {
                 const token = store.syncToken.value;
-                const gistId = gistIdOverride || conversationGists.value[id];
-                if (!token || !gistId) return;
+                const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+                    method: 'PATCH',
+                    headers: _getGistHeaders(token),
+                    body: JSON.stringify({ files: { 'conversation.json': { content: convoJson } } })
+                });
+                if (!res.ok) throw new Error(`Gist PATCH failed: ${res.status}`);
+            };
+            const _pushConvoImages = async (gistId, imageIds, localFs) => {
+                const syncedArr = _syncedConvoImages.value[gistId] || [];
+                const syncedSet = new Set(syncedArr);
+                const newImages = [...imageIds].filter(id => !syncedSet.has(id));
+                const maybeOrphaned = syncedArr.filter(id => !imageIds.has(id));
+                if (!newImages.length && !maybeOrphaned.length) return;
                 const corsProxy = _buildCorsProxy();
-                if (!corsProxy) throw new Error('Worker proxy URL required for conversation sync.');
+                if (!corsProxy) {
+                    throw new Error('A CORS proxy URL is required to sync conversation images.');
+                }
+                const token = store.syncToken.value;
+                const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
+                const syncFs = new LightningFS(`nailab-convo-push-${safeGistId}`, { wipe: true });
+                const dir = '/repo';
+                try { await syncFs.promises.mkdir(dir); } catch {}
+                const gitUrl = `https://gist.github.com/${gistId}.git`;
+                const onAuth = () => ({ username: 'oauth2', password: token });
+                await window.git.clone({ fs: syncFs, http: window.gitHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1, onAuth });
+                const branch = await window.git.currentBranch({ fs: syncFs, dir }) || 'main';
+                let staged = false;
+                for (const imgId of newImages) {
+                    try {
+                        const imgData = await localFs.promises.readFile('/' + imgId);
+                        await syncFs.promises.writeFile(dir + '/' + imgId, imgData);
+                        await window.git.add({ fs: syncFs, dir, filepath: imgId });
+                        staged = true;
+                    } catch {}
+                }
+                const gistFiles = (await syncFs.promises.readdir(dir)).filter(f => f !== '.git');
+                for (const f of gistFiles) {
+                    if (f.startsWith('img_') && f.endsWith('.webp') && !imageIds.has(f)) {
+                        await window.git.remove({ fs: syncFs, dir, filepath: f });
+                        staged = true;
+                    }
+                }
+                if (!staged) return;
+                await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync images' });
+                await window.git.push({ fs: syncFs, http: window.gitHttp, dir, corsProxy, remote: 'origin', ref: branch, onAuth });
+                _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
+            };
+            const _syncConversationToItsGist = async (id) => {
+                const token = store.syncToken.value;
+                const gistId = conversationGists.value[id];
+                if (!token || !gistId) return;
                 const localFs = imageStore.getLfs();
                 if (!localFs) throw new Error('Local storage not initialized.');
                 let convoJson;
@@ -1411,40 +1471,46 @@ const TagCountBadge={
                 catch { throw new Error('Conversation data not found locally.'); }
                 const convoData = JSON.parse(convoJson);
                 const imageIds = _collectImageIds(convoData);
-                const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
-                const syncFsName = `nailab-convo-push-${safeGistId}`;
-                const syncFs = new LightningFS(syncFsName, { wipe: true });
-                const dir = '/repo';
-                try { await syncFs.promises.mkdir(dir); } catch {}
-                const gitUrl = `https://gist.github.com/${gistId}.git`;
-                const onAuth = () => ({ username: 'oauth2', password: token });
-                await window.git.clone({ fs: syncFs, http: window.gitHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1, onAuth });
-                const branch = await window.git.currentBranch({ fs: syncFs, dir }) || 'main';
-                await syncFs.promises.writeFile(dir + '/conversation.json', convoJson);
-                await window.git.add({ fs: syncFs, dir, filepath: 'conversation.json' });
-                for (const imgId of imageIds) {
-                    try {
-                        const imgData = await localFs.promises.readFile('/' + imgId);
-                        await syncFs.promises.writeFile(dir + '/' + imgId, imgData);
-                        await window.git.add({ fs: syncFs, dir, filepath: imgId });
-                    } catch {}
-                }
-                const gistFiles = (await syncFs.promises.readdir(dir)).filter(f => f !== '.git');
-                for (const f of gistFiles) {
-                    if (f.startsWith('img_') && f.endsWith('.webp') && !imageIds.has(f)) {
-                        await window.git.remove({ fs: syncFs, dir, filepath: f });
-                    }
-                }
-                await window.git.commit({
-                    fs: syncFs, dir,
-                    author: { name: 'NAILab', email: 'nailab@local' },
-                    message: 'Update conversation'
-                });
-                await window.git.push({ fs: syncFs, http: window.gitHttp, dir, corsProxy, remote: 'origin', ref: branch, onAuth });
+                await _patchConvoText(gistId, convoJson);
+                await _pushConvoImages(gistId, imageIds, localFs);
             };
+            let _gistSyncInProgress = false;
+            const _gistSyncDirty = new Set();
+            const _runGistSync = async () => {
+                if (_gistSyncInProgress) return;
+                _gistSyncInProgress = true;
+                try {
+                    const ids = [..._gistSyncDirty];
+                    _gistSyncDirty.clear();
+                    for (const id of ids) {
+                        const gistId = conversationGists.value[id];
+                        if (!gistId) continue;
+                        convoSyncStatus[id] = 'syncing';
+                        try {
+                            await _syncConversationToItsGist(id);
+                            convoSyncStatus[id] = 'synced';
+                        } catch (e) {
+                            convoSyncStatus[id] = 'error';
+                            console.warn('Convo gist sync failed:', e);
+                        }
+                    }
+                } finally {
+                    _gistSyncInProgress = false;
+                    if (_gistSyncDirty.size) _runGistSync();
+                }
+            };
+            const _autoSyncGist = useDebounceFn(_runGistSync, 30000);
             const syncConversationNow = async (id) => {
-                if (!conversationGists.value[id]) await createConversationGist(id);
-                else await _syncConversationToItsGist(id);
+                convoSyncStatus[id] = 'syncing';
+                try {
+                    if (!conversationGists.value[id]) await createConversationGist(id);
+                    else await _syncConversationToItsGist(id);
+                    convoSyncStatus[id] = 'synced';
+                    toast.q('Synced to cloud');
+                } catch (e) {
+                    convoSyncStatus[id] = 'error';
+                    toast.err('Sync failed: ' + e.message);
+                }
             };
             const deleteConversationGist = async (id) => {
                 const gistId = conversationGists.value[id];
@@ -1458,10 +1524,14 @@ const TagCountBadge={
                 const g = { ...conversationGists.value };
                 delete g[id];
                 conversationGists.value = g;
+                const s = { ..._syncedConvoImages.value };
+                delete s[gistId];
+                _syncedConvoImages.value = s;
+                delete convoSyncStatus[id];
             };
             return {
                 conversationMap, activeConvoId, activeConvo,
-                messages, savedConversations, conversationGists, generating, generatingMsgId, generatingVarIdx, isHydrating,
+                messages, savedConversations, conversationGists, convoSyncStatus, generating, generatingMsgId, generatingVarIdx, isHydrating,
                 sendMessage, regenerateMessage, regenerateUserMessage,
                 deleteMessage, deleteAllVariants, abort, pruneNoImageMessages, initFromStorage,
                 isHiddenFromModel, toggleHiddenFromModel,
@@ -1520,10 +1590,11 @@ const TagCountBadge={
                 const store = useAppStore();
                 const imageStore = useImageStore();
                 const {conversationMap, activeConvoId, activeConvo, savedConversations,
+                       conversationGists, convoSyncStatus,
                        generating, messages, isHydrating,
                        sendMessage, newChat, abort, switchConversation, closeConversation,
                        saveConversation, loadConversation, deleteConversation, renameConversation,
-                       pruneNoImageMessages} = useGeminiAPI();
+                       syncConversationNow, pruneNoImageMessages} = useGeminiAPI();
                 const editState = ref(null);
                 const pendingImages = ref([]);
                 const lightboxSrc = ref(null);
@@ -1632,6 +1703,8 @@ const TagCountBadge={
                     removePendingImage, downloadImage,
                     autoResize, onKeydown, onPaste,
                     activeConvoId, conversationMap,
+                    conversationGists, convoSyncStatus, syncConversationNow,
+                    syncToken: store.syncToken,
                     openConversations, closedSavedConversations,
                     switchConversation, closeConversation, saveConversation, loadConversation, deleteConversation,
                     renamingId, renamingTitle, startRename, commitRename, cancelRename,
@@ -1640,7 +1713,7 @@ const TagCountBadge={
                     fmtAgo
                 };
             },
-            template: `<split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #header><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0 w-28"><setting-input v-model="convoParams.aspectRatio" label="Aspect Ratio" type="select" :options="aspectRatios"></setting-input></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></template><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><convo-list-item v-for="convo in openConversations" :key="convo.id" :convo="convo" :is-active="activeConvoId===convo.id" is-open :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&switchConversation(convo.id)" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><span v-if="convo.generating" class="loading loading-spinner loading-xs text-primary shrink-0"></span><material-icon v-else-if="convo.isTemp" icon="schedule" :size="14" class="text-neutral-500 shrink-0"/><span v-else-if="convo._lastGenStatus==='success'" class="w-2 h-2 rounded-full bg-success/60 shrink-0 inline-block"></span><span v-else-if="convo._lastGenStatus==='error'" class="w-2 h-2 rounded-full bg-error/60 shrink-0 inline-block"></span><material-icon v-else icon="bookmark" :size="14" class="text-primary/70 shrink-0"/></template><template v-if="convo.messages.length" #preview><span class="truncate flex-1">{{convo.preview||convo.messages[0]?.text?.substring(0,60)||''}}</span><span class="shrink-0 text-neutral-600 tabular-nums">· {{convo.messages.length}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn v-if="convo.isTemp&&convo.messages.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/><icon-btn icon="close" @click.stop="closeConversation(convo.id)" title="Close" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item><template v-if="closedSavedConversations.length"><div class="divider text-xs text-neutral-600 my-2 select-none">Saved ({{ closedSavedConversations.length }})</div><convo-list-item v-for="convo in closedSavedConversations" :key="convo.id" :convo="convo" :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&loadConversation(convo.id)" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><material-icon icon="bookmark" :size="14" class="text-neutral-500 shrink-0"/></template><template #preview><span class="truncate flex-1">{{convo.preview||''}}</span><span class="shrink-0 text-neutral-600 tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn icon="delete" @click.stop="deleteConversation(convo.id)" title="Delete" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item></template><div v-if="!openConversations.length && !closedSavedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()"></chat-message></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><image-preview-card v-for="(img, idx) in pendingImages" :key="idx" :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport>`
+            template: `<split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #header><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0 w-28"><setting-input v-model="convoParams.aspectRatio" label="Aspect Ratio" type="select" :options="aspectRatios"></setting-input></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></template><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><convo-list-item v-for="convo in openConversations" :key="convo.id" :convo="convo" :is-active="activeConvoId===convo.id" is-open :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&switchConversation(convo.id)" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><span v-if="convo.generating" class="loading loading-spinner loading-xs text-primary shrink-0"></span><material-icon v-else-if="convo.isTemp" icon="schedule" :size="14" class="text-neutral-500 shrink-0"/><span v-else-if="convo._lastGenStatus==='success'" class="w-2 h-2 rounded-full bg-success/60 shrink-0 inline-block"></span><span v-else-if="convo._lastGenStatus==='error'" class="w-2 h-2 rounded-full bg-error/60 shrink-0 inline-block"></span><material-icon v-else icon="bookmark" :size="14" class="text-primary/70 shrink-0"/></template><template v-if="convo.messages.length" #preview><span class="truncate flex-1">{{convo.preview||convo.messages[0]?.text?.substring(0,60)||''}}</span><span class="shrink-0 text-neutral-600 tabular-nums">· {{convo.messages.length}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn v-if="convo.isTemp&&convo.messages.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/><span v-if="!convo.isTemp&&conversationGists[convo.id]" class="shrink-0 flex-center w-6 h-6" :title="convoSyncStatus[convo.id]==='error'?'Sync error':convoSyncStatus[convo.id]==='syncing'?'Syncing...':convoSyncStatus[convo.id]==='pending'?'Sync pending':convoSyncStatus[convo.id]==='synced'?'Synced to cloud':'Linked to cloud'"><span v-if="convoSyncStatus[convo.id]==='syncing'" class="loading loading-spinner" style="width:12px;height:12px;color:oklch(var(--in))"></span><material-icon v-else-if="convoSyncStatus[convo.id]==='error'" icon="cloud_off" :size="13" class="text-error/70"/><material-icon v-else-if="convoSyncStatus[convo.id]==='pending'" icon="cloud_upload" :size="13" class="text-info/50"/><material-icon v-else-if="convoSyncStatus[convo.id]==='synced'" icon="cloud_done" :size="13" class="text-success/50"/><material-icon v-else icon="cloud" :size="13" class="text-neutral-500/50"/></span><icon-btn v-else-if="!convo.isTemp&&convo.messages.length&&syncToken" icon="cloud_upload" @click.stop="syncConversationNow(convo.id)" title="Sync to cloud" color="btn-ghost text-neutral-500 hover:text-primary" size="btn-xs"/><icon-btn icon="close" @click.stop="closeConversation(convo.id)" title="Close" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item><template v-if="closedSavedConversations.length"><div class="divider text-xs text-neutral-600 my-2 select-none">Saved ({{ closedSavedConversations.length }})</div><convo-list-item v-for="convo in closedSavedConversations" :key="convo.id" :convo="convo" :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&loadConversation(convo.id)" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><material-icon icon="bookmark" :size="14" class="text-neutral-500 shrink-0"/></template><template #preview><span class="truncate flex-1">{{convo.preview||''}}</span><span class="shrink-0 text-neutral-600 tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template><template #actions><span v-if="conversationGists[convo.id]" class="shrink-0 flex-center w-6 h-6" title="Linked to cloud"><material-icon icon="cloud" :size="13" class="text-neutral-500/50"/></span><icon-btn icon="delete" @click.stop="deleteConversation(convo.id)" title="Delete" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item></template><div v-if="!openConversations.length && !closedSavedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()"></chat-message></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><image-preview-card v-for="(img, idx) in pendingImages" :key="idx" :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport>`
         };
         const ConflictResolutionModal = {
             setup() {
