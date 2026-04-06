@@ -362,7 +362,7 @@
                 if (res.status === 404) throw new Error('Gist not found. Check your Gist ID.');
                 if (res.status === 401) throw new Error('Invalid GitHub token. Check your PAT.');
                 if (!res.ok) throw new Error(`${method} gist failed: ${res.status}`);
-                return res.json();
+                return [await res.json(), res.headers.get('ETag') || ''];
             };
             const pull = async () => {
                 const cfg = appStore.config.value;
@@ -453,9 +453,9 @@
                         syncStatus.value = 'idle';
                         return;
                     }
-                    const updated = await gistRequest(token, 'PATCH', `https://api.github.com/gists/${gistId}`, { files: { ['nailab-config.json']: { content } } });
+                    const [updated, pushedEtag] = await gistRequest(token, 'PATCH', `https://api.github.com/gists/${gistId}`, { files: { ['nailab-config.json']: { content } } });
                     lastPushedContent.value = content;
-                    _finalizePush(cfg, updated.updated_at);
+                    _finalizePush(cfg, pushedEtag);
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config pushed to Gist.', 'sync', 2500);
                 } catch (e) {
@@ -471,9 +471,9 @@
                 try {
                     const payload = extractSyncPayload(cfg);
                     const content = JSON.stringify(payload, null, 2);
-                    const gistData = await gistRequest(token, 'POST', 'https://api.github.com/gists', { description: 'NAILab Config Sync', public: false, files: { ['nailab-config.json']: { content } } });
+                    const [gistData, createdEtag] = await gistRequest(token, 'POST', 'https://api.github.com/gists', { description: 'NAILab Config Sync', public: false, files: { ['nailab-config.json']: { content } } });
                     cfg.jssync.gistId = gistData.id;
-                    _finalizePush(cfg, gistData.updated_at);
+                    _finalizePush(cfg, createdEtag);
                     syncStatus.value = 'idle';
                     toast.ok('Gist created! ID saved.', 'sync');
                     return gistData.id;
