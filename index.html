@@ -65,7 +65,7 @@
             .hover-reveal { opacity:0; transition:opacity .15s; }
             .empty-notice { color:oklch(var(--bc)/.5);font-size:.75rem;text-align:center;padding:.5rem 0;pointer-events:none; }
             .two-col-grid { @apply grid grid-cols-2 gap-3; }
-            .ctr-btn{@apply flex items-center justify-center h-4 w-5 text-neutral-400 transition-colors}.ctr-btn:hover{@apply bg-white/10 text-white}.ctr-btn:active{@apply bg-white/20}
+            .ctr-btn{@apply flex items-center justify-center h-4 w-5 text-neutral-400 transition-colors;}.ctr-btn:hover{@apply bg-white/10 text-white;}.ctr-btn:active{@apply bg-white/20;}
             .dim-input {
                 display: flex;
                 align-items: center;
@@ -553,7 +553,7 @@ const TagCountBadge={
                 });
                 return {isLeftOpen};
             },
-            template:`<div class="flex flex-col h-full"><div v-if="$slots.header" class="z-[200] shrink-0"><slot name="header"></slot></div><div class="h-full flex overflow-hidden flex-1 min-h-0"><div class="shrink-0 flex flex-col border-r border-white/10 transition-all duration-200 overflow-hidden" :style="isLeftOpen ? 'width:380px' : 'width:0px'"><div class="w-[380px] h-full" :class="leftClass"><slot name="left"></slot></div></div><button @click="isLeftOpen=!isLeftOpen" class="shrink-0 w-5 flex-center bg-base-200/20 hover:bg-primary/15 border-r border-white/10 text-neutral-600 hover:text-primary transition-colors z-10" :title="isLeftOpen ? 'Collapse panel' : 'Expand panel'"><material-icon :icon="isLeftOpen ? 'chevron_left' : 'chevron_right'" :size="16"/></button><div class="flex-1 overflow-hidden" :class="rightClass"><slot name="right"></slot></div></div></div>`
+            template:`<div class="flex flex-col h-full"><div v-if="$slots.header" class="z-[200] shrink-0"><slot name="header"></slot></div><div class="flex overflow-hidden flex-1 min-h-0"><div class="shrink-0 flex flex-col border-r border-white/10 transition-all duration-200 overflow-hidden" :style="isLeftOpen ? 'width:380px' : 'width:0px'"><div class="w-[380px] h-full" :class="leftClass"><slot name="left"></slot></div></div><button @click="isLeftOpen=!isLeftOpen" class="shrink-0 w-5 flex-center bg-base-200/20 hover:bg-primary/15 border-r border-white/10 text-neutral-600 hover:text-primary transition-colors z-10" :title="isLeftOpen ? 'Collapse panel' : 'Expand panel'"><material-icon :icon="isLeftOpen ? 'chevron_left' : 'chevron_right'" :size="16"/></button><div class="flex-1 overflow-hidden" :class="rightClass"><slot name="right"></slot></div></div></div>`
         };
         const LazyImage={
             props:{src:String,alt:String,aspectRatio:[Number,String]},setup:()=>({ready:ref(false)}),
