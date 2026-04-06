@@ -328,7 +328,6 @@
             const syncError = ref(null);
             const syncStatus = ref('idle');
             const pendingConflict = ref(null);
-            const lastPushedContent = ref(null);
             const appStore = useAppStore();
             const _finalizePush = (cfg, etag) => {
                 _stampSyncTime(cfg, etag);
@@ -433,7 +432,6 @@
                         toast.ok(`Pulled ${_.size(autoMerged)} updated section(s).`, 'sync', 3000);
                     }
                     _stampSyncTime(cfg, pulledEtag);
-                    lastPushedContent.value = fileContent;
                     syncStatus.value = 'idle';
                 } catch (e) {
                     _setSyncError(e);
@@ -447,14 +445,11 @@
                 if (!token || !gistId) return;
                 syncStatus.value = 'pushing'; syncError.value = null;
                 try {
+                    const hasLocalChanges = _SYNC_KEYS.some(k => (cfg._syncMeta?.[k]?.rev || 0) > (cfg.jssync.lastSyncedRevs?.[k] || 0));
+                    if (!hasLocalChanges) { syncStatus.value = 'idle'; return; }
                     const payload = extractSyncPayload(cfg);
                     const content = JSON.stringify(payload, null, 2);
-                    if (content === lastPushedContent.value) {
-                        syncStatus.value = 'idle';
-                        return;
-                    }
-                    const [updated, pushedEtag] = await gistRequest(token, 'PATCH', `https://api.github.com/gists/${gistId}`, { files: { ['nailab-config.json']: { content } } });
-                    lastPushedContent.value = content;
+                    const [, pushedEtag] = await gistRequest(token, 'PATCH', `https://api.github.com/gists/${gistId}`, { files: { ['nailab-config.json']: { content } } });
                     _finalizePush(cfg, pushedEtag);
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config pushed to Gist.', 'sync', 2500);
