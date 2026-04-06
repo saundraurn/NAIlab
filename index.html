@@ -127,11 +127,9 @@
         const uint8ArrayToBase64 = arr => btoa(fflate.strFromU8(arr, true));
         const _FM='gemini-3.1-flash-image-preview',_PM='gemini-3-pro-image-preview',_WP='image/webp';
         const blobToWebP = async (blob) => {
-            const bitmap = await createImageBitmap(blob);
-            const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-            canvas.getContext('2d').drawImage(bitmap, 0, 0);
-            const webpBlob = await canvas.convertToBlob({ type: _WP, quality: 1 });
-            return new Uint8Array(await webpBlob.arrayBuffer());
+            const bm = await createImageBitmap(blob), c = new OffscreenCanvas(bm.width, bm.height);
+            c.getContext('2d').drawImage(bm, 0, 0);
+            return new Uint8Array(await (await c.convertToBlob({ type: _WP, quality: 1 })).arrayBuffer());
         };
 
         const _GEMINI_IMG_TOKENS = {'0.5K': 747, '1K': 1120, '2K': 1680, '4K': 2520};
@@ -151,18 +149,10 @@
         });
         const calcVariantCost = (usage, imageCount, imageSize, model, isFlexInference) => {
             if (!usage) return null;
-            const pricing = _MODEL_PRICING[model] || _MODEL_PRICING[_FM];
-            let imgTokens;
-            const detail = usage.candidatesTokensDetails?.find(d => d.modality === 'IMAGE');
-            if (detail != null) {
-                imgTokens = detail.tokenCount || 0;
-            } else {
-                imgTokens = (imageCount || 0) * (_GEMINI_IMG_TOKENS[imageSize] || _GEMINI_IMG_TOKENS['1K']);
-            }
-            const txtOutTokens = Math.max(0, (usage.candidatesTokenCount || 0) - imgTokens);
-            const cost = ((usage.promptTokenCount || 0) * pricing.inPerM
-                  + txtOutTokens * pricing.txtPerM
-                  + imgTokens    * pricing.imgPerM) / 1e6;
+            const p = _MODEL_PRICING[model] || _MODEL_PRICING[_FM];
+            const d = usage.candidatesTokensDetails?.find(d => d.modality === 'IMAGE');
+            const imgT = d != null ? (d.tokenCount || 0) : (imageCount || 0) * (_GEMINI_IMG_TOKENS[imageSize] || _GEMINI_IMG_TOKENS['1K']);
+            const cost = ((usage.promptTokenCount || 0) * p.inPerM + Math.max(0, (usage.candidatesTokenCount || 0) - imgT) * p.txtPerM + imgT * p.imgPerM) / 1e6;
             return isFlexInference ? cost * 0.5 : cost;
         };
         const fmtCost = (c) => c === null ? '' : c < 0.0001 ? '~$0' : '$' + c.toFixed(4);
@@ -318,11 +308,7 @@
                 return { imageId, base64: uint8ArrayToBase64(webpBytes), webpBytes };
             };
             const loadImage = async (imageId) => {
-                try {
-                    const bytes = await localLfs.promises.readFile('/' + imageId);
-                    if (bytes) return bytes;
-                } catch {}
-                return null;
+                try { return await localLfs.promises.readFile('/' + imageId) || null; } catch { return null; }
             };
             const cleanupOrphanedImages = async () => {
                 const lp = localLfs.promises;
@@ -893,12 +879,10 @@
             template:`<div class="flex flex-col h-full"><div class="z-10 shrink-0"><collapsible-panel storage-key="tag-test-settings" flush><template #header><span>Tag Test</span><button @click.stop="isTestActive ? stopTesting() : startTesting()" class="btn btn-sm flex-1 mx-4 shadow-lg" :class="isTestActive ? 'btn-error' : 'btn-primary'"><material-icon :icon="isTestActive ? 'stop' : 'play_arrow'" size="16" class="mr-1"/>{{isTestActive ? 'Stop' : 'Start'}}</button></template><template #actions><div class="flex items-center gap-1"><counter :count="tagTest.iterations" :on-update="v => tagTest.iterations = Math.max(1, tagTest.iterations + v)" :class="{'opacity-50 pointer-events-none': tagTest.isInfinite}"><template #icon><material-icon icon="repeat" size="16"/></template></counter><toggle-btn v-model="tagTest.isInfinite" icon="all_inclusive"></toggle-btn></div></template><div class="flex flex-col gap-1 pt-1"><segmented-control v-model="tagTest.isControl" :options="[{val:true,label:'Control'},{val:false,label:'Tag vs Tag'}]" height="h-9" font-size="text-xs"></segmented-control><div class="text-center px-1 h-4"><transition name="fade" mode="out-in"><span :key="tagTest.isControl" class="text-[10px] text-neutral-400 tracking-wide block">{{tagTest.isControl ? 'Compare tagged vs. untagged base' : 'Compare two different tags directly'}}</span></transition></div></div></collapsible-panel></div><div class="flex-1 min-h-0 relative"><split-pane config-key="splitSizes"><template #left><prompt-list title="Prompts & UC" storage-key="prompts-uc" :items="tagTest.prompts" :id-ref="toRef(tagTest, 'nextPromptId')" icon="playlist_add" placeholder="1girl, blue hair... Use '--' for prompt-specific UCs"><template #footer><div class="my-4 border-t border-white/5"></div><autocomplete-field label="Global Negative" v-model:model-val="tagTest.unwantedContent" is-uc placeholder="Global unwanted content..."></autocomplete-field></template></prompt-list><collapsible-panel title="Tags to Test" storage-key="tags-to-test"><div class="mb-3 pt-2"><autocomplete-field label="Tags" v-model:model-val="tagTest.tagsToTest" placeholder="Enter tags separated by newlines..."></autocomplete-field></div><div class="two-col-grid mb-3"><segmented-control v-model="tagTest.tagPos" :options="[{val:'beginning',label:'Start'},{val:'end',label:'End'}]" height="h-9" font-size="text-xs"></segmented-control><segmented-control v-model="tagTest.tagTarget" :options="[{val:'prompt',label:'Prompt'},{val:'uc',label:'UC',activeClass:'btn-error text-white'}]" height="h-9" font-size="text-xs"></segmented-control></div><setting-input v-model="tagTest.tagStrength" :min="tagStrengthMin" :max="tagStrengthMax" :step="0.05" type="range" number><template #prefix><label class="swap swap-rotate w-6 h-6 -ml-1 flex-center cursor-pointer text-neutral-400 hover:text-warning transition-colors z-20"><input v-model="tagTest.hasExtendedRange" type="checkbox" class="hidden" /><material-icon icon="bolt" :size="20" class="swap-on text-warning leading-none"/><material-icon icon="bolt" :size="20" class="swap-off leading-none"/></label></template></setting-input></collapsible-panel><generation-settings-panel :config="genConfig"></generation-settings-panel></template><template #right><collapsible-panel title="Image Comparison" storage-key="img-comparison"><template #actions><toggle-btn v-model="tagTest.areTagsVisible" icon="sell"></toggle-btn></template><div class="text-center text-neutral-300 mb-4"><p class="font-semibold">{{actionStatusMsg}}</p><p class="text-sm">{{progressText}}</p></div><transition name="fade"><div v-if="shouldShowComparisonUI" class="space-y-3"><div class="two-col-grid"><div v-for="(image, key) in [{url: currentImages.imageA, tag: currentImages.tagA, name: 'A'}, {url: currentImages.imageB, tag: currentImages.tagB, name: 'B'}]" :key="key"><div class="glass-nested rounded-xl p-3 aspect-square flex-center"><transition name="fade" mode="out-in"><placeholder v-if="!image.url" key="p" icon="image" :text="'Image '+image.name"/><lazy-image v-else :key="image.url" :src="image.url" :alt="'Image '+image.name" class="max-w-full max-h-full object-contain rounded"></lazy-image></transition></div><div v-if="tagTest.areTagsVisible" class="text-center mt-1.5 text-neutral-300">{{image.tag}}</div></div></div><div class="space-y-2.5"><div class="grid grid-cols-2 gap-2.5"><button @click="recordJudgement('A')" :disabled="!(currentImages.imageA && currentImages.imageB)" class="btn btn-primary">I prefer Image A</button><button @click="recordJudgement('B')" :disabled="!(currentImages.imageA && currentImages.imageB)" class="btn btn-primary">I prefer Image B</button></div><button @click="recordJudgement('skip')" :disabled="!(currentImages.imageA && currentImages.imageB)" class="btn btn-neutral w-full">Skip</button></div></div></transition></collapsible-panel><collapsible-panel title="Results" storage-key="results-panel"><template #actions><toggle-btn v-model="tagTest.shouldFilterMiddleResults" icon="filter_alt"></toggle-btn></template><transition-group tag="div" name="list" class="space-y-2 mb-4"><div v-for="result in formattedResults" :key="result.name" class="flex-row-gap"><div class="w-20 text-neutral-100 text-sm truncate">{{result.name}}</div><div class="flex-1 rounded-full h-4 relative bg-neutral-800 overflow-hidden"><div :style="{width: result.score + '%'}" class="h-full bg-gradient-to-r from-warning to-primary transition-[width] duration-[400ms] ease-out"></div><div class="absolute inset-0 flex-center text-neutral-100 text-xs font-medium">{{result.score}}%</div></div><div class="text-xs text-neutral-400">{{result.tests}} tests</div></div></transition-group><div class="overflow-x-auto max-h-48 custom-scroll"><table class="table table-sm"><thead><tr><th>Tag</th><th>Score</th><th>W/L</th><th>Skips</th></tr></thead><tbody><tr v-for="result in formattedResults" :key="result.name"><td>{{result.name}}</td><td>{{result.score}}%</td><td>{{result.wins}}/{{result.losses}}</td><td>{{result.skips}}</td></tr></tbody></table></div></collapsible-panel></template></split-pane></div></div>`
         }
         const _getConvoPreview = (msgs) => {
-            const firstModelMsg = msgs.find(m => m.role === 'model');
-            const firstVariant = firstModelMsg?.variants?.[firstModelMsg.activeVariant ?? 0] ?? firstModelMsg?.variants?.[0];
-            const previewText = firstVariant?._text || firstVariant?.parts?.find(p => p.text && !p.thought)?.text || '';
-            if (previewText) return previewText.substring(0, 60);
-            const firstUserMsg = msgs.find(m => m.role === 'user');
-            return (firstUserMsg?.text || '').substring(0, 60);
+            const mm = msgs.find(m => m.role === 'model');
+            const v = mm?.variants?.[mm.activeVariant ?? 0] ?? mm?.variants?.[0];
+            const t = v?._text || v?.parts?.find(p => p.text && !p.thought)?.text;
+            return (t || msgs.find(m => m.role === 'user')?.text || '').substring(0, 60);
         };
         const _convoPath = id => `/convo_${id}.json`;
         const _writeConvoToLfs = (lfs, id, messages, params) =>
@@ -916,9 +900,9 @@
                                 img.mimeType = _WP;
                             }
                         }
-                        return { id: img.id, imageId: img.imageId, mimeType: _WP, name: img.name || '', hidden: img.hidden || false };
+                        return { id: img.id, imageId: img.imageId, mimeType: _WP, name: img.name || '', hidden: !!img.hidden };
                     }));
-                    return { id: msg.id, role: 'user', text: msg.text || '', images: serializedImages, hidden: msg.hidden || false };
+                    return { id: msg.id, role: 'user', text: msg.text || '', images: serializedImages, hidden: !!msg.hidden };
                 }
                 if (msg.role === 'model') {
                     const serializedVariants = await Promise.all((msg.variants || []).map(async (v) => {
@@ -952,7 +936,7 @@
                             _images: serializedImages,
                             _imageSize: v._imageSize || '1K',
                             _model: v._model || _FM,
-                            _flexInference: v._flexInference || false,
+                            _flexInference: !!v._flexInference,
                             _genTimeMs: v._genTimeMs || null,
                             _usage: v._usage ? _.omitBy({
                                 promptTokenCount: v._usage.promptTokenCount || 0,
@@ -962,13 +946,13 @@
                             }, _.isNil) : null,
                             _error: v._error || null,
                             _blockReason: v._blockReason || null,
-                            _isPromptBlock: v._isPromptBlock || false,
+                            _isPromptBlock: !!v._isPromptBlock,
                             timestamp: v.timestamp || null
                         };
                     }));
-                    return { id: msg.id, role: 'model', variants: serializedVariants, activeVariant: msg.activeVariant || 0, hidden: msg.hidden || false };
+                    return { id: msg.id, role: 'model', variants: serializedVariants, activeVariant: msg.activeVariant || 0, hidden: !!msg.hidden };
                 }
-                return { id: msg.id, role: msg.role, hidden: msg.hidden || false };
+                return { id: msg.id, role: msg.role, hidden: !!msg.hidden };
             }));
             return { messages: serializedMessages };
         };
@@ -1005,7 +989,7 @@
                             return img;
                         }));
                         dV._model = v._model || _FM;
-                        dV._flexInference = v._flexInference || false;
+                        dV._flexInference = !!v._flexInference;
                         dV._genTimeMs = v._genTimeMs || null;
                         return dV;
                     }));
@@ -1076,21 +1060,16 @@
                 return parts;
             };
             const buildBody = (contents, params) => {
-                const model = params?.bananaModel || _FM;
-                const isPro = model === _PM;
-                const genCfg = {responseModalities: ['TEXT','IMAGE']};
-                // Pro image model does not support thinkingConfig; Flash image model does
-                if (!isPro) {
-                    const thinkingLevel = params?.thinkingLevel || 'MINIMAL';
-                    genCfg.thinkingConfig = {thinkingLevel, includeThoughts: true};
-                }
-                const imgCfg = {};
-                if (params?.aspectRatio) imgCfg.aspectRatio = params.aspectRatio;
-                if (params?.imageSize) imgCfg.imageSize = params.imageSize === '0.5K' ? '512' : params.imageSize;
-                if (Object.keys(imgCfg).length) genCfg.imageConfig = imgCfg;
-                const _body = {contents, generationConfig: genCfg};
-                if (params?.flexInference && model === _PM) _body.service_tier = 'SERVICE_TIER_FLEX';
-                return _body;
+                const m = params?.bananaModel || _FM, isPro = m === _PM;
+                const gc = {responseModalities: ['TEXT','IMAGE']};
+                if (!isPro) gc.thinkingConfig = {thinkingLevel: params?.thinkingLevel || 'MINIMAL', includeThoughts: true};
+                const ic = {};
+                if (params?.aspectRatio) ic.aspectRatio = params.aspectRatio;
+                if (params?.imageSize) ic.imageSize = params.imageSize === '0.5K' ? '512' : params.imageSize;
+                if (Object.keys(ic).length) gc.imageConfig = ic;
+                const b = {contents, generationConfig: gc};
+                if (params?.flexInference && m === _PM) b.service_tier = 'SERVICE_TIER_FLEX';
+                return b;
             };
             const _getContents = (msgs, endIdx) => msgs.slice(0, endIdx).filter(m => !m.hidden).map(m => ({role: m.role, parts: getMsgParts(m)}));
             async function* parseSSE(res) {
@@ -1196,7 +1175,7 @@
                 const keys = msgIds
                     ? msgIds.map(id => `banana-thinking-${id}`)
                     : Object.keys(states).filter(k => k.startsWith('banana-thinking-'));
-                keys.forEach(k => { if (k in states) delete states[k]; });
+                keys.forEach(k => delete states[k]);
             };
             const _runGenerationLoop = async (convo, modelMsg, contents) => {
                 convo.abortCtrl = new AbortController();
@@ -1291,7 +1270,7 @@
             const saveConversation = async (id, title) => {
                 const convo = conversationMap.get(id);
                 if (!convo || !convo.messages.length) return;
-                const actualTitle = (title && title.trim()) ? title.trim() : (convo.messages[0]?.text?.substring(0, 40) || 'Untitled Chat');
+                const actualTitle = title?.trim() || convo.messages[0]?.text?.substring(0, 40) || 'Untitled Chat';
                 convo.title = actualTitle; convo.isTemp = false;
                 convo.preview = _getConvoPreview(convo.messages); convo.timestamp = Date.now();
                 const meta = { id: convo.id, title: actualTitle, preview: convo.preview, timestamp: convo.timestamp };
