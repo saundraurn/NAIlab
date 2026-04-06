@@ -1356,11 +1356,14 @@ const TagCountBadge={
             watch(() => activeConvo.value && !activeConvo.value.isTemp ? activeConvo.value.messages : null, (msgs) => {
                 if (msgs) _autoSave();
             }, { deep: true });
-            const _getGistHeaders = (token) => ({
+            const _getGitHubApiHeaders = (token) => ({
                 'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json',
                 'Accept': 'application/vnd.github+json',
                 'X-GitHub-Api-Version': '2022-11-28'
+            });
+            const _getGistHeaders = (token) => ({
+                ..._getGitHubApiHeaders(token),
+                'Content-Type': 'application/json'
             });
             const _collectImageIds = (convoData) => {
                 const ids = new Set();
@@ -1391,13 +1394,13 @@ const TagCountBadge={
                 });
                 if (!res.ok) throw new Error(`Create gist failed: ${res.status}`);
                 const gistData = await res.json();
+                await _syncConversationToItsGist(id, gistData.id);
                 conversationGists.value = { ...conversationGists.value, [id]: gistData.id };
-                await _syncConversationToItsGist(id);
                 return gistData.id;
             };
-            const _syncConversationToItsGist = async (id) => {
+            const _syncConversationToItsGist = async (id, gistIdOverride) => {
                 const token = store.syncToken.value;
-                const gistId = conversationGists.value[id];
+                const gistId = gistIdOverride || conversationGists.value[id];
                 if (!token || !gistId) return;
                 const corsProxy = _buildCorsProxy();
                 if (!corsProxy) throw new Error('Worker proxy URL required for conversation sync.');
@@ -1408,7 +1411,9 @@ const TagCountBadge={
                 catch { throw new Error('Conversation data not found locally.'); }
                 const convoData = JSON.parse(convoJson);
                 const imageIds = _collectImageIds(convoData);
-                const syncFs = new LightningFS('nailab-convo-push', { wipe: true });
+                const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
+                const syncFsName = `nailab-convo-push-${safeGistId}`;
+                const syncFs = new LightningFS(syncFsName, { wipe: true });
                 const dir = '/repo';
                 try { await syncFs.promises.mkdir(dir); } catch {}
                 const gitUrl = `https://gist.github.com/${gistId}.git`;
@@ -1427,7 +1432,6 @@ const TagCountBadge={
                 const gistFiles = (await syncFs.promises.readdir(dir)).filter(f => f !== '.git');
                 for (const f of gistFiles) {
                     if (f.startsWith('img_') && f.endsWith('.webp') && !imageIds.has(f)) {
-                        await syncFs.promises.unlink(dir + '/' + f);
                         await window.git.remove({ fs: syncFs, dir, filepath: f });
                     }
                 }
@@ -1454,7 +1458,6 @@ const TagCountBadge={
                 const g = { ...conversationGists.value };
                 delete g[id];
                 conversationGists.value = g;
-                try { indexedDB.deleteDatabase('nailab-convo-push'); } catch {}
             };
             return {
                 conversationMap, activeConvoId, activeConvo,
