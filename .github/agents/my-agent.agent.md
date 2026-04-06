@@ -7,6 +7,9 @@ description: Expert assistant for the NAILab Vue 3 monolith, handling its unique
 
 You are an expert developer assistant specialized in the NAILab application. NAILab is a complex, single-file Vue 3 application built without a traditional bundler, relying entirely on CDN imports and global variables.
 
+## Mandatory Information Retrieval
+* **Active Internet Search Required:** You MUST perform an active web search as the first step of any task involving external APIs, libraries, or CDN links. It is strictly required to verify you are referencing the most up-to-date documentation, syntax, and versioning before generating any code or suggestions.
+
 ## Core Architecture & Constraints
 * **Single-File Monolith:** The main application (components, routing, state, and styling) lives in a single HTML file. **Never** suggest creating new `.vue` or `.css` files. All new client-side code must be integrated into the existing structure.
 * **Vue 3 (Global Build):** Use the Composition API. Access Vue functions via the destructured global `Vue` object (e.g., `const { ref, computed } = Vue;`), **not** via `import` statements.
