@@ -65,6 +65,7 @@
             .hover-reveal { opacity:0; transition:opacity .15s; }
             .empty-notice { color:oklch(var(--bc)/.5);font-size:.75rem;text-align:center;padding:.5rem 0;pointer-events:none; }
             .two-col-grid { @apply grid grid-cols-2 gap-3; }
+            .cab{@apply flex items-center justify-center h-4 w-5 text-neutral-400 transition-colors}.cab:hover{@apply bg-white/10 text-white}.cab:active{@apply bg-white/20}
             .dim-input {
                 display: flex;
                 align-items: center;
@@ -131,9 +132,9 @@
             { key: 'app',       label: 'App Settings',              icon: 'settings',     previewFn: (s) => `Model: ${s.model||'—'}` },
             { key: 'danbooru',  label: 'Danbooru Folders & Search', icon: 'package_2',    previewFn: (s) => `${s.folders?.length || 0} folder(s), ${s.savedSearches?.length || 0} saved search(es)` },
         ];
-        const SYNC_DATA_SECTIONS = _CONFLICT_SECTIONS.map(s => s.key);
+        const _SYNC_KEYS = _CONFLICT_SECTIONS.map(s => s.key);
         const _normalizeArrayFields = (cfg) => {
-            cfg.savedConversations = _ensureArray(cfg.savedConversations).map(c => c && typeof c === 'object' ? _.pick(c, CONVO_META_KEYS) : c);
+            cfg.savedConversations = _ensureArray(cfg.savedConversations).map(c => c && typeof c === 'object' ? _.pick(c, _META_KEYS) : c);
         };
         const uid = () => crypto.randomUUID();
         const _ensureArray = (val) => Array.isArray(val) ? val : Object.values(val || {});
@@ -146,13 +147,13 @@
             return new Uint8Array(await (await c.convertToBlob({ type: _WP, quality: 1 })).arrayBuffer());
         };
 
-        const _GEMINI_IMG_TOKENS = {'0.5K': 747, '1K': 1120, '2K': 1680, '4K': 2520};
+        const _GIT = {'0.5K': 747, '1K': 1120, '2K': 1680, '4K': 2520};
         const _MODEL_PRICING = {
             [_FM]: { inPerM: 0.50, txtPerM: 3, imgPerM: 60, label: 'Nano Banana 2', shortLabel: 'NB2', tooltipPricing: '$0.50/M in · $3/M text · $60/M img' },
             [_PM]: { inPerM: 1.25, txtPerM: 5, imgPerM: 120, label: 'Nano Banana Pro', shortLabel: 'NBPro', tooltipPricing: '$1.25/M in · $5/M text · $120/M img' },
         };
         const _BANANA_MODELS = Object.entries(_MODEL_PRICING).map(([val,{label:text}])=>({val,text}));
-        const _DEFAULT_CONVO_PARAMS = () => ({
+        const _DCP = () => ({
             thinkingLevel: 'MINIMAL',
             aspectRatio: '9:16',
             imageSize: '0.5K',
@@ -165,7 +166,7 @@
             if (!usage) return null;
             const p = _MODEL_PRICING[model] || _MODEL_PRICING[_FM];
             const d = usage.candidatesTokensDetails?.find(d => d.modality === 'IMAGE');
-            const imgT = d ? (d.tokenCount || 0) : (imageCount || 0) * (_GEMINI_IMG_TOKENS[imageSize] || _GEMINI_IMG_TOKENS['1K']);
+            const imgT = d ? (d.tokenCount || 0) : (imageCount || 0) * (_GIT[imageSize] || _GIT['1K']);
             const cost = ((usage.promptTokenCount || 0) * p.inPerM + Math.max(0, (usage.candidatesTokenCount || 0) - imgT) * p.txtPerM + imgT * p.imgPerM) / 1e6;
             return isFlexInference ? cost * 0.5 : cost;
         };
@@ -180,7 +181,7 @@
         const _RETRY_CODES = new Set([429, 500, 502, 503, 504]);
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
-        const CONVO_META_KEYS = ['id', 'title', 'preview', 'timestamp'];
+        const _META_KEYS = ['id', 'title', 'preview', 'timestamp'];
         // Migration: API renamed from snake_case to camelCase; saved data may use either
         const getThoughtSig = (p) => p.thoughtSignature || p.thought_signature;
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
@@ -201,7 +202,7 @@
             _normalizeArrayFields(config.value);
             const syncToken = useLocalStorage('nai-sync-token', '');
             const isSyncMerging = ref(false);
-            SYNC_DATA_SECTIONS.forEach(section => {
+            _SYNC_KEYS.forEach(section => {
                 watch(() => config.value[section], () => {
                     if (isSyncMerging.value || !config.value._syncMeta) return;
                     const meta = config.value._syncMeta[section] ??= { rev: 0, updatedAt: 0 };
@@ -364,7 +365,7 @@
             const _finalizePush = (cfg, etag) => {
                 _stampSyncTime(cfg, etag);
                 cfg.jssync.lastSyncedRevs ??= {};
-                SYNC_DATA_SECTIONS.forEach(k => { cfg.jssync.lastSyncedRevs[k] = cfg._syncMeta?.[k]?.rev || 0; });
+                _SYNC_KEYS.forEach(k => { cfg.jssync.lastSyncedRevs[k] = cfg._syncMeta?.[k]?.rev || 0; });
             };
             const withFlag = (f, fn) => { f.value = true; return Promise.resolve().then(fn).finally(() => { f.value = false; }); };
             const withSyncMerge = (fn) => withFlag(appStore.isSyncMerging, fn);
@@ -384,7 +385,7 @@
                 'X-GitHub-Api-Version': '2022-11-28'
             });
             const extractSyncPayload = (fullConfig) => {
-                const snap = _.cloneDeep(_.pick(fullConfig, [...SYNC_DATA_SECTIONS,'_syncMeta']));
+                const snap = _.cloneDeep(_.pick(fullConfig, [..._SYNC_KEYS,'_syncMeta']));
                 if (snap.app) delete snap.app.apiKey;
                 return snap;
             };
@@ -412,7 +413,7 @@
                     const lastSyncedRevs = cfg.jssync.lastSyncedRevs || {};
                     const conflicts = [];
                     const autoMerged = {};
-                    SYNC_DATA_SECTIONS.forEach(key => {
+                    _SYNC_KEYS.forEach(key => {
                         if (!remote[key]) return;
                         const isDifferent = !_.isEqual(local[key], remote[key]);
                         if (!isDifferent) return;
@@ -520,7 +521,7 @@
                     _normalizeArrayFields(cfg);
                     const conflict = pendingConflict.value;
                     if (conflict) {
-                        SYNC_DATA_SECTIONS.forEach(k => {
+                        _SYNC_KEYS.forEach(k => {
                             const chosenSide = resolved[k] === conflict.remote[k] ? 'remote' : 'local';
                             const chosenMeta = conflict[chosenSide]?._syncMeta?.[k];
                             if (chosenMeta && chosenMeta.updatedAt > (cfg._syncMeta[k]?.updatedAt || 0)) {
@@ -566,7 +567,7 @@ const TagCountBadge={
             setup:(p,{emit})=>({val:useVModel(p,'modelValue',emit), show:ref(false)}),
             template:`<div class="relative"><floating-label :label="label" :color="labelColor"/><div v-if="type==='range'" class="input input-sm input-bordered flex-row-gap px-2 bg-base-100/50"><slot name="prefix"></slot><input type="range" v-model.number="val" v-bind="$attrs" :step="step" :min="min" :max="max" class="range range-xs range-primary flex-1"><input v-if="number" v-model.number="val" type="number" :step="step" :min="min" :max="max" class="input input-xs input-ghost w-12 text-right text-sm p-0 h-auto focus:outline-none focus:bg-transparent border-none"><span v-else class="text-[10px] w-8 text-right">{{(val||0).toFixed(2)}}</span></div><select v-else-if="type==='select'" v-model="val" v-bind="$attrs" class="select select-sm select-bordered w-full pt-2 text-xs" :disabled="disabled"><option v-for="o in options" :key="o.val??o" :value="o.val??o">{{o.text??o}}</option></select><div v-else class="flex gap-2"><input v-model="val" v-bind="$attrs" :type="type==='password'?(show?'text':'password'):(type||'number')" :step="step" :min="min" :max="max" :disabled="disabled" :placeholder="placeholder" class="input input-sm input-bordered w-full pt-2 text-sm"><toggle-btn v-if="type==='password'" v-model="show" icon="visibility_off" icon-off="visibility" size="btn-sm btn-ghost btn-square border border-white/10 shrink-0 self-end h-8 min-h-0"></toggle-btn></div><p v-if="helpText" class="text-xs text-neutral-500 mt-2 ml-1" v-html="helpText"></p></div>`
         };
-        const Counter={props:{count:Number,onUpdate:Function},template:`<div class="flex items-center glass-nested rounded-lg h-8 overflow-hidden select-none"><div class="pl-2 text-neutral-400 flex-center empty:hidden"><slot name="icon"></slot></div><div class="flex-1 flex-center px-2 text-xs font-bold text-neutral-200 min-w-[1.5rem]">{{count}}</div><div class="flex flex-col h-full border-l border-white/10"><button @click.stop="onUpdate(1)" class="flex-center h-4 w-5 text-neutral-400 transition-colors hover:bg-white/10 hover:text-white active:bg-white/20"><material-icon icon="keyboard_arrow_up" size="14"/></button><button @click.stop="onUpdate(-1)" class="flex-center h-4 w-5 text-neutral-400 transition-colors hover:bg-white/10 hover:text-white active:bg-white/20"><material-icon icon="keyboard_arrow_down" size="14"/></button></div></div>`};
+        const Counter={props:{count:Number,onUpdate:Function},template:`<div class="flex items-center glass-nested rounded-lg h-8 overflow-hidden select-none"><div class="pl-2 text-neutral-400 flex-center empty:hidden"><slot name="icon"></slot></div><div class="flex-1 flex-center px-2 text-xs font-bold text-neutral-200 min-w-[1.5rem]">{{count}}</div><div class="flex flex-col h-full border-l border-white/10"><button @click.stop="onUpdate(1)" class="cab"><material-icon icon="keyboard_arrow_up" size="14"/></button><button @click.stop="onUpdate(-1)" class="cab"><material-icon icon="keyboard_arrow_down" size="14"/></button></div></div>`};
         const SegmentedControl={
             props:{options:Array,modelValue:{default:undefined},activeClass:{type:String,default:'btn-primary text-white shadow-md'},height:{type:String,default:'h-8'},fontSize:{type:String,default:''},inactiveClass:{type:String,default:'glass-nested text-neutral-400 hover:bg-white/5 hover:text-neutral-200'}},
             emits:['update:modelValue'],
@@ -1017,7 +1018,7 @@ const TagCountBadge={
                 messages: opts.messages || [], generating: false, generatingMsgId: null, generatingVarIdx: null,
                 abortCtrl: null, isHydrating: false, timestamp: opts.timestamp || Date.now(), preview: opts.preview || '',
                 _lastGenStatus: null,
-                params: Object.assign(_DEFAULT_CONVO_PARAMS(), opts.params || {})
+                params: Object.assign(_DCP(), opts.params || {})
             });
             const activeConvo = computed(() => conversationMap.get(activeConvoId.value) || null);
             const messages = computed(() => activeConvo.value?.messages || []);
@@ -1049,7 +1050,7 @@ const TagCountBadge={
                         if (c?.messages) {
                             try {
                                 await _writeConvoToLfs(lfs, c.id, c.messages);
-                                const i = convos.indexOf(c); if (i > -1) convos[i] = _.pick(c, CONVO_META_KEYS);
+                                const i = convos.indexOf(c); if (i > -1) convos[i] = _.pick(c, _META_KEYS);
                             } catch (e) { console.warn('Migration failed for convo', c.id, e); }
                         }
                     }
@@ -1091,7 +1092,7 @@ const TagCountBadge={
             }
             const _streamToVariant = async (convo, msgId, varIdx, contents) => {
                 const getV = () => _findMsg(convo, msgId)?.variants[varIdx];
-                const params = convo.params || _DEFAULT_CONVO_PARAMS();
+                const params = convo.params || _DCP();
                 const model = params.bananaModel || _FM;
                 const startTime = Date.now();
                 const res = await fetch(`${_apiBase(model)}:streamGenerateContent?alt=sse`, {
@@ -1316,7 +1317,7 @@ const TagCountBadge={
                                 await _writeConvoToLfs(lfs, id, convoData.messages, convo.params);
                                 const list = getList();
                                 const idx = _.findIndex(list, {id});
-                                if (idx !== -1) list[idx] = _.pick(meta, CONVO_META_KEYS);
+                                if (idx !== -1) list[idx] = _.pick(meta, _META_KEYS);
                             } catch {}
                         }
                     }
@@ -1457,7 +1458,7 @@ const TagCountBadge={
                 const openFile = () => _openInput(fileInputRef), openEditFile = () => _openInput(editFileInputRef);
                 const onFileInput = (e, forEdit) => { const f = e.target.files; if (f?.length) handleFileUpload(Array.from(f), forEdit); };
                 const geminiApiConfig = store.config.value.gemini;
-                const convoParams = computed(() => activeConvo.value?.params || _DEFAULT_CONVO_PARAMS());
+                const convoParams = computed(() => activeConvo.value?.params || _DCP());
                 const hasApiKey = computed(() => !!geminiApiConfig.apiKey);
                 // Pro model doesn't support 0.5K; clamp if needed when switching models
                 watch(() => convoParams.value.bananaModel, (model) => {
@@ -1517,11 +1518,10 @@ const TagCountBadge={
                 onKeyStroke('Escape', () => { if (lightboxSrc.value) lightboxSrc.value = null; });
                 const renamingId = ref(null);
                 const renamingTitle = ref('');
-                const _sortNewest = arr => _.orderBy(arr, 'timestamp', 'desc');
-                const openConversations = computed(() => _sortNewest([...conversationMap.values()]));
+                const openConversations = computed(() => _.orderBy([...conversationMap.values()], 'timestamp', 'desc'));
                 const closedSavedConversations = computed(() => {
                     const openIds = new Set(conversationMap.keys());
-                    return _sortNewest((savedConversations.value || []).filter(c => !openIds.has(c.id)));
+                    return _.orderBy((savedConversations.value || []).filter(c => !openIds.has(c.id)), 'timestamp', 'desc');
                 });
                 const startRename = (convo) => {
                     renamingId.value = convo.id;
