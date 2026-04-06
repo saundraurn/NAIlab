@@ -1301,7 +1301,16 @@ const TagCountBadge={
                 });
                 if (!res.ok) return null;
                 const gistData = await res.json();
-                const content = gistData.files?.['conversation.json']?.content;
+                const convoFile = gistData.files?.['conversation.json'];
+                if (!convoFile) return null;
+                let content = convoFile.content;
+                if ((convoFile.truncated || typeof content !== 'string') && convoFile.raw_url) {
+                    const rawRes = await fetch(convoFile.raw_url, {
+                        method: 'GET', headers: _getGistHeaders(token)
+                    });
+                    if (!rawRes.ok) return null;
+                    content = await rawRes.text();
+                }
                 if (!content) return null;
                 try { return JSON.parse(content); } catch { return null; }
             };
@@ -1418,13 +1427,21 @@ const TagCountBadge={
                 const gistId = conversationGists.value[id];
                 const token = store.syncToken.value;
                 if (gistId && token) {
-                    fetch(`https://api.github.com/gists/${gistId}`, {
-                        method: 'PATCH', headers: _getGistHeaders(token),
-                        body: JSON.stringify({ description: `NAILab: ${t}` })
-                    }).catch(e => {
-                        console.warn('Failed to update gist description:', e);
-                        toast.warn('Failed to update cloud title', 'sync', 3000);
-                    });
+                    (async () => {
+                        try {
+                            const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+                                method: 'PATCH', headers: _getGistHeaders(token),
+                                body: JSON.stringify({ description: `NAILab: ${t}` })
+                            });
+                            if (!res.ok) {
+                                console.warn(`Failed to update gist description: ${res.status} ${res.statusText}`);
+                                toast.warn('Failed to update cloud title', 'sync', 3000);
+                            }
+                        } catch (e) {
+                            console.warn('Failed to update gist description:', e);
+                            toast.warn('Failed to update cloud title', 'sync', 3000);
+                        }
+                    })();
                 }
             };
             const pruneNoImageMessages = () => withActiveConvo(convo => {
