@@ -1531,7 +1531,7 @@ const TagCountBadge={
                 const gistData = await res.json();
                 conversationGists.value = { ...conversationGists.value, [id]: gistData.id };
                 await _syncConversationToItsGist(id);
-                useSyncStore().push(true).catch(() => {});
+                await useSyncStore().push(true);
                 return gistData.id;
             };
             const _patchConvoText = async (gistId, convoJson) => {
@@ -1646,9 +1646,16 @@ const TagCountBadge={
                 convoSyncStatus[id] = 'pending';
                 _gistSyncDirty.add(id);
                 await _runGistSync();
+                // Poll until status resolves (handles case where sync was already in flight)
+                const deadline = Date.now() + 120000;
+                while (convoSyncStatus[id] === 'pending' && Date.now() < deadline) {
+                    await new Promise(r => setTimeout(r, 500));
+                    if (_gistSyncPromise) await _gistSyncPromise;
+                }
                 const status = convoSyncStatus[id];
                 if (status === 'synced') toast.q('Synced to cloud');
                 else if (status === 'error') toast.err('Sync failed');
+                else if (status === 'pending') toast.warn('Sync timed out — will retry automatically');
             };
             const deleteConversationGist = async (id) => {
                 const gistId = conversationGists.value[id];
@@ -1892,8 +1899,8 @@ const TagCountBadge={
             },
             template: `<teleport to="body"><transition name="fade"><div v-if="syncStatus === 'conflict' && pendingConflict" class="fixed inset-0 z-[900] flex-center p-4" style="background:rgba(5,4,16,0.85);backdrop-filter:blur(8px)"><div class="bg-base-200 border border-white/10 rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col"><div class="flex items-center gap-3 p-5 border-b border-white/10 shrink-0"><div class="w-10 h-10 rounded-xl bg-warning/15 border border-warning/25 flex-center shrink-0"><material-icon icon="sync_problem" :size="22" class="text-warning"/></div><div class="flex-1 min-w-0"><h3 class="font-bold text-neutral-100 text-base">Sync Conflict Detected</h3><p class="text-xs text-neutral-500 mt-0.5">Remote changes differ from your local settings. Choose which version to keep per section.</p></div><div class="flex gap-2 shrink-0"><button @click="setAll('local')" class="btn btn-ghost btn-xs btn-wborder text-neutral-400 hover:text-white">Use All Local</button><button @click="setAll('remote')" class="btn btn-ghost btn-xs btn-wborder text-neutral-400 hover:text-white">Use All Remote</button></div></div><div class="flex-1 overflow-y-auto custom-scroll p-4 space-y-2"><template v-for="sec in SECTIONS" :key="sec.key"><div v-if="isConflicted(sec.key)" class="glass-nested rounded-xl border border-white/10 overflow-hidden"><button class="w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition-colors text-left" @click="expanded[sec.key] = !expanded[sec.key]"><material-icon :icon="sec.icon" :size="18" class="text-neutral-400 shrink-0"/><span class="flex-1 text-sm font-semibold text-neutral-200">{{ sec.label }}</span><span class="badge badge-warning badge-xs font-semibold uppercase tracking-wide mr-1">Conflict</span><material-icon :icon="expanded[sec.key] ? 'expand_less' : 'expand_more'" :size="16" class="text-neutral-500 shrink-0"/></button><div class="px-4 pb-3 space-y-2"><label v-for="side in ['local', 'remote']" :key="side" class="flex items-start gap-3 p-2.5 rounded-xl cursor-pointer transition-colors" :class="choices[sec.key] === side ? (side==='local' ? 'bg-primary/10 border border-primary/30' : 'bg-secondary/10 border border-secondary/30') : 'bg-white/3 border border-white/5 hover:bg-white/5'"><input type="radio" :name="'sec-'+sec.key" :value="side" v-model="choices[sec.key]" class="radio radio-xs mt-0.5 shrink-0" :class="side==='local' ? 'radio-primary' : 'radio-secondary'"><div class="flex-1 min-w-0"><div class="flex-row-gap"><span class="text-xs font-bold uppercase tracking-wide" :class="side==='local' ? 'text-primary' : 'text-secondary'">{{ side }}</span><span class="text-xs text-neutral-500 font-mono">{{ fmtAgo(pendingConflict[side]?._syncMeta?.[sec.key]?.updatedAt) }}</span><span v-if="(pendingConflict[side]?._syncMeta?.[sec.key]?.updatedAt || 0) >= (pendingConflict[side==='local'?'remote':'local']?._syncMeta?.[sec.key]?.updatedAt || 0)" class="badge badge-xs badge-ghost text-neutral-500">newer</span></div><p v-if="pendingConflict[side]?.[sec.key]" class="text-xs text-neutral-400 mt-1 font-mono truncate">{{ sec.previewFn(pendingConflict[side][sec.key]) }}</p></div></label></div><transition name="fade"><div v-if="expanded[sec.key]" class="px-4 pb-3 border-t border-white/5 pt-3"><div class="grid grid-cols-2 gap-2"><div v-for="side in ['local','remote']" :key="side" class="bg-base-300/50 rounded-lg p-2.5"><p class="text-xs font-bold uppercase tracking-wide mb-1.5" :class="side==='local' ? 'text-primary' : 'text-secondary'">{{ side }}</p><pre class="text-[10px] text-neutral-400 font-mono leading-relaxed overflow-auto max-h-40 custom-scroll">{{ redactedJson(pendingConflict[side]?.[sec.key]) }}</pre></div></div></div></transition></div><div v-else class="flex items-center gap-3 px-4 py-2.5 glass-nested rounded-xl border border-white/5 opacity-50"><material-icon :icon="sec.icon" :size="16" class="text-neutral-500 shrink-0"/><span class="text-xs text-neutral-500 flex-1">{{ sec.label }}</span><span class="flex items-center gap-1 text-xs text-success"><material-icon icon="check_circle" :size="14"/>In sync</span></div></template></div><div class="p-4 border-t border-white/10 flex items-center gap-3 shrink-0 justify-end"><button @click="cancel" class="btn btn-ghost btn-sm btn-wborder">Cancel</button><button @click="apply" class="btn btn-sm btn-primary gap-2"><material-icon icon="check" :size="16"/>Apply & Push </button></div></div></div></transition></teleport>`
         };
-        const _SYNCED_ITEMS = _CONFLICT_SECTIONS.map(s => ({icon: s.icon, label: s.label}));
-        const _NOT_SYNCED_ITEMS = ['UI layout & panel states','Session state','Gen history','Nano Banana params (per-chat)'];
+        const _SYNCED_ITEMS = [..._CONFLICT_SECTIONS.map(s => ({icon: s.icon, label: s.label})), {icon: 'chat', label: 'Nano Banana conversation list'}];
+        const _NOT_SYNCED_ITEMS = ['UI layout & panel states','Session state','Gen history'];
         const Settings = {
             setup() {
                 const appStore = useAppStore();
@@ -1959,6 +1966,12 @@ const TagCountBadge={
                     await imageStore.init();
                     await geminiAPI.initFromStorage();
                     imageStore.cleanupOrphanedImages(geminiAPI.savedConversations.value).catch(() => {});
+                    const _debouncedAutoSync = useDebounceFn(() => {
+                        const js = config.value.jssync;
+                        if (!js.autoSync || !syncToken.value || !js.gistId) return;
+                        if (syncStore.syncStatus.value === 'conflict') return;
+                        syncStore.syncNow();
+                    }, 60000);
                     watch(
                         () => {
                             const c = config.value;
@@ -1968,12 +1981,12 @@ const TagCountBadge={
                                 c.danbooru
                             ];
                         },
-                        useDebounceFn(() => {
-                            const js = config.value.jssync;
-                            if (!js.autoSync || !syncToken.value || !js.gistId) return;
-                            if (syncStore.syncStatus.value === 'conflict') return;
-                            syncStore.syncNow();
-                        }, 60000),
+                        _debouncedAutoSync,
+                        { deep: true }
+                    );
+                    watch(
+                        () => [geminiAPI.savedConversations.value, geminiAPI.conversationGists.value],
+                        _debouncedAutoSync,
                         { deep: true }
                     );
                 });
