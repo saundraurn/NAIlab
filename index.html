@@ -371,7 +371,15 @@
                 if (!token || !gistId) return;
                 syncStatus.value = 'pulling'; syncError.value = null;
                 try {
-                    const gistData = await gistRequest(token, 'GET', `https://api.github.com/gists/${gistId}`);
+                    const pullHeaders = getHeaders(token);
+                    if (cfg.jssync.lastPulledEtag) pullHeaders['If-None-Match'] = cfg.jssync.lastPulledEtag;
+                    const pullRes = await fetch(`https://api.github.com/gists/${gistId}`, { method: 'GET', headers: pullHeaders });
+                    if (pullRes.status === 304) { syncStatus.value = 'idle'; return; }
+                    if (pullRes.status === 404) throw new Error('Gist not found. Check your Gist ID.');
+                    if (pullRes.status === 401) throw new Error('Invalid GitHub token. Check your PAT.');
+                    if (!pullRes.ok) throw new Error(`GET gist failed: ${pullRes.status}`);
+                    const pulledEtag = pullRes.headers.get('ETag') || '';
+                    const gistData = await pullRes.json();
                     const fileContent = gistData.files?.['nailab-config.json']?.content;
                     if (!fileContent) { syncStatus.value = 'idle'; return; }
                     const remote = JSON.parse(fileContent);
@@ -424,7 +432,7 @@
                         });
                         toast.ok(`Pulled ${_.size(autoMerged)} updated section(s).`, 'sync', 3000);
                     }
-                    _stampSyncTime(cfg, gistData.updated_at);
+                    _stampSyncTime(cfg, pulledEtag);
                     lastPushedContent.value = fileContent;
                     syncStatus.value = 'idle';
                 } catch (e) {
