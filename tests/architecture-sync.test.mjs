@@ -30,6 +30,8 @@ test('per-conversation gist sync primitives are present', () => {
   assert.match(html, /const _syncConversationToItsGist = async \(id\) =>/);
   assert.match(html, /const syncConversationNow = async \(id\) =>/);
   assert.match(html, /const deleteConversationGist = async \(id\) =>/);
+  assert.match(html, /const _patchConvoText = async \(gistId, convoJson\) =>/);
+  assert.match(html, /const _pushConvoImages = async \(gistId, imageIds, localFs\) =>/);
 });
 
 test('config sync path no longer syncs conversations directly', () => {
