@@ -1053,7 +1053,7 @@ const TagCountBadge={
                         if (c?.messages) {
                             try {
                                 await _writeConvoToLfs(lfs, c.id, c.messages);
-                                convos[convos.indexOf(c)] = _.pick(c, CONVO_META_KEYS);
+                                const i = convos.indexOf(c); if (i > -1) convos[i] = _.pick(c, CONVO_META_KEYS);
                             } catch (e) { console.warn('Migration failed for convo', c.id, e); }
                         }
                     }
