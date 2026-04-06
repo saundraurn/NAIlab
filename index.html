@@ -506,7 +506,7 @@
                 syncStatus.value = 'idle';
                 return withFlag(isSyncing, () => push(false));
             };
-            return { isSyncing, syncStatus, syncError, pendingConflict, lastPushedContent, pull, push, syncNow, createAndSetGist, resolveConflict };
+            return { isSyncing, syncStatus, syncError, pendingConflict, pull, push, syncNow, createAndSetGist, resolveConflict };
         });
         const TAG_COLORS={artist:['badge-warning','bg-warning/20'],character:['badge-success','bg-success/20'],copyright:['badge-accent','bg-accent/20'],meta:['badge-info','bg-info/20'],default:['badge-primary','bg-primary/20']};
         const useDropdown=()=>{const isOpen=ref(false),root=ref(null);return{isOpen,root,close:()=>{isOpen.value=false;if(document.activeElement&&root.value?.contains(document.activeElement))document.activeElement.blur();}};};
