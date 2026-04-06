@@ -21,7 +21,6 @@
     <script src="https://unpkg.com/vue-router@4"></script>
     <script src="https://unpkg.com/@vueuse/shared"></script>
     <script src="https://unpkg.com/@vueuse/core"></script>
-    <!-- CDN UMD builds require both: core depends on shared primitives not re-exported in UMD -->
     <script src="https://unpkg.com/fflate/umd/index.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js"></script>
     <script src="https://unpkg.com/textarea-caret@3.1.0/index.js"></script>
@@ -68,8 +67,6 @@
             .empty-notice { color:oklch(var(--bc)/.5);font-size:.75rem;text-align:center;padding:.5rem 0;pointer-events:none; }
             .two-col-grid { @apply grid grid-cols-2 gap-3; }
             .dim-input {
-                /* Replaces broken @apply join-item input input-sm input-bordered w-full text-center text-sm */
-                /* 'input input-sm input-bordered join-item' are DaisyUI CDN classes; @apply can't reach them */
                 display: flex;
                 align-items: center;
                 width: 100%;
@@ -88,12 +85,10 @@
                 outline: none;
                 flex: 1 1 0%;
             }
-            /* Replicate join-item radius clipping for .dim-input inside .join */
             .join > .dim-input:not(:first-child):not(:last-child) { border-radius: 0; }
             .join > .dim-input:first-child:not(:only-child) { border-start-end-radius: 0; border-end-end-radius: 0; }
             .join > .dim-input:last-child:not(:only-child) { border-start-start-radius: 0; border-end-start-radius: 0; }
             .dim-input:focus { outline: 2px solid oklch(var(--p) / 0.5); outline-offset: 0; }
-            /* counter-arrow-btn: avoid @apply hover: variants which Tailwind CDN can't process in @apply */
             .counter-arrow-btn { display:flex; align-items:center; justify-content:center; height: 1rem; width: 1.25rem; color: rgb(163 163 163); transition: color 150ms, background-color 150ms; }
             .counter-arrow-btn:hover { background-color: rgb(255 255 255 / 0.1); color: white; }
             .counter-arrow-btn:active { background-color: rgb(255 255 255 / 0.2); }
@@ -124,7 +119,7 @@
         const _t=(msg,type,source,duration)=>useAppStore().addToast({msg,type,source,duration});
         const toast={ok:(msg,src,dur=3000)=>_t(msg,'success',src,dur),err:(msg,src)=>_t(msg,'error',src),warn:(msg,src,dur=4000)=>_t(msg,'warning',src,dur),info:(msg,src,dur=3000)=>_t(msg,'info',src,dur),q:(msg,dur=2000)=>_t(msg,'success',undefined,dur)};
         const splitTagString = (str) => _.compact((str || '').split(' '));
-        const TAG_CATEGORIES = ['artist', 'copyright', 'character', 'general', 'meta'];
+        const TAG_CATEGORIES = 'artist,copyright,character,general,meta'.split(',');
         const getPostTags = (post) => TAG_CATEGORIES.flatMap(type =>
             splitTagString(post[`tag_string_${type}`]).map(name => ({name, type}))
         );
@@ -142,14 +137,9 @@
         ];
         const SYNC_DATA_SECTIONS = _CONFLICT_SECTIONS.map(s => s.key);
         const _normalizeArrayFields = (cfg) => {
-            if (!Array.isArray(cfg.savedConversations)) cfg.savedConversations = _ensureArray(cfg.savedConversations);
-            cfg.savedConversations = cfg.savedConversations.map(c => {
-                if (!c || typeof c !== 'object') return c;
-                return _.pick(c, CONVO_META_KEYS);
-            });
+            cfg.savedConversations = _ensureArray(cfg.savedConversations).map(c => c && typeof c === 'object' ? _.pick(c, CONVO_META_KEYS) : c);
         };
         const uid = () => crypto.randomUUID();
-        // lodash mergeWith corrupts arrays into {0:x,1:y} objects; Object.values() recovers data
         const _ensureArray = (val) => Array.isArray(val) ? val : Object.values(val || {});
         const imgSrc = (img) => img?._previewUrl || (img?.data ? `data:${img.mimeType};base64,${img.data}` : '');
         const uint8ArrayToBase64 = arr => btoa(fflate.strFromU8(arr, true));
@@ -179,7 +169,7 @@
             if (!usage) return null;
             const p = _MODEL_PRICING[model] || _MODEL_PRICING[_FM];
             const d = usage.candidatesTokensDetails?.find(d => d.modality === 'IMAGE');
-            const imgT = d != null ? (d.tokenCount || 0) : (imageCount || 0) * (_GEMINI_IMG_TOKENS[imageSize] || _GEMINI_IMG_TOKENS['1K']);
+            const imgT = d ? (d.tokenCount || 0) : (imageCount || 0) * (_GEMINI_IMG_TOKENS[imageSize] || _GEMINI_IMG_TOKENS['1K']);
             const cost = ((usage.promptTokenCount || 0) * p.inPerM + Math.max(0, (usage.candidatesTokenCount || 0) - imgT) * p.txtPerM + imgT * p.imgPerM) / 1e6;
             return isFlexInference ? cost * 0.5 : cost;
         };
@@ -198,7 +188,7 @@
         // Migration: API renamed from snake_case to camelCase; saved data may use either
         const getThoughtSig = (p) => p.thoughtSignature || p.thought_signature;
         const setVarError = (v, err, extra) => { if (!v) return; v._error = err; v.timestamp = Date.now(); extra && Object.assign(v, extra); };
-        const _stampSyncTime = (cfg, etag) => { cfg.jssync.lastSyncedAt = Date.now(); cfg.jssync.lastPulledEtag = etag || ''; };
+        const _stampSyncTime = (cfg, etag) => (cfg.jssync.lastSyncedAt = Date.now(), cfg.jssync.lastPulledEtag = etag || '');
         const useAppStore = createGlobalState(() => {
             const config = useLocalStorage('nai-app-settings', {
                 tagTest: {iterations:1, isInfinite:false, isControl:true, prompts:[{id:1, val:'1girl, solo, wearing casual clothes'}], nextPromptId:2, unwantedContent:'multiple views, monochrome, black and white, looking at viewer, pov', tagsToTest:'sunset lighting\nwarm colors\nnight scene\nfog\nrain', tagPos:'beginning', tagTarget:'prompt', tagStrength:1.0, hasExtendedRange:false, areTagsVisible:false, shouldFilterMiddleResults:false},
@@ -218,10 +208,7 @@
             SYNC_DATA_SECTIONS.forEach(section => {
                 watch(() => config.value[section], () => {
                     if (isSyncMerging.value || !config.value._syncMeta) return;
-                    if (!config.value._syncMeta[section]) {
-                        config.value._syncMeta[section] = { rev: 0, updatedAt: 0 };
-                    }
-                    const meta = config.value._syncMeta[section];
+                    const meta = config.value._syncMeta[section] ??= { rev: 0, updatedAt: 0 };
                     meta.rev = (meta.rev || 0) + 1;
                     meta.updatedAt = Date.now();
                 }, {deep: true});
@@ -377,15 +364,10 @@
             const syncStatus = ref('idle');
             const pendingConflict = ref(null);
             const lastPushedContent = ref(null);
-            const mergeWithArrayReplace = (obj, src) => {
-                // lodash mergeWith treats arrays as objects; guard by cloning arrays directly
-                if (_.isArray(src)) return _.cloneDeep(src);
-                return _.mergeWith({}, obj, src, (_objVal, srcVal) => _.isArray(srcVal) ? _.cloneDeep(srcVal) : undefined);
-            };
             const appStore = useAppStore();
             const _finalizePush = (cfg, etag) => {
                 _stampSyncTime(cfg, etag);
-                if (!cfg.jssync.lastSyncedRevs) cfg.jssync.lastSyncedRevs = {};
+                cfg.jssync.lastSyncedRevs ??= {};
                 SYNC_DATA_SECTIONS.forEach(k => { cfg.jssync.lastSyncedRevs[k] = cfg._syncMeta?.[k]?.rev || 0; });
             };
             const withFlag = (f, fn) => { f.value = true; return Promise.resolve().then(fn).finally(() => { f.value = false; }); };
@@ -393,7 +375,7 @@
             const _applySectionDict = (cfg, dict) => {
                 _.forOwn(dict, (val, key) => {
                     if (key === '_syncMeta') return;
-                    const merged = mergeWithArrayReplace(cfg[key], val);
+                    const merged = _.isArray(val) ? _.cloneDeep(val) : _.mergeWith({}, cfg[key], val, (_o, s) => _.isArray(s) ? _.cloneDeep(s) : undefined);
                     if (_.isPlainObject(merged) && _.isPlainObject(cfg[key])) { Object.assign(cfg[key], merged); }
                     else { cfg[key] = merged; }
                 });
@@ -470,7 +452,7 @@
                                     if (remote._syncMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remote._syncMeta[k]);
                                 });
                             }
-                            if (!cfg.jssync.lastSyncedRevs) cfg.jssync.lastSyncedRevs = {};
+                            cfg.jssync.lastSyncedRevs ??= {};
                             _.forOwn(autoMerged, (_, k) => {
                                 cfg.jssync.lastSyncedRevs[k] = remoteMeta[k]?.rev || 0;
                             });
@@ -705,7 +687,7 @@ const TagCountBadge={
             },
             template: `<div class="toast toast-bottom toast-end z-[1000] p-4 pointer-events-none"><transition-group name="list" tag="div" class="flex flex-col items-end space-y-2"><div v-for="toast in toasts" :key="toast.id" class="alert shadow-lg w-fit max-w-md cursor-pointer flex border border-white/10 text-white pointer-events-auto" :class="[toastConfig[toast.type] || '', 'bg-opacity-80 backdrop-blur-md']" @click="removeToast(toast.id)"><span> {{toast.msg}} <span v-if="toast.count > 1" class="font-bold text-sm"> (x{{toast.count}})</span><span v-if="toast.source && toast.source !== 'default'" class="text-xs opacity-75 ml-1">(from {{toast.source}})</span></span></div></transition-group></div>`
         };
-        const _GEN_SAMPLERS = ['k_euler_ancestral', 'k_euler', 'k_dpmpp_2s_ancestral', 'k_dpmpp_2m_sde', 'k_dpmpp_2m', 'k_dpmpp_sde', 'ddim_v3', 'ddim'];
+        const _GEN_SAMPLERS = 'k_euler_ancestral,k_euler,k_dpmpp_2s_ancestral,k_dpmpp_2m_sde,k_dpmpp_2m,k_dpmpp_sde,ddim_v3,ddim'.split(',');
         const _GEN_SCHEDULERS = ['karras','exponential','polyexponential'].map(v=>({val:v,text:v[0].toUpperCase()+v.slice(1)}));
         const GenerationSettingsPanel = {
             props: {config: {type: Object, required: true}},
@@ -832,12 +814,12 @@ const TagCountBadge={
                         toast.ok(`Saved "${name}".`, 'danbooru');
                         savedSearchName.value = '';
                     },
-                    load: (item) => { searchQueryInput.value = item.prompt; savedSearchName.value = item.name; search(); },
-                    delete: (item) => { _.pull(savedSearches.value, item); toast.info(`Deleted "${item.name}".`, 'danbooru'); },
+                    load: (item) => (searchQueryInput.value = item.prompt, savedSearchName.value = item.name, search()),
+                    delete: (item) => (_.pull(savedSearches.value, item), toast.info(`Deleted "${item.name}".`, 'danbooru')),
                 };
                 const savedSearchAction = (action, item) => _savedSearchActions[action]?.(item);
                 const addTagToSearch = (t) => searchQueryInput.value = _.uniq([..._.compact((searchQueryInput.value||'').split(',').map(x => x.trim())), t.replace(/_/g, ' ')]).join(', ');
-                const searchSingleTag = (t) => { searchQueryInput.value = t.replace(/_/g, ' '); search(); };
+                const searchSingleTag = (t) => (searchQueryInput.value = t.replace(/_/g, ' '), search());
                 const toggleTagInSearch = (tag, searchItem) => { const raw = tag.replace(/ /g, '_'), p = searchItem.prompt || ''; if (p.includes('|')) { searchItem.prompt = _.xorBy(_.compact(p.split('|').map(x => x.trim())), [raw], _.toLower).join(' | '); } else { const r = new RegExp(`(^|\\s)${_.escapeRegExp(raw)}($|\\s)`, 'i'); searchItem.prompt = r.test(p) ? p.replace(r, ' ').trim() : (p ? `${p} | ${raw}` : raw); } toast.ok(`Updated "${searchItem.name}"`, 'danbooru', 1000); };
                 useInfiniteScroll(rightPanelRef, () => _.some(ratingFilters.value) && !isLoading.value && hasMorePages.value && gridRoutes.includes(route.name) && fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []), {distance: 1000});
                 const fetchedSinglePost = ref(null);
@@ -850,7 +832,6 @@ const TagCountBadge={
                     danbooru, isLoading, search, searchQueryInput, displayedImage, rightPanelRef, newFolderName, isEditMode, handleFolderButtonPress, goToFolder, activeFolderId, naiTagKnowledge, blacklist, sortOrder, ratingFilters, ratingMeta, savedSearches, savedSearchName, savedSearchAction, featuredArtist,
                     folderBtn: computed(() => isEditMode.value ? {icon: 'check', color: 'btn-info text-white'} : (newFolderName.value.trim() ? {icon: 'create_new_folder', color: 'btn-success text-white'} : {icon: 'drive_file_rename_outline', color: 'btn-ghost bg-white/5'})),
                     displayedTags: computed(() => { const tags = displayedImage.value ? getPostTags(displayedImage.value) : []; return featuredArtist.value ? _.reject(tags, {name: featuredArtist.value.name, type: 'artist'}) : tags; }),
-                    addTagToSearch, searchSingleTag, toggleTagInSearch,
                     deleteFolder: (f) => { _.remove(danbooru.value.folders, x => x.id === f.id); toast.info(`Deleted "${f.name}"`, 'danbooru'); if (activeFolderId.value === f.id) router.push({name: 'danbooru-grid'}); },
                     debouncedRenameFolder: useDebounceFn((f, n) => { if (!n.trim()) return toast.err('Empty name.', 'danbooru'); if (danbooru.value.folders.some(x => x.id !== f.id && x.name.toLowerCase() === n.trim().toLowerCase())) return toast.err('Name taken.', 'danbooru'); if (foldersById.value[f.id]) foldersById.value[f.id].name = n.trim(); }, 500),
                     updateRatings: (t) => ratingFilters.value = _.mapValues(ratingFilters.value, (v, k) => !t || k === t),
@@ -1028,7 +1009,7 @@ const TagCountBadge={
             }));
             return { messages };
         };
-        const CANDIDATE_BLOCK_REASONS = new Set(['SAFETY','IMAGE_SAFETY','IMAGE_PROHIBITED_CONTENT','PROHIBITED_CONTENT','RECITATION','IMAGE_RECITATION','OTHER','IMAGE_OTHER','NO_IMAGE','BLOCKLIST','SPII']);
+        const CANDIDATE_BLOCK_REASONS = new Set('SAFETY,IMAGE_SAFETY,IMAGE_PROHIBITED_CONTENT,PROHIBITED_CONTENT,RECITATION,IMAGE_RECITATION,OTHER,IMAGE_OTHER,NO_IMAGE,BLOCKLIST,SPII'.split(','));
         const TERMINAL_FINISH_REASONS = new Set(['LANGUAGE','MODEL_ARMOR']);
         const useGeminiAPI = createGlobalState(() => {
             const store = useAppStore();
@@ -1069,11 +1050,10 @@ const TagCountBadge={
                 if (lfs) {
                     const convos = getList() || [];
                     for (const c of convos) {
-                        if (c && c.messages) {
+                        if (c?.messages) {
                             try {
                                 await _writeConvoToLfs(lfs, c.id, c.messages);
-                                const idx = convos.indexOf(c);
-                                if (idx !== -1) convos[idx] = _.pick(c, CONVO_META_KEYS);
+                                const i = convos.indexOf(c); if (i > -1) convos[i] = _.pick(c, CONVO_META_KEYS);
                             } catch (e) { console.warn('Migration failed for convo', c.id, e); }
                         }
                     }
@@ -1368,11 +1348,11 @@ const TagCountBadge={
                 imageStore.cleanupOrphanedImages().catch(() => {});
             };
             const renameConversation = (id, newTitle) => {
-                if (!newTitle || !newTitle.trim()) return;
+                const t = newTitle?.trim(); if (!t) return;
                 const convo = conversationMap.get(id);
-                if (convo) convo.title = newTitle.trim();
-                const savedConvo = _.find(savedConversations.value, {id});
-                if (savedConvo) savedConvo.title = newTitle.trim();
+                if (convo) convo.title = t;
+                const s = _.find(savedConversations.value, {id});
+                if (s) s.title = t;
             };
             const pruneNoImageMessages = () => withActiveConvo(convo => {
                 const genMsgId = convo.generatingMsgId;
@@ -1423,7 +1403,7 @@ const TagCountBadge={
         const _BANANA_IMAGE_SIZES = ['0.5K','1K','2K','4K'];
         const ChatMessage = {
             props: ['msg', 'editState', 'filterNoImage'],
-            emits: ['open-lightbox', 'update:editState', 'request-edit-upload', 'use-as-input'],
+            emits: ['open-lightbox', 'update:editState', 'request-edit-upload'],
             setup(props, {emit}) {
                 const store = useAppStore();
                 const {generating, generatingMsgId, generatingVarIdx, regenerateMessage, regenerateUserMessage, deleteMessage, deleteAllVariants, toggleHiddenFromModel} = useGeminiAPI();
@@ -1527,8 +1507,6 @@ const TagCountBadge={
                     if (img?._previewUrl) URL.revokeObjectURL(img._previewUrl);
                     pendingImages.value.splice(idx, 1);
                 };
-                const useAsInput = (img) => { pendingImages.value.push({data: img.data, mimeType: img.mimeType, name: 'generated.webp'}); toast.q('Image added as reference'); };
-                const useAsInputFromSrc = (src) => { const m = src.match(/^data:([^;]+);base64,(.+)$/); if (m) { pendingImages.value.push({mimeType: m[1], data: m[2], name: 'image.png'}); toast.q('Image added as reference'); } };
                 const autoResize = (e) => { const ta = e.target; ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 160)+'px'; };
                 const onKeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!generating.value) doSend(); } };
                 const onPaste = (e) => { const items = e.clipboardData?.items; if (!items) return; for (const item of items) { if (item.type.startsWith('image/')) { const file = item.getAsFile(); if (file) handleFileUpload([file]); break; } } };
@@ -1579,7 +1557,7 @@ const TagCountBadge={
                     aspectRatios: _BANANA_ASPECT_RATIOS,
                     imgSrc, newChat, abort, doSend, isHydrating,
                     openFile, openEditFile, onFileInput,
-                    removePendingImage, useAsInput, useAsInputFromSrc, downloadImage,
+                    removePendingImage, downloadImage,
                     autoResize, onKeydown, onPaste,
                     activeConvoId, conversationMap,
                     openConversations, closedSavedConversations,
