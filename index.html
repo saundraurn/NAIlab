@@ -147,7 +147,7 @@
         const _RETRY_CODES = new Set([429, 500, 502, 503, 504]);
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
-        const _META_KEYS = ['id', 'title', 'timestamp'];
+        const _META_KEYS = ['id', 'title', 'timestamp', 'preview'];
         // Migration: API renamed from snake_case to camelCase; saved data may use either
         const getThoughtSig = (p) => p.thoughtSignature || p.thought_signature;
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
@@ -387,25 +387,22 @@
                     const autoMerged = {};
                     _SYNC_KEYS.forEach(key => {
                         if (!remote[key]) return;
-                        const isDifferent = !_.isEqual(local[key], remote[key]);
-                        if (!isDifferent) return;
                         const localRev = localMeta[key]?.rev || 0;
                         const remoteRev = remoteMeta[key]?.rev || 0;
                         const lastRev = lastSyncedRevs[key] || 0;
                         const localChanged = localRev > lastRev;
                         const remoteChanged = remoteRev > lastRev;
                         if (localChanged && remoteChanged) {
-                            conflicts.push(key);
+                            if (!_.isEqual(local[key], remote[key])) conflicts.push(key);
                         } else if (remoteChanged) {
                             autoMerged[key] = remote[key];
-                        } else if (!localChanged && !remoteChanged) {
-                            // Content differs with no rev history on either side → treat as conflict
+                        } else if (!localChanged && !remoteChanged && !_.isEqual(local[key], remote[key])) {
                             conflicts.push(key);
                         }
                     });
                     if (conflicts.length > 0) {
                         pendingConflict.value = {
-                            local: extractSyncPayload(cfg),
+                            local,
                             remote,
                             conflictKeys: conflicts
                         };
@@ -430,20 +427,38 @@
                     }
                     if (remote._conversations || remote._conversationGists) {
                         const gemini = useGeminiAPI();
+                        const staleConvoIds = [];
                         if (remote._conversations) {
                             const localById = _.keyBy(gemini.savedConversations.value, 'id');
                             for (const rc of remote._conversations) {
                                 const lc = localById[rc.id];
                                 if (!lc) { localById[rc.id] = rc; }
-                                else if ((rc.timestamp || 0) > (lc.timestamp || 0)) { Object.assign(lc, rc); }
+                                else if ((rc.timestamp || 0) > (lc.timestamp || 0)) {
+                                    Object.assign(lc, rc);
+                                    staleConvoIds.push(rc.id);
+                                }
                             }
                             gemini.savedConversations.value = Object.values(localById);
                         }
                         if (remote._conversationGists) {
-                            gemini.conversationGists.value = { ...remote._conversationGists, ...gemini.conversationGists.value };
+                            gemini.conversationGists.value = { ...gemini.conversationGists.value, ...remote._conversationGists };
                         }
-                        cfg.jssync._lastPushedConvos = _.cloneDeep(gemini.savedConversations.value);
-                        cfg.jssync._lastPushedConvoGists = _.cloneDeep(gemini.conversationGists.value);
+                        // Invalidate stale local LFS cache for conversations updated remotely
+                        if (staleConvoIds.length) {
+                            const lfs = useImageStore().getLfs();
+                            if (lfs) {
+                                for (const id of staleConvoIds) {
+                                    const gistId = gemini.conversationGists.value[id];
+                                    if (!gistId) continue;
+                                    try {
+                                        const freshData = await gemini.fetchConversationFromGist(gistId);
+                                        if (freshData) await lfs.promises.writeFile(_convoPath(id), JSON.stringify(freshData));
+                                    } catch (e) { console.warn(`Failed to refresh conversation ${id} from gist ${gistId}:`, e); }
+                                }
+                            }
+                        }
+                        cfg.jssync._lastPushedConvos = JSON.stringify(gemini.savedConversations.value);
+                        cfg.jssync._lastPushedConvoGists = JSON.stringify(gemini.conversationGists.value);
                     }
                     _stampSyncTime(cfg, pulledEtag);
                     syncStatus.value = 'idle';
@@ -464,13 +479,13 @@
                     const gemini = useGeminiAPI();
                     payload._conversations = gemini.savedConversations.value;
                     payload._conversationGists = gemini.conversationGists.value;
-                    const convoChanged = !_.isEqual(payload._conversations, cfg.jssync._lastPushedConvos) || !_.isEqual(payload._conversationGists, cfg.jssync._lastPushedConvoGists);
+                    const convoChanged = JSON.stringify(payload._conversations) !== cfg.jssync._lastPushedConvos || JSON.stringify(payload._conversationGists) !== cfg.jssync._lastPushedConvoGists;
                     if (!hasLocalChanges && !convoChanged) { syncStatus.value = 'idle'; return; }
                     const content = JSON.stringify(payload);
                     const [, pushedEtag] = await gistRequest(token, 'PATCH', `https://api.github.com/gists/${gistId}`, { files: { ['nailab-config.json']: { content } } });
                     _finalizePush(cfg, pushedEtag);
-                    cfg.jssync._lastPushedConvos = _.cloneDeep(payload._conversations);
-                    cfg.jssync._lastPushedConvoGists = _.cloneDeep(payload._conversationGists);
+                    cfg.jssync._lastPushedConvos = JSON.stringify(payload._conversations);
+                    cfg.jssync._lastPushedConvoGists = JSON.stringify(payload._conversationGists);
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config pushed to Gist.', 'sync', 2500);
                 } catch (e) {
@@ -492,8 +507,8 @@
                     const [gistData, createdEtag] = await gistRequest(token, 'POST', 'https://api.github.com/gists', { description: 'NAILab Config Sync', public: false, files: { ['nailab-config.json']: { content } } });
                     cfg.jssync.gistId = gistData.id;
                     _finalizePush(cfg, createdEtag);
-                    cfg.jssync._lastPushedConvos = _.cloneDeep(payload._conversations);
-                    cfg.jssync._lastPushedConvoGists = _.cloneDeep(payload._conversationGists);
+                    cfg.jssync._lastPushedConvos = JSON.stringify(payload._conversations);
+                    cfg.jssync._lastPushedConvoGists = JSON.stringify(payload._conversationGists);
                     syncStatus.value = 'idle';
                     toast.ok('Gist created! ID saved.', 'sync');
                     return gistData.id;
@@ -914,9 +929,9 @@ const TagCountBadge={
                                 img.mimeType = _WP;
                             }
                         }
-                        return { id: img.id, imageId: img.imageId, mimeType: _WP, name: img.name || '', hidden: !!img.hidden };
+                        return { id: img.id, imageId: img.imageId, ...(img.name ? {name: img.name} : {}), ...(img.hidden ? {hidden: true} : {}) };
                     }));
-                    return { id: msg.id, role: 'user', text: msg.text || '', images: serializedImages, hidden: !!msg.hidden };
+                    return { id: msg.id, role: 'user', text: msg.text || '', images: serializedImages, ...(msg.hidden ? {hidden: true} : {}) };
                 }
                 if (msg.role === 'model') {
                     const serializedVariants = await Promise.all((msg.variants || []).map(async (v) => {
@@ -930,7 +945,7 @@ const TagCountBadge={
                                     if (v._images?.[inlineDataCount]) v._images[inlineDataCount].imageId = imageId;
                                 }
                                 inlineDataCount++;
-                                const sPart = { _imageRef: imageId, _mimeType: _WP };
+                                const sPart = { _imageRef: imageId };
                                 if (part.thought) sPart.thought = true;
                                 const _sig = getThoughtSig(part); if (_sig) sPart._thoughtSignature = _sig;
                                 if (part.text) sPart.text = part.text;
@@ -939,34 +954,33 @@ const TagCountBadge={
                             const _sig2 = getThoughtSig(part); return { text: part.text || '', ...(part.thought ? { thought: true } : {}), ...(_sig2 ? { thoughtSignature: _sig2 } : {}) };
                         }));
                         const serializedImages = (v._images || []).map(img => ({
-                            mimeType: img.mimeType || _WP,
                             imageId: img.imageId || null
                         }));
-                        return {
+                        const sv = {
                             id: v.id,
                             parts: serializedParts,
-                            _text: v._text || '',
-                            _thinking: '',
                             _images: serializedImages,
                             _imageSize: v._imageSize || '1K',
                             _model: v._model || _FM,
-                            _flexInference: !!v._flexInference,
-                            _genTimeMs: v._genTimeMs || null,
-                            _usage: v._usage ? _.omitBy({
-                                promptTokenCount: v._usage.promptTokenCount || 0,
-                                candidatesTokenCount: v._usage.candidatesTokenCount || 0,
-                                candidatesTokensDetails: v._usage.candidatesTokensDetails,
-                                thoughtsTokenCount: v._usage.thoughtsTokenCount
-                            }, _.isNil) : null,
-                            _error: v._error || null,
-                            _blockReason: v._blockReason || null,
-                            _isPromptBlock: !!v._isPromptBlock,
-                            timestamp: v.timestamp || null
                         };
+                        if (v._text) sv._text = v._text;
+                        if (v._flexInference) sv._flexInference = true;
+                        if (v._genTimeMs) sv._genTimeMs = v._genTimeMs;
+                        if (v._usage) sv._usage = _.omitBy({
+                            promptTokenCount: v._usage.promptTokenCount || 0,
+                            candidatesTokenCount: v._usage.candidatesTokenCount || 0,
+                            candidatesTokensDetails: v._usage.candidatesTokensDetails,
+                            thoughtsTokenCount: v._usage.thoughtsTokenCount
+                        }, _.isNil);
+                        if (v._error) sv._error = v._error;
+                        if (v._blockReason) sv._blockReason = v._blockReason;
+                        if (v._isPromptBlock) sv._isPromptBlock = true;
+                        if (v.timestamp) sv.timestamp = v.timestamp;
+                        return sv;
                     }));
-                    return { id: msg.id, role: 'model', variants: serializedVariants, activeVariant: msg.activeVariant || 0, hidden: !!msg.hidden };
+                    return { id: msg.id, role: 'model', variants: serializedVariants, activeVariant: msg.activeVariant || 0, ...(msg.hidden ? {hidden: true} : {}) };
                 }
-                return { id: msg.id, role: msg.role, hidden: !!msg.hidden };
+                return { id: msg.id, role: msg.role, ...(msg.hidden ? {hidden: true} : {}) };
             }));
             return { messages: serializedMessages };
         };
@@ -974,17 +988,17 @@ const TagCountBadge={
             if (!serializedData) return { messages: [] };
             const imageStore = useImageStore();
             const messages = await Promise.all((serializedData.messages || []).map(async (msg) => {
-                const dMsg = { ...msg };
+                const dMsg = { ...msg, hidden: !!msg.hidden };
                 if (dMsg.images && dMsg.images.length > 0) {
                     dMsg.images = await Promise.all(dMsg.images.map(async (img) => {
-                        const dImg = { ...img };
+                        const dImg = { ...img, mimeType: img.mimeType || _WP, hidden: !!img.hidden };
                         if (dImg.imageId) dImg.data = await loadImageAsBase64(dImg.imageId);
                         return dImg;
                     }));
                 }
                 if (dMsg.variants && dMsg.variants.length > 0) {
                     dMsg.variants = await Promise.all(dMsg.variants.map(async (v) => {
-                        const dV = { ...v };
+                        const dV = { ...v, _text: v._text || '', _thinking: v._thinking || '' };
                         dV.parts = await Promise.all(v.parts.map(async (part) => {
                             if (part._imageRef) {
                                 const imgB64 = await loadImageAsBase64(part._imageRef);
@@ -999,8 +1013,9 @@ const TagCountBadge={
                             return textPart;
                         }));
                         dV._images = await Promise.all((v._images || []).map(async (img) => {
-                            if (img.imageId) return { ...img, data: await loadImageAsBase64(img.imageId) };
-                            return img;
+                            const dImg = { ...img, mimeType: img.mimeType || _WP };
+                            if (dImg.imageId) return { ...dImg, data: await loadImageAsBase64(dImg.imageId) };
+                            return dImg;
                         }));
                         dV._model = v._model || _FM;
                         dV._flexInference = !!v._flexInference;
@@ -1188,7 +1203,7 @@ const TagCountBadge={
                     await _writeConvoToLfs(lfs, convo.id, serialized.messages, convo.params);
                     const list = getList();
                     const meta = list.find(c => c.id === convo.id);
-                    if (meta) { meta.timestamp = Date.now(); }
+                    if (meta) { meta.timestamp = Date.now(); meta.preview = _getConvoPreview(convo.messages); }
                 } catch (e) { console.warn('Auto-save failed:', e); }
             };
             const _pruneBananaThinkingStates = (msgIds) => {
@@ -1297,7 +1312,7 @@ const TagCountBadge={
                 const actualTitle = title?.trim() || convo.messages[0]?.text?.substring(0, 40) || 'Untitled Chat';
                 convo.title = actualTitle; convo.isTemp = false;
                 convo.timestamp = Date.now();
-                const meta = { id: convo.id, title: actualTitle, timestamp: convo.timestamp };
+                const meta = { id: convo.id, title: actualTitle, timestamp: convo.timestamp, preview: _getConvoPreview(convo.messages) };
                 const serialized = await serializeConversation(convo.messages);
                 const lfs = imageStore.getLfs();
                 if (lfs) {
@@ -1573,12 +1588,10 @@ const TagCountBadge={
                 _gistSyncInProgress = true;
                 _gistSyncPromise = (async () => {
                     try {
-                        const ids = [..._gistSyncDirty];
+                        const ids = [..._gistSyncDirty].filter(id => conversationGists.value[id]);
                         _gistSyncDirty.clear();
-                        for (const id of ids) {
-                            const gistId = conversationGists.value[id];
-                            if (!gistId) continue;
-                            convoSyncStatus[id] = 'syncing';
+                        ids.forEach(id => { convoSyncStatus[id] = 'syncing'; });
+                        await Promise.allSettled(ids.map(async (id) => {
                             try {
                                 await _syncConversationToItsGist(id);
                                 convoSyncStatus[id] = 'synced';
@@ -1588,7 +1601,7 @@ const TagCountBadge={
                                 const title = savedConversations.value.find(c => c.id === id)?.title || id;
                                 toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
                             }
-                        }
+                        }));
                     } finally {
                         _gistSyncInProgress = false;
                         _gistSyncPromise = null;
@@ -1654,7 +1667,8 @@ const TagCountBadge={
                 isHiddenFromModel, toggleHiddenFromModel,
                 newChat, switchConversation, closeConversation,
                 saveConversation, loadConversation, deleteConversation, renameConversation,
-                createConversationGist, syncConversationNow, deleteConversationGist
+                createConversationGist, syncConversationNow, deleteConversationGist,
+                fetchConversationFromGist: _fetchConvoFromGist
             };
         });
         const HiddenBadge = {template:`<div class="flex items-center gap-1 text-xs text-neutral-500"><material-icon icon="visibility_off" :size="12"/><span>Hidden from model</span></div>`};
@@ -1838,7 +1852,7 @@ const TagCountBadge={
                     fmtAgo, getConvoPreview: _getConvoPreview
                 };
             },
-            template: `<split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #header><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0 w-28"><setting-input v-model="convoParams.aspectRatio" label="Aspect Ratio" type="select" :options="aspectRatios"></setting-input></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></template><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button><icon-btn v-if="syncToken" icon="sync" @click="pullConversations" :disabled="isSyncing" title="Sync conversations from cloud" color="bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300" size="btn-sm"/></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><convo-list-item v-for="convo in openConversations" :key="convo.id" :convo="convo" :is-active="activeConvoId===convo.id" is-open :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&switchConversation(convo.id)" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><span v-if="convo.generating" class="loading loading-spinner loading-xs text-primary shrink-0"></span><material-icon v-else-if="convo.isTemp" icon="schedule" :size="14" class="text-neutral-500 shrink-0"/><span v-else-if="convo._lastGenStatus==='success'" class="w-2 h-2 rounded-full bg-success/60 shrink-0 inline-block"></span><span v-else-if="convo._lastGenStatus==='error'" class="w-2 h-2 rounded-full bg-error/60 shrink-0 inline-block"></span><material-icon v-else icon="bookmark" :size="14" class="text-primary/70 shrink-0"/><span v-if="!convo.isTemp&&conversationGists[convo.id]" class="shrink-0 flex-center w-4 h-4" :title="convoSyncStatus[convo.id]==='error'?'Sync error':convoSyncStatus[convo.id]==='syncing'?'Syncing...':convoSyncStatus[convo.id]==='pending'?'Sync pending':convoSyncStatus[convo.id]==='synced'?'Synced to cloud':'Linked to cloud'"><span v-if="convoSyncStatus[convo.id]==='syncing'" class="loading loading-spinner" style="width:10px;height:10px;color:oklch(var(--in))"></span><material-icon v-else-if="convoSyncStatus[convo.id]==='error'" icon="cloud_off" :size="11" class="text-error/70"/><material-icon v-else-if="convoSyncStatus[convo.id]==='pending'" icon="cloud_upload" :size="11" class="text-info/50"/><material-icon v-else-if="convoSyncStatus[convo.id]==='synced'" icon="cloud_done" :size="11" class="text-success/50"/><material-icon v-else icon="cloud" :size="11" class="text-neutral-500/50"/></span></template><template v-if="convo.messages.length" #preview><span class="truncate flex-1">{{getConvoPreview(convo.messages)}}</span><span class="shrink-0 text-neutral-600 tabular-nums">· {{convo.messages.length}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn v-if="convo.isTemp&&convo.messages.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/><icon-btn v-else-if="!convo.isTemp&&convo.messages.length&&syncToken&&!conversationGists[convo.id]" icon="cloud_upload" @click.stop="syncConversationNow(convo.id)" title="Sync to cloud" color="btn-ghost text-neutral-500 hover:text-primary" size="btn-xs"/><icon-btn icon="close" @click.stop="closeConversation(convo.id)" title="Close" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item><template v-if="closedSavedConversations.length"><div class="divider text-xs text-neutral-600 my-2 select-none">Saved ({{ closedSavedConversations.length }})</div><convo-list-item v-for="convo in closedSavedConversations" :key="convo.id" :convo="convo" :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&loadConversation(convo.id)" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><material-icon icon="bookmark" :size="14" class="text-neutral-500 shrink-0"/><span v-if="conversationGists[convo.id]" class="shrink-0 flex-center w-4 h-4" title="Linked to cloud"><material-icon icon="cloud" :size="11" class="text-neutral-500/50"/></span></template><template #preview><span class="shrink-0 text-neutral-600 tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn icon="delete" @click.stop="deleteConversation(convo.id)" title="Delete" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item></template><div v-if="!openConversations.length && !closedSavedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()"></chat-message></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><image-preview-card v-for="(img, idx) in pendingImages" :key="idx" :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport>`
+            template: `<split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #header><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0 w-28"><setting-input v-model="convoParams.aspectRatio" label="Aspect Ratio" type="select" :options="aspectRatios"></setting-input></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></template><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button><icon-btn v-if="syncToken" icon="sync" @click="pullConversations" :disabled="isSyncing" title="Sync conversations from cloud" color="bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300" size="btn-sm"/></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><convo-list-item v-for="convo in openConversations" :key="convo.id" :convo="convo" :is-active="activeConvoId===convo.id" is-open :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&switchConversation(convo.id)" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><span v-if="convo.generating" class="loading loading-spinner loading-xs text-primary shrink-0"></span><material-icon v-else-if="convo.isTemp" icon="schedule" :size="14" class="text-neutral-500 shrink-0"/><span v-else-if="convo._lastGenStatus==='success'" class="w-2 h-2 rounded-full bg-success/60 shrink-0 inline-block"></span><span v-else-if="convo._lastGenStatus==='error'" class="w-2 h-2 rounded-full bg-error/60 shrink-0 inline-block"></span><material-icon v-else icon="bookmark" :size="14" class="text-primary/70 shrink-0"/><span v-if="!convo.isTemp&&conversationGists[convo.id]" class="shrink-0 flex-center w-4 h-4" :title="convoSyncStatus[convo.id]==='error'?'Sync error':convoSyncStatus[convo.id]==='syncing'?'Syncing...':convoSyncStatus[convo.id]==='pending'?'Sync pending':convoSyncStatus[convo.id]==='synced'?'Synced to cloud':'Linked to cloud'"><span v-if="convoSyncStatus[convo.id]==='syncing'" class="loading loading-spinner" style="width:10px;height:10px;color:oklch(var(--in))"></span><material-icon v-else-if="convoSyncStatus[convo.id]==='error'" icon="cloud_off" :size="11" class="text-error/70"/><material-icon v-else-if="convoSyncStatus[convo.id]==='pending'" icon="cloud_upload" :size="11" class="text-info/50"/><material-icon v-else-if="convoSyncStatus[convo.id]==='synced'" icon="cloud_done" :size="11" class="text-success/50"/><material-icon v-else icon="cloud" :size="11" class="text-neutral-500/50"/></span></template><template v-if="convo.messages.length" #preview><span class="truncate flex-1">{{getConvoPreview(convo.messages)}}</span><span class="shrink-0 text-neutral-600 tabular-nums">· {{convo.messages.length}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn v-if="convo.isTemp&&convo.messages.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/><icon-btn v-else-if="!convo.isTemp&&convo.messages.length&&syncToken&&!conversationGists[convo.id]" icon="cloud_upload" @click.stop="syncConversationNow(convo.id)" title="Sync to cloud" color="btn-ghost text-neutral-500 hover:text-primary" size="btn-xs"/><icon-btn icon="close" @click.stop="closeConversation(convo.id)" title="Close" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item><template v-if="closedSavedConversations.length"><div class="divider text-xs text-neutral-600 my-2 select-none">Saved ({{ closedSavedConversations.length }})</div><convo-list-item v-for="convo in closedSavedConversations" :key="convo.id" :convo="convo" :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&loadConversation(convo.id)" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><material-icon icon="bookmark" :size="14" class="text-neutral-500 shrink-0"/><span v-if="conversationGists[convo.id]" class="shrink-0 flex-center w-4 h-4" title="Linked to cloud"><material-icon icon="cloud" :size="11" class="text-neutral-500/50"/></span></template><template #preview><span v-if="convo.preview" class="truncate flex-1">{{convo.preview}}</span><span class="shrink-0 text-neutral-600 tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn icon="delete" @click.stop="deleteConversation(convo.id)" title="Delete" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item></template><div v-if="!openConversations.length && !closedSavedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()"></chat-message></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><image-preview-card v-for="(img, idx) in pendingImages" :key="idx" :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport>`
         };
         const ConflictResolutionModal = {
             setup() {
