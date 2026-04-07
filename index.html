@@ -393,7 +393,7 @@
                         const localChanged = localRev > lastRev;
                         const remoteChanged = remoteRev > lastRev;
                         if (localChanged && remoteChanged) {
-                            conflicts.push(key);
+                            if (!_.isEqual(local[key], remote[key])) conflicts.push(key);
                         } else if (remoteChanged) {
                             autoMerged[key] = remote[key];
                         } else if (!localChanged && !remoteChanged && !_.isEqual(local[key], remote[key])) {
@@ -451,9 +451,9 @@
                                     const gistId = gemini.conversationGists.value[id];
                                     if (!gistId) continue;
                                     try {
-                                        const freshData = await gemini._fetchConvoFromGist(gistId);
+                                        const freshData = await gemini.fetchConversationFromGist(gistId);
                                         if (freshData) await lfs.promises.writeFile(_convoPath(id), JSON.stringify(freshData));
-                                    } catch {}
+                                    } catch (e) { console.warn(`Failed to refresh conversation ${id} from gist ${gistId}:`, e); }
                                 }
                             }
                         }
@@ -1668,7 +1668,7 @@ const TagCountBadge={
                 newChat, switchConversation, closeConversation,
                 saveConversation, loadConversation, deleteConversation, renameConversation,
                 createConversationGist, syncConversationNow, deleteConversationGist,
-                _fetchConvoFromGist
+                fetchConversationFromGist: _fetchConvoFromGist
             };
         });
         const HiddenBadge = {template:`<div class="flex items-center gap-1 text-xs text-neutral-500"><material-icon icon="visibility_off" :size="12"/><span>Hidden from model</span></div>`};
