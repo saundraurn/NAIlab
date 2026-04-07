@@ -432,28 +432,15 @@
                         const gemini = useGeminiAPI();
                         if (remote._conversations) {
                             const localById = _.keyBy(gemini.savedConversations.value, 'id');
-                            const lfs = useImageStore().getLfs();
-                            const staleReloads = [];
                             for (const rc of remote._conversations) {
                                 const lc = localById[rc.id];
                                 if (!lc) { localById[rc.id] = rc; }
-                                else if ((rc.timestamp || 0) > (lc.timestamp || 0)) {
-                                    Object.assign(lc, rc);
-                                    // Invalidate stale local cache so a later load re-fetches from gist
-                                    if (lfs) lfs.promises.unlink(_convoPath(rc.id)).catch(() => {});
-                                    // If this conversation is currently open, schedule a reload
-                                    if (gemini.activeConvoId?.value === rc.id) staleReloads.push(rc.id);
-                                }
-                            }
-                            // Reload any active conversations that had stale data
-                            for (const rid of staleReloads) {
-                                if (gemini.conversationMap?.has(rid)) gemini.conversationMap.delete(rid);
-                                gemini.loadConversation(rid).catch(() => {});
+                                else if ((rc.timestamp || 0) > (lc.timestamp || 0)) { Object.assign(lc, rc); }
                             }
                             gemini.savedConversations.value = Object.values(localById);
                         }
                         if (remote._conversationGists) {
-                            gemini.conversationGists.value = { ...gemini.conversationGists.value, ...remote._conversationGists };
+                            gemini.conversationGists.value = { ...remote._conversationGists, ...gemini.conversationGists.value };
                         }
                         cfg.jssync._lastPushedConvos = _.cloneDeep(gemini.savedConversations.value);
                         cfg.jssync._lastPushedConvoGists = _.cloneDeep(gemini.conversationGists.value);
@@ -991,7 +978,6 @@ const TagCountBadge={
                 if (dMsg.images && dMsg.images.length > 0) {
                     dMsg.images = await Promise.all(dMsg.images.map(async (img) => {
                         const dImg = { ...img };
-                        if (!dImg.mimeType) dImg.mimeType = _WP;
                         if (dImg.imageId) dImg.data = await loadImageAsBase64(dImg.imageId);
                         return dImg;
                     }));
@@ -1091,7 +1077,7 @@ const TagCountBadge={
             const getMsgParts = (msg) => {
                 if (msg.role === 'model' && msg.variants) { const v = msg.variants[msg.activeVariant] ?? msg.variants[0]; return v ? v.parts : []; }
                 const parts = [];
-                for (const img of (msg.images || [])) { if (!img.hidden && img.data) parts.push({inlineData: {data: img.data, mimeType: img.mimeType || _WP}}); }
+                for (const img of (msg.images || [])) { if (!img.hidden && img.data) parts.push({inlineData: {data: img.data, mimeType: img.mimeType}}); }
                 if (msg.text) parts.push({text: msg.text});
                 return parts;
             };
@@ -1367,7 +1353,8 @@ const TagCountBadge={
                 const token = store.syncToken.value;
                 if (!token) return [...imageIds];
                 const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
-                const tmpFs = new LightningFS(`nailab-convo-pull-${safeGistId}`, { wipe: true });
+                // Unique name per call to avoid lock contention if two pulls race.
+                const tmpFs = new LightningFS(`nailab-convo-pull-${safeGistId}-${Date.now()}`, { wipe: true });
                 const dir = '/repo';
                 try { await tmpFs.promises.mkdir(dir); } catch {}
                 const gitUrl = `https://gist.github.com/${gistId}.git`;
@@ -1579,9 +1566,73 @@ const TagCountBadge={
                 await useSyncStore().push(true);
                 return gistData.id;
             };
-            // Syncs conversation text and images to the gist in a single git
-            // clone → write → commit → push operation, avoiding the race condition
-            // that occurred when a REST API PATCH was followed by a separate git push.
+            const _patchConvoText = async (gistId, convoJson) => {
+                const token = store.syncToken.value;
+                const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+                    method: 'PATCH',
+                    headers: _getGistHeaders(token),
+                    body: JSON.stringify({ files: { 'conversation.json': { content: convoJson } } })
+                });
+                if (!res.ok) throw new Error(`Gist PATCH failed: ${res.status}`);
+            };
+            // Per-gist mutex: serializes concurrent pushes to the same gist to prevent
+            // LightningFS IndexedDB lock contention and git pre-receive rejections.
+            const _pushConvoImageLocks = new Map();
+            const _pushConvoImages = (gistId, imageIds, localFs) => {
+                const prev = _pushConvoImageLocks.get(gistId) || Promise.resolve();
+                const next = prev.then(() => _doPushConvoImages(gistId, imageIds, localFs));
+                _pushConvoImageLocks.set(gistId, next.catch(() => {}));
+                return next;
+            };
+            const _doPushConvoImages = async (gistId, imageIds, localFs) => {
+                const syncedArr = _syncedConvoImages.value[gistId] || [];
+                const syncedSet = new Set(syncedArr);
+                const newImages = [...imageIds].filter(id => !syncedSet.has(id));
+                const maybeOrphaned = syncedArr.filter(id => !imageIds.has(id));
+                if (!newImages.length && !maybeOrphaned.length) return;
+                const corsProxy = _buildCorsProxy();
+                if (!corsProxy) {
+                    throw new Error('A CORS proxy URL is required to sync conversation images.');
+                }
+                const token = store.syncToken.value;
+                const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
+                // Unique FS name per invocation: prevents concurrent calls (e.g. from
+                // createConversationGist racing with _runGistSync) from sharing the same
+                // IndexedDB store and stealing each other's lock.
+                const syncFs = new LightningFS(`nailab-convo-push-${safeGistId}-${Date.now()}`, { wipe: true });
+                const dir = '/repo';
+                try { await syncFs.promises.mkdir(dir); } catch {}
+                const gitUrl = `https://gist.github.com/${gistId}.git`;
+                const authHttp = _makeAuthHttp(token);
+                await window.git.clone({ fs: syncFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1 });
+                // currentBranch throws 'Could not find HEAD' when the clone didn't fully
+                // complete or the gist has no commits yet; default to 'main'.
+                let branch;
+                try { branch = await window.git.currentBranch({ fs: syncFs, dir }); } catch {}
+                branch = branch || 'main';
+                let staged = false;
+                for (const imgId of newImages) {
+                    try {
+                        const imgData = await localFs.promises.readFile('/' + imgId);
+                        await syncFs.promises.writeFile(dir + '/' + imgId, imgData);
+                        await window.git.add({ fs: syncFs, dir, filepath: imgId });
+                        staged = true;
+                    } catch {}
+                }
+                const gistFiles = (await syncFs.promises.readdir(dir)).filter(f => f !== '.git');
+                for (const f of gistFiles) {
+                    if (f.startsWith('img_') && f.endsWith('.webp') && !imageIds.has(f)) {
+                        await window.git.remove({ fs: syncFs, dir, filepath: f });
+                        staged = true;
+                    }
+                }
+                if (!staged) return;
+                await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync images' });
+                // force: true avoids pre-receive hook rejections when a previous push
+                // advanced the remote past this clone's shallow base.
+                await window.git.push({ fs: syncFs, http: authHttp, dir, corsProxy, remote: 'origin', ref: branch, force: true });
+                _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
+            };
             const _syncConversationToItsGist = async (id) => {
                 const token = store.syncToken.value;
                 const gistId = conversationGists.value[id];
@@ -1593,48 +1644,8 @@ const TagCountBadge={
                 catch { throw new Error('Conversation data not found locally.'); }
                 const convoData = JSON.parse(convoJson);
                 const imageIds = _collectImageIds(convoData);
-                const corsProxy = _buildCorsProxy();
-                if (!corsProxy) throw new Error('A CORS proxy URL is required to sync conversations.');
-                const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
-                const syncFs = new LightningFS(`nailab-convo-push-${safeGistId}`, { wipe: true });
-                const dir = '/repo';
-                try { await syncFs.promises.mkdir(dir); } catch {}
-                const gitUrl = `https://gist.github.com/${gistId}.git`;
-                const authHttp = _makeAuthHttp(token);
-                await window.git.clone({ fs: syncFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1 });
-                const branch = await window.git.currentBranch({ fs: syncFs, dir }) || 'main';
-                let staged = false;
-                // Write conversation.json and stage only if its content changed
-                await syncFs.promises.writeFile(dir + '/conversation.json', convoJson, 'utf8');
-                const convoStatus = await window.git.status({ fs: syncFs, dir, filepath: 'conversation.json' });
-                if (convoStatus !== 'unmodified') {
-                    await window.git.add({ fs: syncFs, dir, filepath: 'conversation.json' });
-                    staged = true;
-                }
-                // Write new images
-                const syncedArr = _syncedConvoImages.value[gistId] || [];
-                const syncedSet = new Set(syncedArr);
-                const newImages = [...imageIds].filter(imgId => !syncedSet.has(imgId));
-                for (const imgId of newImages) {
-                    try {
-                        const imgData = await localFs.promises.readFile('/' + imgId);
-                        await syncFs.promises.writeFile(dir + '/' + imgId, imgData);
-                        await window.git.add({ fs: syncFs, dir, filepath: imgId });
-                        staged = true;
-                    } catch (e) { console.warn(`Image sync failed for ${imgId}:`, e); }
-                }
-                // Remove orphaned images
-                const gistFiles = (await syncFs.promises.readdir(dir)).filter(f => f !== '.git');
-                for (const f of gistFiles) {
-                    if (f.startsWith('img_') && f.endsWith('.webp') && !imageIds.has(f)) {
-                        await window.git.remove({ fs: syncFs, dir, filepath: f });
-                        staged = true;
-                    }
-                }
-                if (!staged) return;
-                await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync conversation' });
-                await window.git.push({ fs: syncFs, http: authHttp, dir, corsProxy, remote: 'origin', ref: branch });
-                _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
+                await _patchConvoText(gistId, convoJson);
+                await _pushConvoImages(gistId, imageIds, localFs);
             };
             let _gistSyncInProgress = false;
             let _gistSyncPromise = null;
@@ -2006,10 +2017,10 @@ const TagCountBadge={
                     const jssync = config.value.jssync;
                     const imageStore = useImageStore();
                     const geminiAPI = useGeminiAPI();
-                    await imageStore.init();
                     if (syncToken.value && jssync.gistId) {
                         syncStore.pull().catch(() => {});
                     }
+                    await imageStore.init();
                     await geminiAPI.initFromStorage();
                     imageStore.cleanupOrphanedImages(geminiAPI.savedConversations.value).catch(() => {});
                     const _debouncedAutoSync = useDebounceFn(() => {
