@@ -1363,7 +1363,7 @@ const TagCountBadge={
             };
             // Helper: convert a Uint8Array/Buffer to a base64 data-URI string.
             const _imageToDataUri = (uint8) => {
-                const bytes = new Uint8Array(uint8.buffer || uint8);
+                const bytes = uint8 instanceof Uint8Array ? uint8 : new Uint8Array(uint8);
                 let bin = '';
                 for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
                 return `data:image/webp;base64,${btoa(bin)}`;
@@ -1633,12 +1633,13 @@ const TagCountBadge={
                 let hasChanges = false;
 
                 // 2a. conversation.json — compare with remote to avoid empty revisions.
-                let remoteConvo = existingFiles['conversation.json']?.content ?? null;
-                if ((existingFiles['conversation.json']?.truncated || remoteConvo === null) && existingFiles['conversation.json']?.raw_url) {
+                const convoFile = existingFiles['conversation.json'];
+                let remoteConvo = convoFile?.content ?? null;
+                if ((convoFile?.truncated || remoteConvo === null) && convoFile?.raw_url) {
                     const corsProxy = ghClient.buildCorsProxy();
                     const rawUrl = corsProxy
-                        ? `${corsProxy}/${existingFiles['conversation.json'].raw_url.replace(/^https?:\/\//, '')}`
-                        : existingFiles['conversation.json'].raw_url;
+                        ? `${corsProxy}/${convoFile.raw_url.replace(/^https?:\/\//, '')}`
+                        : convoFile.raw_url;
                     try {
                         const rawRes = await fetch(rawUrl, { headers: { 'Authorization': `Bearer ${token}` } });
                         if (rawRes.ok) remoteConvo = await rawRes.text();
