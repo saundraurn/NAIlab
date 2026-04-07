@@ -432,17 +432,23 @@
                         const gemini = useGeminiAPI();
                         if (remote._conversations) {
                             const localById = _.keyBy(gemini.savedConversations.value, 'id');
-                            const imageStoreRef = useImageStore();
-                            const lfs = imageStoreRef.getLfs();
+                            const lfs = useImageStore().getLfs();
+                            const staleReloads = [];
                             for (const rc of remote._conversations) {
                                 const lc = localById[rc.id];
                                 if (!lc) { localById[rc.id] = rc; }
                                 else if ((rc.timestamp || 0) > (lc.timestamp || 0)) {
                                     Object.assign(lc, rc);
-                                    // Invalidate stale local cache so loadConversation re-fetches from gist
+                                    // Invalidate stale local cache so a later load re-fetches from gist
                                     if (lfs) lfs.promises.unlink(_convoPath(rc.id)).catch(() => {});
-                                    if (gemini.conversationMap?.has(rc.id)) gemini.conversationMap.delete(rc.id);
+                                    // If this conversation is currently open, schedule a reload
+                                    if (gemini.activeConvoId?.value === rc.id) staleReloads.push(rc.id);
                                 }
+                            }
+                            // Reload any active conversations that had stale data
+                            for (const rid of staleReloads) {
+                                if (gemini.conversationMap?.has(rid)) gemini.conversationMap.delete(rid);
+                                gemini.loadConversation(rid).catch(() => {});
                             }
                             gemini.savedConversations.value = Object.values(localById);
                         }
@@ -1615,7 +1621,7 @@ const TagCountBadge={
                         await syncFs.promises.writeFile(dir + '/' + imgId, imgData);
                         await window.git.add({ fs: syncFs, dir, filepath: imgId });
                         staged = true;
-                    } catch {}
+                    } catch (e) { console.warn(`Image sync failed for ${imgId}:`, e); }
                 }
                 // Remove orphaned images
                 const gistFiles = (await syncFs.promises.readdir(dir)).filter(f => f !== '.git');
@@ -2000,10 +2006,10 @@ const TagCountBadge={
                     const jssync = config.value.jssync;
                     const imageStore = useImageStore();
                     const geminiAPI = useGeminiAPI();
+                    await imageStore.init();
                     if (syncToken.value && jssync.gistId) {
                         syncStore.pull().catch(() => {});
                     }
-                    await imageStore.init();
                     await geminiAPI.initFromStorage();
                     imageStore.cleanupOrphanedImages(geminiAPI.savedConversations.value).catch(() => {});
                     const _debouncedAutoSync = useDebounceFn(() => {
