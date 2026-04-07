@@ -128,9 +128,7 @@
             {key:'danbooru', label:'Danbooru Folders & Search', icon:'package_2', previewFn:(s)=>`${s.folders?.length||0} folder(s), ${s.savedSearches?.length||0} saved search(es)`},
         ];
         const _SYNC_KEYS = _CONFLICT_SECTIONS.map(s => s.key);
-        const _normalizeArrayFields = (cfg) => {};
         const uid = () => crypto.randomUUID();
-        const _ensureArray = (val) => Array.isArray(val) ? val : Object.values(val || {});
         const imgSrc = (img) => img?._previewUrl || (img?.data ? `data:${img.mimeType};base64,${img.data}` : '');
         const uint8ArrayToBase64 = arr => btoa(fflate.strFromU8(arr, true));
         const _FM='gemini-3.1-flash-image-preview',_PM='gemini-3-pro-image-preview',_WP='image/webp';
@@ -164,7 +162,6 @@
                 jssync: {gistId:'', proxyUrl:'', autoSync:true, lastSyncedAt:null, lastPulledEtag:'', lastSyncedRevs:{}},
                 _syncMeta: {tagTest:{updatedAt:0,rev:0}, genConfig:{updatedAt:0,rev:0}, genState:{updatedAt:0,rev:0}, app:{updatedAt:0,rev:0}, danbooru:{updatedAt:0,rev:0}}
             }, {mergeDefaults: true});
-            _normalizeArrayFields(config.value);
             const syncToken = useLocalStorage('nai-sync-token', '');
             const isSyncMerging = ref(false);
             _SYNC_KEYS.forEach(section => {
@@ -415,7 +412,6 @@
                     if (!_.isEmpty(autoMerged)) {
                         await withSyncMerge(() => {
                             _applySectionDict(cfg, autoMerged);
-                            _normalizeArrayFields(cfg);
                             if (remote._syncMeta) {
                                 _.forOwn(autoMerged, (_v, k) => {
                                     if (remote._syncMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remote._syncMeta[k]);
@@ -514,7 +510,6 @@
                 const cfg = appStore.config.value;
                 await withSyncMerge(() => {
                     _applySectionDict(cfg, resolved);
-                    _normalizeArrayFields(cfg);
                     const conflict = pendingConflict.value;
                     if (conflict) {
                         _SYNC_KEYS.forEach(k => {
@@ -598,7 +593,7 @@ const TagCountBadge={
         const ImagePreviewCard = {
             props: ['src'],
             emits: ['close'],
-            template: `<hover-card class="shrink-0" rounded="rounded-lg"><img :src="src" class="h-14 w-14 object-cover border border-white/20 block"><template #overlay-tr><icon-btn icon="close" @click="$emit('close')" color="btn-error" circle/></template></hover-card>`
+            template: `<hover-card class="shrink-0" rounded="rounded-lg"><img :src="src" class="h-14 w-14 object-cover border border-white/20 block"><template #overlay-tr><icon-btn icon="close" @click="$emit('close')" overlay/></template></hover-card>`
         };
         const FolderDropdown={props:['post','iconSize','menuClass'],setup(){const{folders,isPostInFolder,togglePostInFolder}=inject('danbooruFolders');return{folders,isPostInFolder,togglePostInFolder}},template:`<checklist-dropdown :items="folders" :is-checked="f=>isPostInFolder(post.id,f.id)" :on-toggle="f=>togglePostInFolder(post,f)" :get-count="f=>f.postIds.length" empty-text="No folders" btn-class="btn-xs btn-circle min-h-0 h-6 w-6 p-0 bg-black/65 text-white hover:bg-black/85 border-none" icon="create_new_folder" active-icon="create_new_folder" :icon-size="iconSize||16" :menu-class="menuClass"></checklist-dropdown>`};
         const NavLink={props:['to','icon','notification','label'],template:`<router-link :to="to" custom v-slot="{href,navigate,isActive}"><a :href="href" @click="navigate" :title="label" class="relative flex-center w-14 h-14" :class="{'active':isActive}"><div class="indicator flex-center"><span v-if="notification>0" class="indicator-item badge badge-primary badge-sm">{{notification}}</span><material-icon :icon="icon"/></div></a></router-link>`};
