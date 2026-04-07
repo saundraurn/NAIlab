@@ -65,3 +65,52 @@ test('pull updates _lastPushedConvos and _lastPushedConvoGists to prevent redund
   assert.match(html, /cfg\.jssync\._lastPushedConvoGists = _\.cloneDeep\(gemini\.conversationGists\.value\)/,
     'pull must update _lastPushedConvoGists after merging remote conversations');
 });
+
+test('sync uses last-write-wins timestamp strategy instead of three-way merge', () => {
+  assert.match(html, /const _lwwPickWinner/, 'LWW helper function must be defined');
+  assert.match(html, /remoteMeta\?\.\s*updatedAt/, 'LWW must compare updatedAt timestamps');
+  // Pull must use LWW rather than conflict detection
+  const pullFn = html.match(/const pull = async \(\) => \{([\s\S]*?)(?=\n\s*const push)/);
+  assert.ok(pullFn, 'pull function not found');
+  const pullBody = pullFn[1];
+  assert.match(pullBody, /_lwwPickWinner/, 'pull must use _lwwPickWinner');
+  assert.doesNotMatch(pullBody, /conflicts\.push/, 'pull must not build conflict arrays');
+  assert.doesNotMatch(pullBody, /pendingConflict/, 'pull must not set pendingConflict');
+});
+
+test('conflict resolution modal is completely removed', () => {
+  assert.doesNotMatch(html, /const ConflictResolutionModal\s*=/, 'ConflictResolutionModal component must be removed');
+  assert.doesNotMatch(html, /conflict-resolution-modal/, 'conflict-resolution-modal tag must be removed from App template');
+  assert.doesNotMatch(html, /resolveConflict/, 'resolveConflict function must be removed');
+  assert.doesNotMatch(html, /pendingConflict/, 'pendingConflict ref must be removed');
+  assert.doesNotMatch(html, /_CONFLICT_SECTIONS/, '_CONFLICT_SECTIONS must be removed');
+});
+
+test('useGitHubClient composable centralizes API header generation', () => {
+  assert.match(html, /const useGitHubClient = createGlobalState/, 'useGitHubClient must be a global state composable');
+  assert.match(html, /gistFetch/, 'useGitHubClient must expose gistFetch');
+  assert.match(html, /makeAuthHttp/, 'useGitHubClient must expose makeAuthHttp');
+  assert.match(html, /buildCorsProxy/, 'useGitHubClient must expose buildCorsProxy');
+  // Old scattered header functions must be removed
+  assert.doesNotMatch(html, /const _getGistHeaders/, 'scattered _getGistHeaders must be removed');
+  assert.doesNotMatch(html, /const _getGitHubApiHeaders/, 'scattered _getGitHubApiHeaders must be removed');
+});
+
+test('useSyncQueue composable provides centralized background sync queue', () => {
+  assert.match(html, /const useSyncQueue = createGlobalState/, 'useSyncQueue must be a global state composable');
+  assert.match(html, /enqueue/, 'useSyncQueue must expose enqueue');
+  // Queue must handle deduplication
+  assert.match(html, /findIndex.*q\.key === key/, 'queue must deduplicate by key');
+});
+
+test('auto-sync debounce is reduced to 5 seconds', () => {
+  assert.match(html, /useDebounceFn\(\(\) => \{[\s\S]*?queueSync[\s\S]*?\}, 5000\)/, 'auto-sync debounce must be 5000ms');
+});
+
+test('InlineEdit component is defined and registered', () => {
+  assert.match(html, /const InlineEdit=\{/, 'InlineEdit component must be defined');
+  assert.match(html, /InlineEdit/, 'InlineEdit must be in component registration');
+  // Must handle Enter/Escape
+  assert.match(html, /keydown\.enter\.prevent/, 'InlineEdit must handle Enter key');
+  assert.match(html, /keydown\.escape\.prevent/, 'InlineEdit must handle Escape key');
+});
