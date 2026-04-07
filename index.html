@@ -613,7 +613,7 @@ const TagCountBadge={
                 const isEditing=ref(false),draft=ref(p.modelValue),inputRef=ref(null);
                 watch(()=>p.modelValue,(v)=>{if(!isEditing.value)draft.value=v;});
                 const startEdit=()=>{isEditing.value=true;draft.value=p.modelValue;nextTick(()=>{const el=inputRef.value;if(el){el.focus();el.select();}});};
-                const commit=()=>{const v=draft.value.trim();if(v&&v!==p.modelValue)emit('update:modelValue',v);isEditing.value=false;};
+                const commit=()=>{const v=draft.value.trim();if(v!==p.modelValue)emit('update:modelValue',v);isEditing.value=false;};
                 const cancel=()=>{draft.value=p.modelValue;isEditing.value=false;};
                 const onBlur=()=>{if(p.commitOnBlur)commit();else cancel();};
                 return{isEditing,draft,inputRef,startEdit,commit,cancel,onBlur};
