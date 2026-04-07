@@ -1474,7 +1474,9 @@ const TagCountBadge={
                 const t = store.syncToken.value;
                 if (!t) throw new Error('No GitHub token.');
                 const res = await fetch('https://api.github.com/gists' + path, {method, headers: _ghH(t), ...(body && {body: JSON.stringify(body)})});
-                if (!res.ok) throw new Error(`Gist ${method} ${res.status}`);
+                if (res.status === 401) throw new Error('Invalid GitHub token. Check your PAT.');
+                if (res.status === 404) throw new Error('Gist not found. Check your Gist ID.');
+                if (!res.ok) throw new Error(`Gist ${method} failed: ${res.status}`);
                 return res.status === 204 ? null : res.json();
             };
             const _collectImageIds = (convoData) => {
@@ -1514,9 +1516,13 @@ const TagCountBadge={
                 const gistData = await _gistFetch('POST', '', {description:`NAILab: ${title}`, public:false, files:{'conversation.json':{content: convoJson}}});
                 conversationGists.value = {...conversationGists.value, [id]: gistData.id};
                 if (lfs && convoJson !== '{}') {
-                    const data = JSON.parse(convoJson);
-                    const imgIds = _collectImageIds(data);
-                    if (imgIds.size) _pushConvoImages(gistData.id, imgIds, lfs).catch(e => console.warn('Image push failed:', e));
+                    try {
+                        const data = JSON.parse(convoJson);
+                        const imgIds = _collectImageIds(data);
+                        if (imgIds.size) _pushConvoImages(gistData.id, imgIds, lfs).catch(e => console.warn('Image push failed:', e));
+                    } catch (e) {
+                        console.warn('Skipping image push due to invalid conversation JSON:', e);
+                    }
                 }
                 await useSyncStore().push(true);
                 return gistData.id;
@@ -1804,15 +1810,12 @@ const TagCountBadge={
                     toast.q(hide ? 'All messages hidden from model' : 'All messages visible to model');
                 };
                 watch(activeConvoId, () => { editState.value = null; nextTick(scrollToBottom); });
-                const isSyncing = ref(false);
                 const pullConversations = async () => {
-                    if (isSyncing.value) return;
-                    isSyncing.value = true;
+                    if (syncStore.isSyncing.value) return;
                     try {
                         await syncStore.pull();
                         toast.ok('Conversations synced', 'sync', 2000);
                     } catch (e) { toast.err('Sync failed: ' + e.message); }
-                    finally { isSyncing.value = false; }
                 };
                 return {
                     messages, generating, editState, pendingImages, lightboxSrc,
@@ -1826,7 +1829,7 @@ const TagCountBadge={
                     autoResize, onKeydown, onPaste,
                     activeConvoId, conversationMap,
                     conversationGists, convoSyncStatus, syncConversationNow,
-                    syncToken: store.syncToken, pullConversations, isSyncing,
+                    syncToken: store.syncToken, pullConversations, isSyncing: syncStore.isSyncing,
                     openConversations, closedSavedConversations,
                     switchConversation, closeConversation, saveConversation, loadConversation, deleteConversation,
                     renamingId, renamingTitle, startRename, commitRename, cancelRename,
