@@ -347,8 +347,8 @@
             return { getToken, headers, gistFetch, makeAuthHttp, buildCorsProxy };
         });
         const useSyncQueue = createGlobalState(() => {
-            const _queue = [];
-            let _running = false;
+            const _queue = reactive([]);
+            const _running = ref(false);
             let _timer = null;
             const _BATCH_DELAY = 500;
             const _MIN_INTERVAL = 2000;
@@ -360,15 +360,15 @@
                 _scheduleRun();
             };
             const _scheduleRun = () => {
-                if (_running || _timer) return;
+                if (_running.value || _timer) return;
                 const elapsed = Date.now() - _lastRunAt;
                 const wait = Math.max(_BATCH_DELAY, _MIN_INTERVAL - elapsed);
                 _timer = setTimeout(_processQueue, wait);
             };
             const _processQueue = async () => {
                 _timer = null;
-                if (_running || !_queue.length) return;
-                _running = true;
+                if (_running.value || !_queue.length) return;
+                _running.value = true;
                 try {
                     while (_queue.length) {
                         const batch = _queue.splice(0);
@@ -383,9 +383,9 @@
                             toast.warn(`Sync failed for: ${failed}`, 'sync', 4000);
                         }
                     }
-                } finally { _running = false; if (_queue.length) _scheduleRun(); }
+                } finally { _running.value = false; if (_queue.length) _scheduleRun(); }
             };
-            const isRunning = computed(() => _running);
+            const isRunning = computed(() => _running.value);
             const pending = computed(() => _queue.length);
             return { enqueue, isRunning, pending };
         });
@@ -433,7 +433,8 @@
                     const lwwMerged = {};
                     _SYNC_KEYS.forEach(key => {
                         if (!remote[key]) return;
-                        if (_.isEqual(cfg[key], remote[key])) return;
+                        const localSection = key === 'app' ? _.omit(cfg[key], 'apiKey') : cfg[key];
+                        if (_.isEqual(localSection, remote[key])) return;
                         const winner = _lwwPickWinner(localMeta[key], remoteMeta[key]);
                         if (winner === 'remote') lwwMerged[key] = remote[key];
                     });
