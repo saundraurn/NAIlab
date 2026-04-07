@@ -1588,10 +1588,10 @@ const TagCountBadge={
                 _gistSyncInProgress = true;
                 _gistSyncPromise = (async () => {
                     try {
-                        const ids = [..._gistSyncDirty];
+                        const ids = [..._gistSyncDirty].filter(id => conversationGists.value[id]);
                         _gistSyncDirty.clear();
-                        ids.forEach(id => { if (conversationGists.value[id]) convoSyncStatus[id] = 'syncing'; });
-                        const results = await Promise.allSettled(ids.filter(id => conversationGists.value[id]).map(async (id) => {
+                        ids.forEach(id => { convoSyncStatus[id] = 'syncing'; });
+                        await Promise.allSettled(ids.map(async (id) => {
                             try {
                                 await _syncConversationToItsGist(id);
                                 convoSyncStatus[id] = 'synced';
