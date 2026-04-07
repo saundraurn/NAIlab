@@ -1598,9 +1598,13 @@ const TagCountBadge={
                 await window.git.clone({ fs: syncFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1 });
                 const branch = await window.git.currentBranch({ fs: syncFs, dir }) || 'main';
                 let staged = false;
-                // Write conversation.json into the repo
+                // Write conversation.json and stage only if its content changed
                 await syncFs.promises.writeFile(dir + '/conversation.json', convoJson, 'utf8');
-                await window.git.add({ fs: syncFs, dir, filepath: 'conversation.json' });
+                const convoStatus = await window.git.status({ fs: syncFs, dir, filepath: 'conversation.json' });
+                if (convoStatus !== 'unmodified') {
+                    await window.git.add({ fs: syncFs, dir, filepath: 'conversation.json' });
+                    staged = true;
+                }
                 // Write new images
                 const syncedArr = _syncedConvoImages.value[gistId] || [];
                 const syncedSet = new Set(syncedArr);
@@ -1621,9 +1625,6 @@ const TagCountBadge={
                         staged = true;
                     }
                 }
-                // Check if conversation.json actually changed
-                const status = await window.git.status({ fs: syncFs, dir, filepath: 'conversation.json' });
-                if (status !== 'unmodified') staged = true;
                 if (!staged) return;
                 await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync conversation' });
                 await window.git.push({ fs: syncFs, http: authHttp, dir, corsProxy, remote: 'origin', ref: branch });
