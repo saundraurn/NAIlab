@@ -43,3 +43,27 @@ test('config sync path no longer syncs conversations directly', () => {
   assert.doesNotMatch(body, /syncAllConversationsNow\(/);
   assert.doesNotMatch(body, /syncConversationNow\(/);
 });
+
+test('auto-sync watcher covers conversation metadata alongside config sections', () => {
+  // The debounced auto-sync callback must watch savedConversations and conversationGists
+  assert.match(html, /geminiAPI\.savedConversations\.value/, 'savedConversations not watched for auto-sync');
+  assert.match(html, /geminiAPI\.conversationGists\.value/, 'conversationGists not watched for auto-sync');
+});
+
+test('syncConversationNow polls convoSyncStatus with a bounded timeout', () => {
+  const syncNowFn = html.match(/const syncConversationNow = async \(id\) => \{([\s\S]*?)\n\s*\};/);
+  assert.ok(syncNowFn, 'syncConversationNow function not found');
+  const body = syncNowFn[1];
+  // Must have a polling loop with a deadline
+  assert.match(body, /deadline/, 'missing deadline/timeout in polling loop');
+  assert.match(body, /Promise\.race/, 'missing Promise.race for bounded await');
+  assert.match(body, /convoSyncStatus\[id\] === 'pending'/, 'must poll until status leaves pending');
+});
+
+test('pull updates _lastPushedConvos and _lastPushedConvoGists to prevent redundant pushes', () => {
+  // After merging remote conversations, pull must snapshot the merged state
+  assert.match(html, /cfg\.jssync\._lastPushedConvos = _\.cloneDeep\(gemini\.savedConversations\.value\)/,
+    'pull must update _lastPushedConvos after merging remote conversations');
+  assert.match(html, /cfg\.jssync\._lastPushedConvoGists = _\.cloneDeep\(gemini\.conversationGists\.value\)/,
+    'pull must update _lastPushedConvoGists after merging remote conversations');
+});

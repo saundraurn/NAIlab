@@ -442,6 +442,8 @@
                         if (remote._conversationGists) {
                             gemini.conversationGists.value = { ...remote._conversationGists, ...gemini.conversationGists.value };
                         }
+                        cfg.jssync._lastPushedConvos = _.cloneDeep(gemini.savedConversations.value);
+                        cfg.jssync._lastPushedConvoGists = _.cloneDeep(gemini.conversationGists.value);
                     }
                     _stampSyncTime(cfg, pulledEtag);
                     syncStatus.value = 'idle';
