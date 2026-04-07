@@ -1560,11 +1560,11 @@ const TagCountBadge={
             };
             // Per-gist mutex: serializes concurrent pushes to the same gist to prevent
             // LightningFS IndexedDB lock contention and git pre-receive rejections.
-            const _pushConvoImageLocks = new Map();
+            const _pushConvoGistLocks = new Map();
             const _pushConvoGist = (gistId, convoJson, imageIds, localFs) => {
-                const prev = _pushConvoImageLocks.get(gistId) || Promise.resolve();
+                const prev = _pushConvoGistLocks.get(gistId) || Promise.resolve();
                 const next = prev.then(() => _doPushConvoGist(gistId, convoJson, imageIds, localFs));
-                _pushConvoImageLocks.set(gistId, next.catch(() => {}));
+                _pushConvoGistLocks.set(gistId, next.catch(() => {}));
                 return next;
             };
             // Unified push: writes conversation.json AND images in one git commit.
