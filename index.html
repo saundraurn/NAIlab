@@ -1361,6 +1361,39 @@ const TagCountBadge={
                     return null;
                 }
             };
+            // Helper: convert a Uint8Array/Buffer to a base64 data-URI string.
+            const _imageToDataUri = (uint8) => {
+                const bytes = new Uint8Array(uint8.buffer || uint8);
+                let bin = '';
+                for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                return `data:image/webp;base64,${btoa(bin)}`;
+            };
+            // Helper: decode a data-URI string back to a Uint8Array.
+            const _dataUriToUint8 = (dataUri) => {
+                const b64 = dataUri.split(',')[1];
+                const bin = atob(b64);
+                const bytes = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                return bytes;
+            };
+            // Helper: download raw file content via raw_url, handling both data-URI
+            // (new REST-API format) and binary (legacy git-push format) transparently.
+            const _downloadGistImage = async (rawUrl, corsProxy, token) => {
+                const url = corsProxy
+                    ? `${corsProxy}/${rawUrl.replace(/^https?:\/\//, '')}`
+                    : rawUrl;
+                const res = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
+                if (!res.ok) return null;
+                const buf = await res.arrayBuffer();
+                const bytes = new Uint8Array(buf);
+                // Detect data-URI prefix: "data:" = [100,97,116,97,58]
+                if (bytes.length > 5 && bytes[0] === 100 && bytes[1] === 97 &&
+                    bytes[2] === 116 && bytes[3] === 97 && bytes[4] === 58) {
+                    const text = new TextDecoder().decode(bytes);
+                    return _dataUriToUint8(text);
+                }
+                return bytes; // legacy binary
+            };
             const _pullMissingImages = async (convoData, gistId, localFs) => {
                 const imageIds = _collectImageIds(convoData);
                 if (!imageIds.size) return [];
@@ -1369,52 +1402,45 @@ const TagCountBadge={
                     try { await localFs.promises.stat('/' + imgId); } catch { missing.push(imgId); }
                 }
                 if (!missing.length) return [...imageIds];
-                const corsProxy = ghClient.buildCorsProxy();
-                if (!corsProxy) return [...imageIds];
                 const token = store.syncToken.value;
                 if (!token) return [...imageIds];
-                const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
-                // Unique name per call to avoid lock contention if two pulls race.
-                const fsName = `nailab-convo-pull-${safeGistId}-${Date.now()}`;
-                const tmpFs = new LightningFS(fsName, { wipe: true });
-                const dir = '/repo';
-                try { await tmpFs.promises.mkdir(dir); } catch {}
-                const gitUrl = `https://gist.github.com/${gistId}.git`;
-                const authHttp = ghClient.makeAuthHttp(token);
                 try {
-                    await window.git.clone({ fs: tmpFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1 });
-                    const pulled = [];
+                    // Fetch gist metadata via REST API (no git clone needed).
+                    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+                        method: 'GET', headers: ghClient.headers(token)
+                    });
+                    if (!res.ok) return [...imageIds];
+                    const gistData = await res.json();
+                    const corsProxy = ghClient.buildCorsProxy();
                     for (const imgId of missing) {
+                        const fileData = gistData.files?.[imgId];
+                        if (!fileData) continue;
                         try {
-                            const data = await tmpFs.promises.readFile(dir + '/' + imgId);
-                            await localFs.promises.writeFile('/' + imgId, data);
-                            pulled.push(imgId);
-                        } catch {}
+                            let binaryData = null;
+                            if (fileData.content && !fileData.truncated) {
+                                // Content available inline — check format
+                                if (fileData.content.startsWith('data:')) {
+                                    binaryData = _dataUriToUint8(fileData.content);
+                                } else if (fileData.raw_url) {
+                                    binaryData = await _downloadGistImage(fileData.raw_url, corsProxy, token);
+                                }
+                            } else if (fileData.raw_url) {
+                                binaryData = await _downloadGistImage(fileData.raw_url, corsProxy, token);
+                            }
+                            if (binaryData) {
+                                await localFs.promises.writeFile('/' + imgId, binaryData);
+                            }
+                        } catch (e) { console.warn(`Failed to pull image ${imgId}:`, e); }
                     }
-                    // Fix 4: bootstrap _syncedConvoImages with all image IDs found in the cloned repo
-                    const clonedFiles = await tmpFs.promises.readdir(dir);
-                    const clonedImageIds = clonedFiles.filter(f => f.startsWith('img_') && f.endsWith('.webp'));
-                    if (clonedImageIds.length) {
-                        _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: clonedImageIds };
+                    // Bootstrap _syncedConvoImages with all image IDs found in the gist
+                    const gistImageIds = Object.keys(gistData.files || {}).filter(f => f.startsWith('img_') && f.endsWith('.webp'));
+                    if (gistImageIds.length) {
+                        _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: gistImageIds };
                     }
-                    return [...imageIds];
                 } catch (e) {
                     console.warn('Failed to pull images from gist:', e);
-                    return [...imageIds];
-                } finally {
-                    // Clean up the temporary IndexedDB store to prevent leaks.
-                    if (typeof tmpFs.close === 'function') {
-                        try { await tmpFs.close(); } catch (e) { console.warn('Failed to close temporary filesystem:', e); }
-                    }
-                    try {
-                        await new Promise((resolve, reject) => {
-                            const req = indexedDB.deleteDatabase(fsName);
-                            req.onsuccess = () => resolve();
-                            req.onerror = () => reject(req.error || new Error(`Failed to delete IndexedDB database: ${fsName}`));
-                            req.onblocked = () => { console.warn('Temporary IndexedDB deletion was blocked:', fsName); resolve(); };
-                        });
-                    } catch (e) { console.warn('Failed to delete temporary IndexedDB store:', e); }
                 }
+                return [...imageIds];
             };
             const loadConversation = async (id) => {
                 if (conversationMap.has(id)) { activeConvoId.value = id; return; }
@@ -1573,7 +1599,7 @@ const TagCountBadge={
                 return gistData.id;
             };
             // Per-gist mutex: serializes concurrent pushes to the same gist to prevent
-            // LightningFS IndexedDB lock contention and git pre-receive rejections.
+            // overlapping PATCH requests from racing each other.
             const _pushConvoGistLocks = new Map();
             const _pushConvoGist = (gistId, convoJson, imageIds, localFs) => {
                 const prev = _pushConvoGistLocks.get(gistId) || Promise.resolve();
@@ -1581,87 +1607,80 @@ const TagCountBadge={
                 _pushConvoGistLocks.set(gistId, next.catch(() => {}));
                 return next;
             };
-            // Unified push: writes conversation.json AND images in one git commit.
-            // This avoids the race condition where a separate REST API PATCH creates a
-            // commit that the subsequent shallow clone may not see due to replication
-            // lag between GitHub's API and git backends, causing non-fast-forward
-            // rejections from the pre-receive hook.
+            // Push via GitHub REST API (PATCH /gists/{id}).  This replaces the former
+            // isomorphic-git clone+commit+push approach, which was unreliable because
+            // GitHub Gist pre-receive hooks reject pushes under various edge-cases
+            // (shallow packs, protocol quirks, etc.) that are hard to work around from
+            // the browser.  The REST API sidesteps the git protocol entirely.
             //
-            // NOTE: The clone intentionally omits `depth` (full clone).  Shallow
-            // clones (depth: 1) produce packfiles that reference objects only
-            // present beyond the shallow boundary.  GitHub's Gist pre-receive hook
-            // rejects these with "pre-receive hook declined" because Gists do not
-            // have `receive.shallowUpdate` enabled.  A full clone is negligible for
-            // Gist-sized repos and eliminates this entire class of errors.
+            // Images are stored as base64 data-URI text files.  When pulling, both
+            // the new data-URI format and legacy binary format (from old git pushes)
+            // are handled transparently.
             const _doPushConvoGist = async (gistId, convoJson, imageIds, localFs) => {
-                const corsProxy = ghClient.buildCorsProxy();
-                if (!corsProxy) {
-                    throw new Error('A CORS proxy URL is required to sync conversations.');
-                }
                 const token = store.syncToken.value;
-                const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
-                // Unique FS name per invocation: prevents concurrent calls (e.g. from
-                // createConversationGist racing with _runGistSync) from sharing the same
-                // IndexedDB store and stealing each other's lock.
-                const fsName = `nailab-convo-push-${safeGistId}-${Date.now()}`;
-                const syncFs = new LightningFS(fsName, { wipe: true });
-                const dir = '/repo';
-                try { await syncFs.promises.mkdir(dir); } catch {}
-                const gitUrl = `https://gist.github.com/${gistId}.git`;
-                const authHttp = ghClient.makeAuthHttp(token);
-                try {
-                    await window.git.clone({ fs: syncFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true });
-                    // currentBranch throws 'Could not find HEAD' when the clone didn't fully
-                    // complete or the gist has no commits yet; default to 'main'.
-                    let branch;
-                    try { branch = await window.git.currentBranch({ fs: syncFs, dir }); } catch {}
-                    branch = branch || 'main';
-                    let staged = false;
-                    // Write conversation.json into the git working tree so text and images
-                    // are committed atomically — no separate REST PATCH needed.
-                    let existingConvo = null;
-                    try { existingConvo = await syncFs.promises.readFile(dir + '/conversation.json', { encoding: 'utf8' }); } catch {}
-                    if (existingConvo !== convoJson) {
-                        await syncFs.promises.writeFile(dir + '/conversation.json', convoJson);
-                        await window.git.add({ fs: syncFs, dir, filepath: 'conversation.json' });
-                        staged = true;
-                    }
-                    const syncedArr = _syncedConvoImages.value[gistId] || [];
-                    const syncedSet = new Set(syncedArr);
-                    const newImages = [...imageIds].filter(id => !syncedSet.has(id));
-                    for (const imgId of newImages) {
-                        try {
-                            const imgData = await localFs.promises.readFile('/' + imgId);
-                            await syncFs.promises.writeFile(dir + '/' + imgId, imgData);
-                            await window.git.add({ fs: syncFs, dir, filepath: imgId });
-                            staged = true;
-                        } catch {}
-                    }
-                    const gistFiles = (await syncFs.promises.readdir(dir)).filter(f => f !== '.git');
-                    for (const f of gistFiles) {
-                        if (f.startsWith('img_') && f.endsWith('.webp') && !imageIds.has(f)) {
-                            await window.git.remove({ fs: syncFs, dir, filepath: f });
-                            staged = true;
-                        }
-                    }
-                    if (!staged) return;
-                    await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync conversation' });
-                    await window.git.push({ fs: syncFs, http: authHttp, dir, corsProxy, remote: 'origin', ref: branch, force: true });
-                    _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
-                } finally {
-                    // Clean up the temporary IndexedDB store to prevent leaks.
-                    if (typeof syncFs.close === 'function') {
-                        try { await syncFs.close(); } catch (e) { console.warn('Failed to close temporary filesystem:', e); }
-                    }
+                if (!token) throw new Error('No GitHub token configured.');
+
+                // 1. Fetch current gist state to diff against.
+                const gistRes = await fetch(`https://api.github.com/gists/${gistId}`, {
+                    method: 'GET', headers: ghClient.headers(token)
+                });
+                if (!gistRes.ok) throw new Error(`Failed to read gist: ${gistRes.status}`);
+                const gistData = await gistRes.json();
+                const existingFiles = gistData.files || {};
+
+                // 2. Build the PATCH payload — only include files that actually changed.
+                const files = {};
+                let hasChanges = false;
+
+                // 2a. conversation.json — compare with remote to avoid empty revisions.
+                let remoteConvo = existingFiles['conversation.json']?.content ?? null;
+                if ((existingFiles['conversation.json']?.truncated || remoteConvo === null) && existingFiles['conversation.json']?.raw_url) {
+                    const corsProxy = ghClient.buildCorsProxy();
+                    const rawUrl = corsProxy
+                        ? `${corsProxy}/${existingFiles['conversation.json'].raw_url.replace(/^https?:\/\//, '')}`
+                        : existingFiles['conversation.json'].raw_url;
                     try {
-                        await new Promise((resolve, reject) => {
-                            const req = indexedDB.deleteDatabase(fsName);
-                            req.onsuccess = () => resolve();
-                            req.onerror = () => reject(req.error || new Error(`Failed to delete IndexedDB database: ${fsName}`));
-                            req.onblocked = () => { console.warn('Temporary IndexedDB deletion was blocked:', fsName); resolve(); };
-                        });
-                    } catch (e) { console.warn('Failed to delete temporary IndexedDB store:', e); }
+                        const rawRes = await fetch(rawUrl, { headers: { 'Authorization': `Bearer ${token}` } });
+                        if (rawRes.ok) remoteConvo = await rawRes.text();
+                    } catch {}
                 }
+                if (remoteConvo !== convoJson) {
+                    files['conversation.json'] = { content: convoJson };
+                    hasChanges = true;
+                }
+
+                // 2b. New images — encode as data-URI text.
+                const existingImageNames = new Set(
+                    Object.keys(existingFiles).filter(f => f.startsWith('img_') && f.endsWith('.webp'))
+                );
+                for (const imgId of imageIds) {
+                    if (existingImageNames.has(imgId)) continue; // already in gist
+                    try {
+                        const imgData = await localFs.promises.readFile('/' + imgId);
+                        files[imgId] = { content: _imageToDataUri(imgData) };
+                        hasChanges = true;
+                    } catch {}
+                }
+
+                // 2c. Deleted images — set to null so the API removes them.
+                for (const f of existingImageNames) {
+                    if (!imageIds.has(f)) {
+                        files[f] = null;
+                        hasChanges = true;
+                    }
+                }
+
+                if (!hasChanges) return;
+
+                // 3. PATCH the gist (atomic update, no git protocol involved).
+                const patchRes = await fetch(`https://api.github.com/gists/${gistId}`, {
+                    method: 'PATCH',
+                    headers: ghClient.headers(token),
+                    body: JSON.stringify({ files })
+                });
+                if (!patchRes.ok) throw new Error(`Failed to update gist: ${patchRes.status}`);
+
+                _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
             };
             const _syncConversationToItsGist = async (id) => {
                 const token = store.syncToken.value;
