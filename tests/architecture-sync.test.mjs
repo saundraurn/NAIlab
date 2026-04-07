@@ -62,8 +62,8 @@ test('syncConversationNow polls convoSyncStatus with a bounded timeout', () => {
 
 test('pull updates _lastPushedConvos and _lastPushedConvoGists to prevent redundant pushes', () => {
   // After merging remote conversations, pull must snapshot the merged state
-  assert.match(html, /cfg\.jssync\._lastPushedConvos = _\.cloneDeep\(gemini\.savedConversations\.value\)/,
+  assert.match(html, /cfg\.jssync\._lastPushedConvos = JSON\.stringify\(gemini\.savedConversations\.value\)/,
     'pull must update _lastPushedConvos after merging remote conversations');
-  assert.match(html, /cfg\.jssync\._lastPushedConvoGists = _\.cloneDeep\(gemini\.conversationGists\.value\)/,
+  assert.match(html, /cfg\.jssync\._lastPushedConvoGists = JSON\.stringify\(gemini\.conversationGists\.value\)/,
     'pull must update _lastPushedConvoGists after merging remote conversations');
 });
