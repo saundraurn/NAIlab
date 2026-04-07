@@ -28,6 +28,11 @@ async function handleRequest(request) {
     // GET/HEAD must not carry a body (Fetch spec violation in some runtimes).
     const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
 
+    // Buffer the body upfront so it can survive redirect retries.
+    // ReadableStream is consumed on first fetch(); without buffering the body
+    // would be empty on any subsequent redirect hop, breaking git push.
+    const bodyBuffer = hasBody ? await request.arrayBuffer() : null;
+
     // Follow redirects manually so we can re-attach auth headers on each hop.
     // Cloudflare's redirect:'follow' drops Authorization on cross-origin redirects.
     let fetchUrl = targetUrl;
@@ -37,7 +42,7 @@ async function handleRequest(request) {
         response = await fetch(new Request(fetchUrl, {
           method: request.method,
           headers,
-          body: hasBody ? request.body : null,
+          body: bodyBuffer,
           redirect: 'manual',
         }));
       } catch (err) {
@@ -49,7 +54,6 @@ async function handleRequest(request) {
         const location = response.headers.get('Location');
         if (!location) break;
         fetchUrl = location;
-        // Don't resend a body after a redirect (mirrors browser behaviour for 301/302).
         continue;
       }
       break;

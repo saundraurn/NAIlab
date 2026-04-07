@@ -1558,33 +1558,24 @@ const TagCountBadge={
                 await useSyncStore().push(true);
                 return gistData.id;
             };
-            const _patchConvoText = async (gistId, convoJson) => {
-                const token = store.syncToken.value;
-                const res = await fetch(`https://api.github.com/gists/${gistId}`, {
-                    method: 'PATCH',
-                    headers: ghClient.headers(token),
-                    body: JSON.stringify({ files: { 'conversation.json': { content: convoJson } } })
-                });
-                if (!res.ok) throw new Error(`Gist PATCH failed: ${res.status}`);
-            };
             // Per-gist mutex: serializes concurrent pushes to the same gist to prevent
             // LightningFS IndexedDB lock contention and git pre-receive rejections.
             const _pushConvoImageLocks = new Map();
-            const _pushConvoImages = (gistId, imageIds, localFs) => {
+            const _pushConvoGist = (gistId, convoJson, imageIds, localFs) => {
                 const prev = _pushConvoImageLocks.get(gistId) || Promise.resolve();
-                const next = prev.then(() => _doPushConvoImages(gistId, imageIds, localFs));
+                const next = prev.then(() => _doPushConvoGist(gistId, convoJson, imageIds, localFs));
                 _pushConvoImageLocks.set(gistId, next.catch(() => {}));
                 return next;
             };
-            const _doPushConvoImages = async (gistId, imageIds, localFs) => {
-                const syncedArr = _syncedConvoImages.value[gistId] || [];
-                const syncedSet = new Set(syncedArr);
-                const newImages = [...imageIds].filter(id => !syncedSet.has(id));
-                const maybeOrphaned = syncedArr.filter(id => !imageIds.has(id));
-                if (!newImages.length && !maybeOrphaned.length) return;
+            // Unified push: writes conversation.json AND images in one git commit.
+            // This avoids the race condition where a separate REST API PATCH creates a
+            // commit that the subsequent shallow clone may not see due to replication
+            // lag between GitHub's API and git backends, causing non-fast-forward
+            // rejections from the pre-receive hook.
+            const _doPushConvoGist = async (gistId, convoJson, imageIds, localFs) => {
                 const corsProxy = ghClient.buildCorsProxy();
                 if (!corsProxy) {
-                    throw new Error('A CORS proxy URL is required to sync conversation images.');
+                    throw new Error('A CORS proxy URL is required to sync conversations.');
                 }
                 const token = store.syncToken.value;
                 const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
@@ -1603,6 +1594,18 @@ const TagCountBadge={
                 try { branch = await window.git.currentBranch({ fs: syncFs, dir }); } catch {}
                 branch = branch || 'main';
                 let staged = false;
+                // Write conversation.json into the git working tree so text and images
+                // are committed atomically — no separate REST PATCH needed.
+                let existingConvo = null;
+                try { existingConvo = await syncFs.promises.readFile(dir + '/conversation.json', { encoding: 'utf8' }); } catch {}
+                if (existingConvo !== convoJson) {
+                    await syncFs.promises.writeFile(dir + '/conversation.json', convoJson);
+                    await window.git.add({ fs: syncFs, dir, filepath: 'conversation.json' });
+                    staged = true;
+                }
+                const syncedArr = _syncedConvoImages.value[gistId] || [];
+                const syncedSet = new Set(syncedArr);
+                const newImages = [...imageIds].filter(id => !syncedSet.has(id));
                 for (const imgId of newImages) {
                     try {
                         const imgData = await localFs.promises.readFile('/' + imgId);
@@ -1619,9 +1622,7 @@ const TagCountBadge={
                     }
                 }
                 if (!staged) return;
-                await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync images' });
-                // force: true avoids pre-receive hook rejections when a previous push
-                // advanced the remote past this clone's shallow base.
+                await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync conversation' });
                 await window.git.push({ fs: syncFs, http: authHttp, dir, corsProxy, remote: 'origin', ref: branch, force: true });
                 _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
             };
@@ -1636,8 +1637,7 @@ const TagCountBadge={
                 catch { throw new Error('Conversation data not found locally.'); }
                 const convoData = JSON.parse(convoJson);
                 const imageIds = _collectImageIds(convoData);
-                await _patchConvoText(gistId, convoJson);
-                await _pushConvoImages(gistId, imageIds, localFs);
+                await _pushConvoGist(gistId, convoJson, imageIds, localFs);
             };
             let _gistSyncInProgress = false;
             let _gistSyncPromise = null;
