@@ -129,13 +129,21 @@ describe('Source verification', () => {
         assert.ok(pushIdx > -1, '_pushConvoImages called');
         assert.ok(patchIdx < pushIdx, '_patchConvoText is called before _pushConvoImages');
     });
-    it('_pushConvoImages uses onAuth callback (not makeAuthHttp)', () => {
+    it('_pushConvoImages uses onAuth callback and cache-busting http handler (not makeAuthHttp, not window.gitHttp)', () => {
         const pushFn = html.match(/const _pushConvoImages[\s\S]*?(?=\n\s*const _syncConversationToItsGist)/);
         assert.ok(pushFn, '_pushConvoImages function found');
         const body = pushFn[0];
         assert.ok(body.includes('onAuth'), 'uses onAuth callback');
-        assert.ok(body.includes('window.gitHttp'), 'uses window.gitHttp');
+        assert.ok(body.includes('_noCacheHttp'), 'uses _noCacheHttp (cache-busting handler)');
         assert.ok(!body.includes('makeAuthHttp'), 'does NOT use makeAuthHttp');
+        assert.ok(!body.includes('window.gitHttp'), 'does NOT use window.gitHttp directly');
+    });
+    it('_noCacheHttp is defined and uses cache:no-store fetch option', () => {
+        const noCacheDef = html.match(/const _noCacheHttp\s*=[\s\S]*?(?=\n\s*const _patchConvoText)/);
+        assert.ok(noCacheDef, '_noCacheHttp definition found');
+        const body = noCacheDef[0];
+        assert.ok(/cache\s*:\s*['"]no-store['"]/.test(body), 'uses cache: no-store');
+        assert.ok(body.includes('fetch('), 'calls fetch()');
     });
     it('_pushConvoImages returns early when no new/orphaned images', () => {
         const pushFn = html.match(/const _pushConvoImages[\s\S]*?(?=\n\s*const _syncConversationToItsGist)/);
