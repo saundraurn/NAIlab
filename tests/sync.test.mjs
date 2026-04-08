@@ -1068,7 +1068,7 @@ describe('Sync architecture invariants', () => {
 
     it('auto-save debounce is 1.5 seconds', () => {
         // The _autoSave function has a 1500ms debounce
-        assert.ok(html.includes('}, 1500)'));
+        assert.ok(html.includes('_autoSave = useDebounceFn(') && html.includes(', 1500)'));
     });
 
     it('auto-save skips temp, generating, and hydrating convos', () => {
