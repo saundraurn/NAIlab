@@ -1639,6 +1639,8 @@ const TagCountBadge={
                         } catch (e) {
                             convoSyncStatus[id] = 'error';
                             console.warn('Convo gist sync failed:', e);
+                            const title = _.find(savedConversations.value, {id})?.title || id;
+                            toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
                         }
                     }
                 } finally {
