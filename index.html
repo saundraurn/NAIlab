@@ -518,7 +518,7 @@
                     for (const meta of gemini.savedConversations.value) {
                         if (!gemini.cloudConversations.value[meta.id]) continue;
                         if ((meta.timestamp || 0) <= lastSynced) continue;
-                        try { await gemini.syncConvoToR2(meta.id); }
+                        try { await gemini.syncConversationToR2(meta.id); }
                         catch (e) { console.warn(`Failed to push convo ${meta.id}:`, e); }
                     }
                     // Delete tombstoned conversations from R2 (only recent ones)
@@ -1658,7 +1658,7 @@ const TagCountBadge={
                 isHiddenFromModel, toggleHiddenFromModel,
                 newChat, switchConversation, closeConversation,
                 saveConversation, loadConversation, deleteConversation, renameConversation,
-                syncConversationNow, deleteCloudConversation, syncConvoToR2: _syncConversationToR2
+                syncConversationNow, deleteCloudConversation, syncConversationToR2: _syncConversationToR2
             };
         });
         const HiddenBadge = {template:`<div class="flex items-center gap-1 text-xs text-neutral-500"><material-icon icon="visibility_off" :size="12"/><span>Hidden from model</span></div>`};
