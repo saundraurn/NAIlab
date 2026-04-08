@@ -208,8 +208,11 @@ export default {
 
     // R2 Storage API — requires auth
     if (url.pathname.startsWith('/r2/')) {
+      if (!env.R2_AUTH_SECRET) {
+        return corsResponse('R2_AUTH_SECRET not configured', 500);
+      }
       const auth = request.headers.get('Authorization');
-      if (!env.R2_AUTH_SECRET || !auth || auth !== `Bearer ${env.R2_AUTH_SECRET}`) {
+      if (!auth || auth !== `Bearer ${env.R2_AUTH_SECRET}`) {
         return corsResponse('Unauthorized', 401);
       }
       return handleR2(request, env, url);
