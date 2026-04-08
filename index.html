@@ -1568,6 +1568,10 @@ const TagCountBadge={
                 if (!res.ok) throw new Error(`Create gist failed: ${res.status}`);
                 const gistData = await res.json();
                 conversationGists.value = { ...conversationGists.value, [id]: gistData.id };
+                // Brief delay to let GitHub's git backend replicate the newly created gist.
+                // Without this, the immediate git clone may hit a stale replica that doesn't
+                // yet know about the gist, causing the push to fail.
+                await new Promise(r => setTimeout(r, 1500));
                 await _syncConversationToItsGist(id);
                 await useSyncStore().push(true);
                 return gistData.id;
@@ -1593,6 +1597,13 @@ const TagCountBadge={
             // rejects these with "pre-receive hook declined" because Gists do not
             // have `receive.shallowUpdate` enabled.  A full clone is negligible for
             // Gist-sized repos and eliminates this entire class of errors.
+            //
+            // Retry logic: GitHub's git backend may lag behind the API/write primary,
+            // causing the push discovery (GET info/refs) and the actual push (POST
+            // git-receive-pack) to hit different replicas with different ref values.
+            // When the oldoid from discovery doesn't match the server's current ref,
+            // the pre-receive hook rejects the push.  Retrying after a delay gives
+            // replicas time to converge.
             const _doPushConvoGist = async (gistId, convoJson, imageIds, localFs) => {
                 const corsProxy = ghClient.buildCorsProxy();
                 if (!corsProxy) {
@@ -1600,67 +1611,98 @@ const TagCountBadge={
                 }
                 const token = store.syncToken.value;
                 const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
-                // Unique FS name per invocation: prevents concurrent calls (e.g. from
-                // createConversationGist racing with _runGistSync) from sharing the same
-                // IndexedDB store and stealing each other's lock.
-                const fsName = `nailab-convo-push-${safeGistId}-${Date.now()}`;
-                const syncFs = new LightningFS(fsName, { wipe: true });
-                const dir = '/repo';
-                try { await syncFs.promises.mkdir(dir); } catch {}
                 const gitUrl = `https://gist.github.com/${gistId}.git`;
-                const authHttp = ghClient.makeAuthHttp(token);
-                try {
-                    await window.git.clone({ fs: syncFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true });
-                    // currentBranch throws 'Could not find HEAD' when the clone didn't fully
-                    // complete or the gist has no commits yet; default to 'main'.
-                    let branch;
-                    try { branch = await window.git.currentBranch({ fs: syncFs, dir }); } catch {}
-                    branch = branch || 'main';
-                    let staged = false;
-                    // Write conversation.json into the git working tree so text and images
-                    // are committed atomically — no separate REST PATCH needed.
-                    let existingConvo = null;
-                    try { existingConvo = await syncFs.promises.readFile(dir + '/conversation.json', { encoding: 'utf8' }); } catch {}
-                    if (existingConvo !== convoJson) {
-                        await syncFs.promises.writeFile(dir + '/conversation.json', convoJson);
-                        await window.git.add({ fs: syncFs, dir, filepath: 'conversation.json' });
-                        staged = true;
-                    }
-                    const syncedArr = _syncedConvoImages.value[gistId] || [];
-                    const syncedSet = new Set(syncedArr);
-                    const newImages = [...imageIds].filter(id => !syncedSet.has(id));
-                    for (const imgId of newImages) {
-                        try {
-                            const imgData = await localFs.promises.readFile('/' + imgId);
-                            await syncFs.promises.writeFile(dir + '/' + imgId, imgData);
-                            await window.git.add({ fs: syncFs, dir, filepath: imgId });
-                            staged = true;
-                        } catch {}
-                    }
-                    const gistFiles = (await syncFs.promises.readdir(dir)).filter(f => f !== '.git');
-                    for (const f of gistFiles) {
-                        if (f.startsWith('img_') && f.endsWith('.webp') && !imageIds.has(f)) {
-                            await window.git.remove({ fs: syncFs, dir, filepath: f });
+
+                const maxAttempts = 3;
+                let lastError;
+                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                    // Unique FS name per attempt: prevents stale IndexedDB state from
+                    // a previous failed attempt from affecting the retry.
+                    const fsName = `nailab-convo-push-${safeGistId}-${Date.now()}`;
+                    const syncFs = new LightningFS(fsName, { wipe: true });
+                    const dir = '/repo';
+                    try { await syncFs.promises.mkdir(dir); } catch {}
+                    const authHttp = ghClient.makeAuthHttp(token);
+                    try {
+                        await window.git.clone({ fs: syncFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true });
+                        // Robustly detect the gist's branch name.  GitHub Gists may use
+                        // 'main' or 'master' depending on when they were created and the
+                        // user's default-branch setting.  Pushing to the wrong branch
+                        // name triggers a "pre-receive hook declined" error because Gists
+                        // do not allow creating new branches.
+                        let branch;
+                        try { branch = await window.git.currentBranch({ fs: syncFs, dir }); } catch {}
+                        if (!branch) {
+                            try {
+                                const remoteBranches = await window.git.listBranches({ fs: syncFs, dir, remote: 'origin' });
+                                const filtered = remoteBranches.filter(b => b !== 'HEAD');
+                                if (filtered.length) branch = filtered[0];
+                            } catch {}
+                        }
+                        if (!branch) {
+                            try {
+                                const localBranches = await window.git.listBranches({ fs: syncFs, dir });
+                                if (localBranches.length) branch = localBranches[0];
+                            } catch {}
+                        }
+                        branch = branch || 'main';
+                        let staged = false;
+                        // Write conversation.json into the git working tree so text and images
+                        // are committed atomically — no separate REST PATCH needed.
+                        let existingConvo = null;
+                        try { existingConvo = await syncFs.promises.readFile(dir + '/conversation.json', { encoding: 'utf8' }); } catch {}
+                        if (existingConvo !== convoJson) {
+                            await syncFs.promises.writeFile(dir + '/conversation.json', convoJson);
+                            await window.git.add({ fs: syncFs, dir, filepath: 'conversation.json' });
                             staged = true;
                         }
+                        const syncedArr = _syncedConvoImages.value[gistId] || [];
+                        const syncedSet = new Set(syncedArr);
+                        const newImages = [...imageIds].filter(id => !syncedSet.has(id));
+                        for (const imgId of newImages) {
+                            try {
+                                const imgData = await localFs.promises.readFile('/' + imgId);
+                                await syncFs.promises.writeFile(dir + '/' + imgId, imgData);
+                                await window.git.add({ fs: syncFs, dir, filepath: imgId });
+                                staged = true;
+                            } catch {}
+                        }
+                        const gistFiles = (await syncFs.promises.readdir(dir)).filter(f => f !== '.git');
+                        for (const f of gistFiles) {
+                            if (f.startsWith('img_') && f.endsWith('.webp') && !imageIds.has(f)) {
+                                await window.git.remove({ fs: syncFs, dir, filepath: f });
+                                staged = true;
+                            }
+                        }
+                        if (!staged) return;
+                        await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync conversation' });
+                        await window.git.push({ fs: syncFs, http: authHttp, dir, corsProxy, remote: 'origin', ref: branch, force: true });
+                        _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
+                        return; // Success — exit the retry loop.
+                    } catch (e) {
+                        lastError = e;
+                        const isRetryable = e.code === 'GitPushError' || (e.message && e.message.includes('pre-receive hook declined'));
+                        if (isRetryable && attempt < maxAttempts) {
+                            const delay = 2000 * attempt; // 2s, 4s
+                            console.warn(`Convo gist push attempt ${attempt}/${maxAttempts} failed (${e.message}), retrying in ${delay}ms…`);
+                            await new Promise(r => setTimeout(r, delay));
+                            continue;
+                        }
+                        throw e;
+                    } finally {
+                        // Clean up the temporary IndexedDB store to prevent leaks.
+                        if (typeof syncFs.close === 'function') {
+                            try { await syncFs.close(); } catch (e) { console.warn('Failed to close temporary filesystem:', e); }
+                        }
+                        try {
+                            await new Promise((resolve, reject) => {
+                                const req = indexedDB.deleteDatabase(fsName);
+                                req.onsuccess = () => resolve();
+                                req.onerror = () => reject(req.error || new Error(`Failed to delete IndexedDB database: ${fsName}`));
+                                req.onblocked = () => { console.warn('Temporary IndexedDB deletion was blocked:', fsName); resolve(); };
+                            });
+                        } catch (e) { console.warn('Failed to delete temporary IndexedDB store:', e); }
                     }
-                    if (!staged) return;
-                    await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync conversation' });
-                    await window.git.push({ fs: syncFs, http: authHttp, dir, corsProxy, remote: 'origin', ref: branch, force: true });
-                    _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
-                } finally {
-                    // Clean up the temporary IndexedDB store to prevent leaks.
-                    if (typeof syncFs.close === 'function') {
-                        try { await syncFs.close(); } catch (e) { console.warn('Failed to close temporary filesystem:', e); }
-                    }
-                    try {
-                        await new Promise((resolve, reject) => {
-                            const req = indexedDB.deleteDatabase(fsName);
-                            req.onsuccess = () => resolve();
-                            req.onerror = () => reject(req.error || new Error(`Failed to delete IndexedDB database: ${fsName}`));
-                            req.onblocked = () => { console.warn('Temporary IndexedDB deletion was blocked:', fsName); resolve(); };
-                        });
-                    } catch (e) { console.warn('Failed to delete temporary IndexedDB store:', e); }
                 }
             };
             const _syncConversationToItsGist = async (id) => {
