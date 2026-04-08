@@ -113,7 +113,7 @@
         const loadImageAsBase64 = async (imageId) => { const bytes = await useImageStore().loadImage(imageId); return bytes ? uint8ArrayToBase64(bytes) : null; };
         const models = [['4-5-full','v4.5 Full'],['4-5-curated','v4.5 Curated'],['4-full','v4 Full']].map(([s,text])=>({val:'nai-diffusion-'+s,text}));
         const _SYNC_KEYS = ['tagTest','genConfig','genState','app','danbooru'];
-        const _normalizeArrayFields = (cfg) => {};
+
         const _lwwPickWinner = (localMeta, remoteMeta) => (remoteMeta?.updatedAt || 0) >= (localMeta?.updatedAt || 0) ? 'remote' : 'local';
         const uid = () => crypto.randomUUID();
         const _ensureArray = (val) => Array.isArray(val) ? val : Object.values(val || {});
@@ -149,7 +149,7 @@
                 jssync: {proxyUrl:'', autoSync:true, lastSyncedAt:null},
                 _syncMeta: {tagTest:{updatedAt:0,rev:0}, genConfig:{updatedAt:0,rev:0}, genState:{updatedAt:0,rev:0}, app:{updatedAt:0,rev:0}, danbooru:{updatedAt:0,rev:0}}
             }, {mergeDefaults: true});
-            _normalizeArrayFields(config.value);
+
             const syncToken = useLocalStorage('nai-sync-token', '');
             const isSyncMerging = ref(false);
             _SYNC_KEYS.forEach(section => {
@@ -363,6 +363,7 @@
             const appStore = useAppStore();
             const r2Client = useR2Client();
             const syncQueue = useSyncQueue();
+            const TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
             const _finalizePush = (cfg) => {
                 cfg.jssync.lastSyncedAt = Date.now();
             };
@@ -382,6 +383,10 @@
                 if (snap.app) delete snap.app.apiKey;
                 return snap;
             };
+            const _pruneTombstones = (tombstones) => {
+                const cutoff = Date.now() - TOMBSTONE_TTL_MS;
+                return (tombstones || []).filter(t => t.deletedAt > cutoff);
+            };
             const pull = async () => {
                 const cfg = appStore.config.value;
                 const workerUrl = r2Client.getWorkerUrl();
@@ -389,46 +394,78 @@
                 if (!workerUrl || !secret) return;
                 syncStatus.value = 'pulling'; syncError.value = null;
                 try {
+                    // Pull config (settings only, no conversations)
                     const res = await r2Client.r2Fetch('GET', 'config');
                     const remote = await res.json();
-                    if (!remote || _.isEmpty(remote)) { syncStatus.value = 'idle'; return; }
-                    const localMeta = cfg._syncMeta || {};
-                    const remoteMeta = remote._syncMeta || {};
-                    const lwwMerged = {};
-                    _SYNC_KEYS.forEach(key => {
-                        if (!remote[key]) return;
-                        const localSection = key === 'app' ? _.omit(cfg[key], 'apiKey') : cfg[key];
-                        if (_.isEqual(localSection, remote[key])) return;
-                        const winner = _lwwPickWinner(localMeta[key], remoteMeta[key]);
-                        if (winner === 'remote') lwwMerged[key] = remote[key];
-                    });
-                    if (!_.isEmpty(lwwMerged)) {
-                        await withSyncMerge(() => {
-                            _applySectionDict(cfg, lwwMerged);
-                            _normalizeArrayFields(cfg);
-                            _.forOwn(lwwMerged, (_v, k) => {
-                                if (remoteMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remoteMeta[k]);
-                            });
+                    if (remote && !_.isEmpty(remote)) {
+                        const localMeta = cfg._syncMeta || {};
+                        const remoteMeta = remote._syncMeta || {};
+                        const lwwMerged = {};
+                        _SYNC_KEYS.forEach(key => {
+                            if (!remote[key]) return;
+                            const localSection = key === 'app' ? _.omit(cfg[key], 'apiKey') : cfg[key];
+                            if (_.isEqual(localSection, remote[key])) return;
+                            const winner = _lwwPickWinner(localMeta[key], remoteMeta[key]);
+                            if (winner === 'remote') lwwMerged[key] = remote[key];
                         });
-                        toast.ok(`Pulled ${_.size(lwwMerged)} updated section(s).`, 'sync', 3000);
+                        if (!_.isEmpty(lwwMerged)) {
+                            await withSyncMerge(() => {
+                                _applySectionDict(cfg, lwwMerged);
+                                _.forOwn(lwwMerged, (_v, k) => {
+                                    if (remoteMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remoteMeta[k]);
+                                });
+                            });
+                            toast.ok(`Pulled ${_.size(lwwMerged)} updated section(s).`, 'sync', 3000);
+                        }
+                        // Merge tombstones from remote
+                        if (remote._deletedConversationIds) {
+                            const localTombstones = cfg.jssync._deletedConversationIds || [];
+                            const merged = new Map();
+                            for (const t of [...localTombstones, ...remote._deletedConversationIds]) {
+                                const existing = merged.get(t.id);
+                                if (!existing || t.deletedAt > existing.deletedAt) merged.set(t.id, t);
+                            }
+                            cfg.jssync._deletedConversationIds = _pruneTombstones([...merged.values()]);
+                        }
                     }
-                    if (remote._conversations || remote._cloudConversations) {
-                        const gemini = useGeminiAPI();
-                        if (remote._conversations) {
+                    // Pull conversation list from R2
+                    const gemini = useGeminiAPI();
+                    try {
+                        const listRes = await r2Client.r2Fetch('GET', 'conversations');
+                        if (listRes.ok) {
+                            const remoteConvoIds = await listRes.json();
+                            const tombstoneIds = new Set((cfg.jssync._deletedConversationIds || []).map(t => t.id));
                             const localById = _.keyBy(gemini.savedConversations.value, 'id');
-                            for (const rc of remote._conversations) {
-                                const lc = localById[rc.id];
-                                if (!lc) { localById[rc.id] = rc; }
-                                else if ((rc.timestamp || 0) > (lc.timestamp || 0)) { Object.assign(lc, rc); }
+                            const localCloudMap = { ...gemini.cloudConversations.value };
+                            let addedCount = 0;
+                            for (const remoteId of remoteConvoIds) {
+                                // Skip tombstoned conversations
+                                if (tombstoneIds.has(remoteId)) continue;
+                                localCloudMap[remoteId] = true;
+                                if (!localById[remoteId]) {
+                                    // Fetch metadata for new remote conversation
+                                    try {
+                                        const convoRes = await r2Client.r2Fetch('GET', `conversations/${remoteId}`);
+                                        if (convoRes.ok) {
+                                            const convoData = await convoRes.json();
+                                            const title = convoData?.messages?.[0]?.text?.substring(0, 40) || 'Cloud Chat';
+                                            const ts = convoData?.timestamp || Date.now();
+                                            localById[remoteId] = { id: remoteId, title, timestamp: ts };
+                                            // Write to local LFS
+                                            const lfs = useImageStore().getLfs();
+                                            if (lfs && convoData) {
+                                                try { await lfs.promises.writeFile(_convoPath(remoteId), JSON.stringify(convoData)); } catch {}
+                                            }
+                                            addedCount++;
+                                        }
+                                    } catch {}
+                                }
                             }
                             gemini.savedConversations.value = Object.values(localById);
+                            gemini.cloudConversations.value = localCloudMap;
+                            if (addedCount) toast.ok(`Pulled ${addedCount} conversation(s) from cloud.`, 'sync', 3000);
                         }
-                        if (remote._cloudConversations) {
-                            gemini.cloudConversations.value = { ...remote._cloudConversations, ...gemini.cloudConversations.value };
-                        }
-                        cfg.jssync._lastPushedConvos = _.cloneDeep(gemini.savedConversations.value);
-                        cfg.jssync._lastPushedCloudConvos = _.cloneDeep(gemini.cloudConversations.value);
-                    }
+                    } catch (e) { console.warn('Failed to pull conversations list:', e); }
                     cfg.jssync.lastSyncedAt = Date.now();
                     syncStatus.value = 'idle';
                 } catch (e) {
@@ -443,22 +480,40 @@
                 if (!workerUrl || !secret) return;
                 syncStatus.value = 'pushing'; syncError.value = null;
                 try {
+                    // Push config (settings sections only)
                     const payload = extractSyncPayload(cfg);
-                    const gemini = useGeminiAPI();
-                    payload._conversations = gemini.savedConversations.value;
-                    payload._cloudConversations = gemini.cloudConversations.value;
-                    const convoChanged = !_.isEqual(payload._conversations, cfg.jssync._lastPushedConvos) || !_.isEqual(payload._cloudConversations, cfg.jssync._lastPushedCloudConvos);
+                    // Include tombstones in config
+                    payload._deletedConversationIds = _pruneTombstones(cfg.jssync._deletedConversationIds || []);
                     const hasLocalChanges = _SYNC_KEYS.some(k => {
                         const localTime = cfg._syncMeta?.[k]?.updatedAt || 0;
                         const lastSynced = cfg.jssync.lastSyncedAt || 0;
                         return localTime > lastSynced;
                     });
-                    if (!hasLocalChanges && !convoChanged) { syncStatus.value = 'idle'; return; }
-                    const content = JSON.stringify(payload, null, 2);
-                    await r2Client.r2Fetch('PUT', 'config', content, { contentType: 'application/json' });
+                    if (hasLocalChanges) {
+                        const content = JSON.stringify(payload, null, 2);
+                        await r2Client.r2Fetch('PUT', 'config', content, { contentType: 'application/json' });
+                    }
+                    // Push dirty conversations individually
+                    const gemini = useGeminiAPI();
+                    const lastSynced = cfg.jssync.lastSyncedAt || 0;
+                    for (const meta of gemini.savedConversations.value) {
+                        if (!gemini.cloudConversations.value[meta.id]) continue;
+                        if ((meta.timestamp || 0) <= lastSynced) continue;
+                        try {
+                            const lfs = useImageStore().getLfs();
+                            if (lfs) {
+                                const json = await lfs.promises.readFile(_convoPath(meta.id), { encoding: 'utf8' });
+                                const convoData = JSON.parse(json);
+                                const imageIds = _collectImageIds(convoData);
+                                await _pushConvoToR2Direct(meta.id, json, imageIds, lfs);
+                            }
+                        } catch (e) { console.warn(`Failed to push convo ${meta.id}:`, e); }
+                    }
+                    // Delete tombstoned conversations from R2
+                    for (const t of (cfg.jssync._deletedConversationIds || [])) {
+                        try { await r2Client.r2Fetch('DELETE', `conversations/${t.id}`); } catch {}
+                    }
                     _finalizePush(cfg);
-                    cfg.jssync._lastPushedConvos = _.cloneDeep(payload._conversations);
-                    cfg.jssync._lastPushedCloudConvos = _.cloneDeep(payload._cloudConversations);
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config synced to cloud.', 'sync', 2500);
                 } catch (e) {
@@ -861,6 +916,42 @@ const TagCountBadge={
         const _convoPath = id => `/convo_${id}.json`;
         const _writeConvoToLfs = (lfs, id, messages, params) =>
             lfs.promises.writeFile(_convoPath(id), JSON.stringify({ messages, ...(params ? { params } : {}) }));
+        const _collectImageIds = (convoData) => {
+            const ids = new Set();
+            for (const msg of convoData.messages || []) {
+                for (const img of msg.images || []) { if (img.imageId) ids.add(img.imageId); }
+                for (const v of msg.variants || []) {
+                    for (const part of v.parts || []) { if (part._imageRef) ids.add(part._imageRef); }
+                    for (const img of v._images || []) { if (img.imageId) ids.add(img.imageId); }
+                }
+            }
+            return ids;
+        };
+        const _pushConvoToR2Direct = async (convoId, convoJson, imageIds, localFs) => {
+            const r2Client = useR2Client();
+            await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json' });
+            const syncedR2 = JSON.parse(localStorage.getItem('nai-r2-synced-images') || '{}');
+            const syncedSet = new Set(syncedR2[convoId] || []);
+            const newImages = [...imageIds].filter(id => !syncedSet.has(id));
+            for (const imgId of newImages) {
+                try {
+                    const imgData = await localFs.promises.readFile('/' + imgId);
+                    await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
+                } catch {}
+            }
+            try {
+                const listRes = await r2Client.r2Fetch('GET', `conversations/${convoId}/images`);
+                if (listRes.ok) {
+                    const remoteImages = await listRes.json();
+                    const orphaned = remoteImages.filter(name => !imageIds.has(name));
+                    for (const name of orphaned) {
+                        try { await r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`); } catch {}
+                    }
+                }
+            } catch {}
+            syncedR2[convoId] = [...imageIds];
+            localStorage.setItem('nai-r2-synced-images', JSON.stringify(syncedR2));
+        };
         const serializeConversation = async (messages) => {
             const imageStore = useImageStore();
             const serializedMessages = await Promise.all(messages.map(async (msg) => {
@@ -1374,6 +1465,15 @@ const TagCountBadge={
                     const lfs = imageStore.getLfs();
                     if (lfs) { lfs.promises.unlink(_convoPath(id)).catch(() => {}); }
                 }
+                // Add tombstone so pull won't resurrect this conversation
+                if (cloudConversations.value[id]) {
+                    const cfg = store.config.value;
+                    const tombstones = cfg.jssync._deletedConversationIds || [];
+                    if (!tombstones.some(t => t.id === id)) {
+                        tombstones.push({ id, deletedAt: Date.now() });
+                        cfg.jssync._deletedConversationIds = tombstones;
+                    }
+                }
                 if (conversationMap.has(id)) closeConversation(id);
                 deleteCloudConversation(id).catch(() => {});
                 toast.q('Removed from saved chats');
@@ -1424,17 +1524,6 @@ const TagCountBadge={
                 if (msgs) _autoSave();
             }, { deep: true });
             const r2Client = useR2Client();
-            const _collectImageIds = (convoData) => {
-                const ids = new Set();
-                for (const msg of convoData.messages || []) {
-                    for (const img of msg.images || []) { if (img.imageId) ids.add(img.imageId); }
-                    for (const v of msg.variants || []) {
-                        for (const part of v.parts || []) { if (part._imageRef) ids.add(part._imageRef); }
-                        for (const img of v._images || []) { if (img.imageId) ids.add(img.imageId); }
-                    }
-                }
-                return ids;
-            };
             // Push conversation JSON + images to R2 via the worker
             const _pushConvoR2Locks = new Map();
             const _pushConvoToR2 = (convoId, convoJson, imageIds, localFs) => {
@@ -1770,13 +1859,16 @@ const TagCountBadge={
                 const R2_FREE_LIMIT = 10 * 1024 * 1024 * 1024; // 10 GB
                 const storageUsage = ref(null);
                 const isLoadingUsage = ref(false);
+                const usageError = ref(null);
                 const fetchUsage = async () => {
                     if (!syncToken.value || !jssync.proxyUrl) return;
                     isLoadingUsage.value = true;
+                    usageError.value = null;
                     try {
                         const res = await r2Client.r2Fetch('GET', 'usage');
                         if (res.ok) storageUsage.value = await res.json();
-                    } catch {} finally { isLoadingUsage.value = false; }
+                        else { storageUsage.value = null; usageError.value = `Request failed (${res.status})`; }
+                    } catch (e) { storageUsage.value = null; usageError.value = e.message || 'Unknown error'; } finally { isLoadingUsage.value = false; }
                 };
                 const usagePct = computed(() => storageUsage.value ? Math.min(100, (storageUsage.value.totalBytes / R2_FREE_LIMIT) * 100) : 0);
                 const usageColor = computed(() => usagePct.value > 90 ? 'progress-error' : usagePct.value > 70 ? 'progress-warning' : 'progress-primary');
@@ -1801,9 +1893,9 @@ const TagCountBadge={
                     if (!jssync.proxyUrl) return toast.err('Enter your Worker URL first.', 'sync');
                     syncStore.syncNow();
                 };
-                return { app, gemini, jssync, syncToken, models, isSyncing, syncStatus, syncError, statusMeta, handleSyncNow, storageUsage, isLoadingUsage, usagePct, usageColor, fmtBytes, fetchUsage };
+                return { app, gemini, jssync, syncToken, models, isSyncing, syncStatus, syncError, statusMeta, handleSyncNow, storageUsage, isLoadingUsage, usageError, usagePct, usageColor, fmtBytes, fetchUsage };
             },
-            template:`<div class="max-w-4xl mx-auto p-4 space-y-4 h-full custom-scroll"><collapsible-panel title="API Configuration" storage-key="api-config"><div class="pt-2 space-y-5"><setting-input type="password" v-model="app.apiKey" label="NovelAI API Key" help-text="Stored locally in your browser."></setting-input><setting-input type="password" v-model="gemini.apiKey" label="Vertex AI API Key" placeholder="AIzaSy..." help-text="Get a key from &lt;a href='https://console.cloud.google.com/apis/credentials' target='_blank' class='text-primary hover:underline'&gt;Google Cloud Console → APIs &amp; Services → Credentials&lt;/a&gt;. Stored locally."></setting-input></div></collapsible-panel><collapsible-panel title="Application Settings" storage-key="app-settings"><div class="pt-2"><setting-input v-model="app.model" label="NovelAI Model" type="select" :options="models"></setting-input></div></collapsible-panel><collapsible-panel storage-key="sync-settings"><template #header><span class="flex-row-gap"><material-icon icon="cloud_sync" :size="20" class="text-primary/80 shrink-0"/><span>Cross-Browser Cloud Sync</span></span><span v-if="syncToken && jssync.proxyUrl" class="flex items-center gap-1.5 ml-1 shrink-0"><spin-icon :loading="isSyncing" :icon="statusMeta.icon" :size="16" :class="isSyncing ? 'text-info' : statusMeta.color"></spin-icon><span class="text-xs font-medium" :class="statusMeta.color">{{ statusMeta.text }}</span></span></template><template #actions><button @click.stop="handleSyncNow" :disabled="isSyncing || !syncToken || !jssync.proxyUrl" class="btn btn-ghost btn-xs btn-wborder gap-1" title="Sync Now"><spin-icon :loading="isSyncing" icon="sync" :size="14"></spin-icon><span>Sync Now</span></button></template><div class="pt-1 space-y-4"><div class="alert bg-primary/8 border border-primary/15 text-sm gap-2 py-2.5"><material-icon icon="info" :size="18" class="text-primary/70 shrink-0"/><div class="text-xs text-neutral-400 leading-relaxed"> Sync your settings and conversations across browsers using <strong class="text-neutral-300">Cloudflare R2</strong> via your Cloudflare Worker. Configure your Worker URL and the shared secret (set as <code class="text-primary/80">R2_AUTH_SECRET</code> in your Worker environment).</div></div><div class="space-y-2"><setting-input type="text" v-model="jssync.proxyUrl" label="Cloudflare Worker URL" placeholder="https://my-worker.workers.dev" help-text="Your Cloudflare Worker URL. Handles R2 storage, Danbooru image proxy, and CORS proxying."></setting-input></div><setting-input type="password" v-model="syncToken" label="Sync Secret" placeholder="your-shared-secret" help-text="Must match the R2_AUTH_SECRET configured in your Cloudflare Worker. Stored locally only."></setting-input><div v-if="syncToken && jssync.proxyUrl" class="glass-nested rounded-xl p-3 space-y-2"><div class="flex items-center justify-between"><span class="text-xs font-medium text-neutral-300 flex items-center gap-1.5"><material-icon icon="database" :size="14" class="text-primary/70"/>R2 Storage Usage</span><button @click="fetchUsage" :disabled="isLoadingUsage" class="btn btn-ghost btn-xs gap-1 text-neutral-500 hover:text-white"><spin-icon :loading="isLoadingUsage" icon="refresh" :size="12"></spin-icon></button></div><div v-if="storageUsage" class="space-y-1.5"><progress :class="['progress w-full h-2', usageColor]" :value="usagePct" max="100"></progress><div class="flex justify-between text-xs text-neutral-500"><span>{{ fmtBytes(storageUsage.totalBytes) }} / 10 GB free tier</span><span>{{ storageUsage.objectCount }} object{{ storageUsage.objectCount !== 1 ? 's' : '' }}</span></div></div><div v-else-if="isLoadingUsage" class="flex items-center gap-2 text-xs text-neutral-500 py-1"><span class="loading loading-spinner loading-xs"></span>Loading...</div><div v-else class="text-xs text-neutral-600 py-1">Click refresh to check storage usage.</div></div><div class="flex flex-wrap gap-x-6 gap-y-2 py-1"><label class="flex-row-gap cursor-pointer"><input type="checkbox" v-model="jssync.autoSync" class="toggle toggle-xs toggle-primary"><span class="text-sm text-neutral-300">Auto-sync on changes</span><span class="text-xs text-neutral-600">(5s debounce)</span></label></div></div></collapsible-panel></div>`
+            template:`<div class="max-w-4xl mx-auto p-4 space-y-4 h-full custom-scroll"><collapsible-panel title="API Configuration" storage-key="api-config"><div class="pt-2 space-y-5"><setting-input type="password" v-model="app.apiKey" label="NovelAI API Key" help-text="Stored locally in your browser."></setting-input><setting-input type="password" v-model="gemini.apiKey" label="Vertex AI API Key" placeholder="AIzaSy..." help-text="Get a key from &lt;a href='https://console.cloud.google.com/apis/credentials' target='_blank' class='text-primary hover:underline'&gt;Google Cloud Console → APIs &amp; Services → Credentials&lt;/a&gt;. Stored locally."></setting-input></div></collapsible-panel><collapsible-panel title="Application Settings" storage-key="app-settings"><div class="pt-2"><setting-input v-model="app.model" label="NovelAI Model" type="select" :options="models"></setting-input></div></collapsible-panel><collapsible-panel storage-key="sync-settings"><template #header><span class="flex-row-gap"><material-icon icon="cloud_sync" :size="20" class="text-primary/80 shrink-0"/><span>Cross-Browser Cloud Sync</span></span><span v-if="syncToken && jssync.proxyUrl" class="flex items-center gap-1.5 ml-1 shrink-0"><spin-icon :loading="isSyncing" :icon="statusMeta.icon" :size="16" :class="isSyncing ? 'text-info' : statusMeta.color"></spin-icon><span class="text-xs font-medium" :class="statusMeta.color">{{ statusMeta.text }}</span></span></template><template #actions><button @click.stop="handleSyncNow" :disabled="isSyncing || !syncToken || !jssync.proxyUrl" class="btn btn-ghost btn-xs btn-wborder gap-1" title="Sync Now"><spin-icon :loading="isSyncing" icon="sync" :size="14"></spin-icon><span>Sync Now</span></button></template><div class="pt-1 space-y-4"><div class="alert bg-primary/8 border border-primary/15 text-sm gap-2 py-2.5"><material-icon icon="info" :size="18" class="text-primary/70 shrink-0"/><div class="text-xs text-neutral-400 leading-relaxed"> Sync your settings and conversations across browsers using <strong class="text-neutral-300">Cloudflare R2</strong> via your Cloudflare Worker. Configure your Worker URL and the shared secret (set as <code class="text-primary/80">R2_AUTH_SECRET</code> in your Worker environment).</div></div><div class="space-y-2"><setting-input type="text" v-model="jssync.proxyUrl" label="Cloudflare Worker URL" placeholder="https://my-worker.workers.dev" help-text="Your Cloudflare Worker URL. Handles R2 storage, Danbooru image proxy, and CORS proxying."></setting-input></div><setting-input type="password" v-model="syncToken" label="Sync Secret" placeholder="your-shared-secret" help-text="Must match the R2_AUTH_SECRET configured in your Cloudflare Worker. Stored locally only."></setting-input><div v-if="syncToken && jssync.proxyUrl" class="glass-nested rounded-xl p-3 space-y-2"><div class="flex items-center justify-between"><span class="text-xs font-medium text-neutral-300 flex items-center gap-1.5"><material-icon icon="database" :size="14" class="text-primary/70"/>R2 Storage Usage</span><button @click="fetchUsage" :disabled="isLoadingUsage" class="btn btn-ghost btn-xs gap-1 text-neutral-500 hover:text-white"><spin-icon :loading="isLoadingUsage" icon="refresh" :size="12"></spin-icon></button></div><div v-if="storageUsage" class="space-y-1.5"><progress :class="['progress w-full h-2', usageColor]" :value="usagePct" max="100"></progress><div class="flex justify-between text-xs text-neutral-500"><span>{{ fmtBytes(storageUsage.totalBytes) }} / 10 GB free tier</span><span>{{ storageUsage.objectCount }} object{{ storageUsage.objectCount !== 1 ? 's' : '' }}</span></div></div><div v-else-if="isLoadingUsage" class="flex items-center gap-2 text-xs text-neutral-500 py-1"><span class="loading loading-spinner loading-xs"></span>Loading...</div><div v-else-if="usageError" class="flex items-center gap-2 text-xs text-error/70 py-1"><material-icon icon="error" :size="12"/>{{ usageError }}</div><div v-else class="text-xs text-neutral-600 py-1">Click refresh to check storage usage.</div></div><div class="flex flex-wrap gap-x-6 gap-y-2 py-1"><label class="flex-row-gap cursor-pointer"><input type="checkbox" v-model="jssync.autoSync" class="toggle toggle-xs toggle-primary"><span class="text-sm text-neutral-300">Auto-sync on changes</span><span class="text-xs text-neutral-600">(5s debounce)</span></label></div></div></collapsible-panel></div>`
         };
         const routes = [
             {path:'/', redirect:'/tagtest'},
@@ -1847,15 +1939,10 @@ const TagCountBadge={
                             const c = config.value;
                             return [
                                 c.tagTest, c.genConfig, c.genState,
-                                c.app.model,
+                                c.app,
                                 c.danbooru
                             ];
                         },
-                        _debouncedAutoSync,
-                        { deep: true }
-                    );
-                    watch(
-                        () => [geminiAPI.savedConversations.value, geminiAPI.cloudConversations.value],
                         _debouncedAutoSync,
                         { deep: true }
                     );
