@@ -1443,10 +1443,15 @@ const TagCountBadge={
                 });
                 if (!res.ok) throw new Error(`Gist PATCH failed: ${res.status}`);
             };
-            const _pushConvoGit = async (gistId, convoJson, imageIds, localFs) => {
+            const _pushConvoImages = async (gistId, imageIds, localFs) => {
+                const syncedArr = _syncedConvoImages.value[gistId] || [];
+                const syncedSet = new Set(syncedArr);
+                const newImages = [...imageIds].filter(id => !syncedSet.has(id));
+                const maybeOrphaned = syncedArr.filter(id => !imageIds.has(id));
+                if (!newImages.length && !maybeOrphaned.length) return;
                 const corsProxy = _buildCorsProxy();
                 if (!corsProxy) {
-                    throw new Error('A CORS proxy URL is required to sync conversations.');
+                    throw new Error('A CORS proxy URL is required to sync conversation images.');
                 }
                 const token = store.syncToken.value;
                 const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
@@ -1458,16 +1463,6 @@ const TagCountBadge={
                 await window.git.clone({ fs: syncFs, http: window.gitHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1, onAuth });
                 const branch = await window.git.currentBranch({ fs: syncFs, dir }) || 'main';
                 let staged = false;
-                let existingConvo = null;
-                try { existingConvo = await syncFs.promises.readFile(dir + '/conversation.json', { encoding: 'utf8' }); } catch {}
-                if (existingConvo !== convoJson) {
-                    await syncFs.promises.writeFile(dir + '/conversation.json', convoJson);
-                    await window.git.add({ fs: syncFs, dir, filepath: 'conversation.json' });
-                    staged = true;
-                }
-                const syncedArr = _syncedConvoImages.value[gistId] || [];
-                const syncedSet = new Set(syncedArr);
-                const newImages = [...imageIds].filter(id => !syncedSet.has(id));
                 for (const imgId of newImages) {
                     try {
                         const imgData = await localFs.promises.readFile('/' + imgId);
@@ -1484,7 +1479,7 @@ const TagCountBadge={
                     }
                 }
                 if (!staged) return;
-                await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync conversation' });
+                await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync images' });
                 await window.git.push({ fs: syncFs, http: window.gitHttp, dir, corsProxy, remote: 'origin', ref: branch, onAuth });
                 _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
             };
@@ -1499,15 +1494,8 @@ const TagCountBadge={
                 catch { throw new Error('Conversation data not found locally.'); }
                 const convoData = JSON.parse(convoJson);
                 const imageIds = _collectImageIds(convoData);
-                const syncedArr = _syncedConvoImages.value[gistId] || [];
-                const syncedSet = new Set(syncedArr);
-                const needsImageSync = [...imageIds].some(id => !syncedSet.has(id))
-                    || syncedArr.some(id => !imageIds.has(id));
-                if (needsImageSync) {
-                    await _pushConvoGit(gistId, convoJson, imageIds, localFs);
-                } else {
-                    await _patchConvoText(gistId, convoJson);
-                }
+                await _patchConvoText(gistId, convoJson);
+                await _pushConvoImages(gistId, imageIds, localFs);
             };
             let _gistSyncInProgress = false;
             const _gistSyncDirty = new Set();

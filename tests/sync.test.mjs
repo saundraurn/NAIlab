@@ -101,8 +101,8 @@ describe('Source verification', () => {
     it('nailabpre.html contains _patchConvoText', () => {
         assert.ok(html.includes('const _patchConvoText'));
     });
-    it('nailabpre.html contains _pushConvoGit', () => {
-        assert.ok(html.includes('const _pushConvoGit'));
+    it('nailabpre.html contains _pushConvoImages', () => {
+        assert.ok(html.includes('const _pushConvoImages'));
     });
     it('nailabpre.html contains _syncConversationToItsGist', () => {
         assert.ok(html.includes('const _syncConversationToItsGist'));
@@ -119,31 +119,39 @@ describe('Source verification', () => {
     it('nailabpre.html contains extractSyncPayload', () => {
         assert.ok(html.includes('const extractSyncPayload'));
     });
-    it('nailabpre.html routes sync: git push when images need syncing, REST PATCH when text-only', () => {
+    it('nailabpre.html uses two-step sync: _patchConvoText then _pushConvoImages', () => {
         const syncFn = html.match(/const _syncConversationToItsGist[\s\S]*?(?=\n\s*let _gistSyncInProgress)/);
         assert.ok(syncFn, '_syncConversationToItsGist function found');
         const body = syncFn[0];
-        assert.ok(body.includes('needsImageSync'), 'checks whether images need syncing');
-        assert.ok(body.includes('_pushConvoGit'), 'calls _pushConvoGit when images need syncing');
-        assert.ok(body.includes('_patchConvoText'), 'calls _patchConvoText for text-only updates');
+        const patchIdx = body.indexOf('_patchConvoText');
+        const pushIdx = body.indexOf('_pushConvoImages');
+        assert.ok(patchIdx > -1, '_patchConvoText called');
+        assert.ok(pushIdx > -1, '_pushConvoImages called');
+        assert.ok(patchIdx < pushIdx, '_patchConvoText is called before _pushConvoImages');
     });
-    it('_pushConvoGit uses onAuth callback and window.gitHttp (not makeAuthHttp)', () => {
-        const pushFn = html.match(/const _pushConvoGit[\s\S]*?(?=\n\s*const _syncConversationToItsGist)/);
-        assert.ok(pushFn, '_pushConvoGit function found');
+    it('_pushConvoImages uses onAuth callback and window.gitHttp (not makeAuthHttp)', () => {
+        const pushFn = html.match(/const _pushConvoImages[\s\S]*?(?=\n\s*const _syncConversationToItsGist)/);
+        assert.ok(pushFn, '_pushConvoImages function found');
         const body = pushFn[0];
         assert.ok(body.includes('onAuth'), 'uses onAuth callback');
         assert.ok(body.includes('window.gitHttp'), 'uses window.gitHttp');
         assert.ok(!body.includes('makeAuthHttp'), 'does NOT use makeAuthHttp');
     });
-    it('_pushConvoGit skips push when nothing staged', () => {
-        const pushFn = html.match(/const _pushConvoGit[\s\S]*?(?=\n\s*const _syncConversationToItsGist)/);
+    it('_pushConvoImages returns early when no new/orphaned images', () => {
+        const pushFn = html.match(/const _pushConvoImages[\s\S]*?(?=\n\s*const _syncConversationToItsGist)/);
         const body = pushFn[0];
-        assert.ok(body.includes('if (!staged) return'), 'early return when nothing staged');
+        assert.ok(body.includes('if (!newImages.length && !maybeOrphaned.length) return'), 'early return present');
     });
     it('git push does not use force:true', () => {
-        const pushFn = html.match(/const _pushConvoGit[\s\S]*?(?=\n\s*const _syncConversationToItsGist)/);
+        const pushFn = html.match(/const _pushConvoImages[\s\S]*?(?=\n\s*const _syncConversationToItsGist)/);
         const body = pushFn[0];
         assert.ok(!body.includes('force: true') && !body.includes('force:true'), 'no force:true in push');
+    });
+    it('_pushConvoImages does NOT stage conversation.json via git', () => {
+        const pushFn = html.match(/const _pushConvoImages[\s\S]*?(?=\n\s*const _syncConversationToItsGist)/);
+        const body = pushFn[0];
+        assert.ok(!body.includes("filepath: 'conversation.json'"), 'does NOT git add conversation.json');
+        assert.ok(!body.includes('writeFile(dir + \'/conversation.json\''), 'does NOT write conversation.json to git working tree');
     });
 });
 
@@ -874,7 +882,7 @@ describe('_patchConvoText', () => {
 // _syncConversationToItsGist orchestration
 // ---------------------------------------------------------------------------
 describe('_syncConversationToItsGist orchestration', () => {
-    it('uses git push for images + text when images need syncing', async () => {
+    it('reads conversation from LFS, patches text, then pushes images', async () => {
         const callOrder = [];
         const convoJson = JSON.stringify({
             messages: [
@@ -892,76 +900,19 @@ describe('_syncConversationToItsGist orchestration', () => {
             }
         };
 
-        let pushGitArgs;
-        const _patchConvoText = async (gistId, json) => {
-            callOrder.push('patch');
-        };
-        const _pushConvoGit = async (gistId, json, imageIds, fs) => {
-            callOrder.push('pushGit');
-            pushGitArgs = { gistId, json, imageIds };
-        };
-
-        // Simulated _syncConversationToItsGist: routes to git push when images need syncing
-        const _syncConversationToItsGist = async (id) => {
-            const gistId = 'gist-abc';
-            const _syncedConvoImages = {};
-            let json;
-            try {
-                json = await localFs.promises.readFile(`/convo_${id}.json`, { encoding: 'utf8' });
-            } catch {
-                throw new Error('Conversation data not found locally.');
-            }
-            const convoData = JSON.parse(json);
-            const imageIds = _collectImageIds(convoData);
-            const syncedArr = _syncedConvoImages[gistId] || [];
-            const syncedSet = new Set(syncedArr);
-            const needsImageSync = [...imageIds].some(id => !syncedSet.has(id))
-                || syncedArr.some(id => !imageIds.has(id));
-            if (needsImageSync) {
-                await _pushConvoGit(gistId, json, imageIds, localFs);
-            } else {
-                await _patchConvoText(gistId, json);
-            }
-        };
-
-        await _syncConversationToItsGist('convo-1');
-
-        assert.deepEqual(callOrder, ['readFile:/convo_convo-1.json', 'pushGit']);
-        assert.equal(pushGitArgs.gistId, 'gist-abc');
-        assert.equal(pushGitArgs.json, convoJson);
-        assert.ok(pushGitArgs.imageIds.has('img_1.webp'));
-        assert.ok(pushGitArgs.imageIds.has('img_2.webp'));
-    });
-
-    it('uses REST PATCH for text-only updates when all images are synced', async () => {
-        const callOrder = [];
-        const convoJson = JSON.stringify({
-            messages: [
-                { role: 'user', images: [{ imageId: 'img_1.webp' }] }
-            ]
-        });
-
-        const localFs = {
-            promises: {
-                readFile: async (path, opts) => {
-                    callOrder.push(`readFile:${path}`);
-                    return convoJson;
-                }
-            }
-        };
-
-        let patchArgs;
+        let patchArgs, pushArgs;
         const _patchConvoText = async (gistId, json) => {
             callOrder.push('patch');
             patchArgs = { gistId, json };
         };
-        const _pushConvoGit = async () => {
-            callOrder.push('pushGit');
+        const _pushConvoImages = async (gistId, imageIds, fs) => {
+            callOrder.push('push');
+            pushArgs = { gistId, imageIds };
         };
 
+        // Simulated _syncConversationToItsGist (matches source flow: read → parse → patch → push)
         const _syncConversationToItsGist = async (id) => {
             const gistId = 'gist-abc';
-            const _syncedConvoImages = { 'gist-abc': ['img_1.webp'] };
             let json;
             try {
                 json = await localFs.promises.readFile(`/convo_${id}.json`, { encoding: 'utf8' });
@@ -970,21 +921,18 @@ describe('_syncConversationToItsGist orchestration', () => {
             }
             const convoData = JSON.parse(json);
             const imageIds = _collectImageIds(convoData);
-            const syncedArr = _syncedConvoImages[gistId] || [];
-            const syncedSet = new Set(syncedArr);
-            const needsImageSync = [...imageIds].some(id => !syncedSet.has(id))
-                || syncedArr.some(id => !imageIds.has(id));
-            if (needsImageSync) {
-                await _pushConvoGit(gistId, json, imageIds, localFs);
-            } else {
-                await _patchConvoText(gistId, json);
-            }
+            await _patchConvoText(gistId, json);
+            await _pushConvoImages(gistId, imageIds, localFs);
         };
 
         await _syncConversationToItsGist('convo-1');
 
-        assert.deepEqual(callOrder, ['readFile:/convo_convo-1.json', 'patch']);
+        assert.deepEqual(callOrder, ['readFile:/convo_convo-1.json', 'patch', 'push']);
         assert.equal(patchArgs.gistId, 'gist-abc');
+        assert.equal(patchArgs.json, convoJson);
+        assert.equal(pushArgs.gistId, 'gist-abc');
+        assert.ok(pushArgs.imageIds.has('img_1.webp'));
+        assert.ok(pushArgs.imageIds.has('img_2.webp'));
     });
 
     it('throws when conversation data not found locally', async () => {
@@ -1141,7 +1089,7 @@ describe('Sync architecture invariants', () => {
         assert.ok(html.includes("public: false, files: { 'conversation.json': { content: '{}' }"));
     });
 
-    it('_pushConvoGit clones with depth:1 for efficiency', () => {
+    it('_pushConvoImages clones with depth:1 for efficiency', () => {
         assert.ok(html.includes('depth: 1, onAuth'));
     });
 });
