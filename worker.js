@@ -184,12 +184,24 @@ export default {
       if (!PROXY_ALLOWED_HOSTS.has(targetUrl.hostname)) {
         return new Response('Proxy target host not allowed', { status: 403 });
       }
+      // Strip sensitive headers before forwarding
+      const fwdHeaders = new Headers(request.headers);
+      fwdHeaders.delete('Authorization');
+      fwdHeaders.delete('Cookie');
       try {
-        return await fetch(new Request(target, {
+        const upstream = await fetch(new Request(target, {
           method: request.method,
-          headers: request.headers,
+          headers: fwdHeaders,
           body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : null,
         }));
+        // Add CORS headers to upstream response
+        const resp = new Response(upstream.body, {
+          status: upstream.status,
+          statusText: upstream.statusText,
+          headers: new Headers(upstream.headers),
+        });
+        resp.headers.set('Access-Control-Allow-Origin', '*');
+        return resp;
       } catch (err) {
         return new Response(`Proxy fetch failed: ${err.message}`, { status: 502 });
       }
