@@ -1618,8 +1618,8 @@ const TagCountBadge={
                 catch { throw new Error('Conversation data not found locally.'); }
                 const convoData = JSON.parse(convoJson);
                 const imageIds = _collectImageIds(convoData);
-                await _patchConvoText(gistId, convoJson);
                 await _pushConvoImages(gistId, imageIds, localFs);
+                await _patchConvoText(gistId, convoJson);
             };
             let _gistSyncInProgress = false;
             const _gistSyncDirty = new Set();

@@ -119,7 +119,7 @@ describe('Source verification', () => {
     it('nailabpre.html contains extractSyncPayload', () => {
         assert.ok(html.includes('const extractSyncPayload'));
     });
-    it('nailabpre.html uses two-step sync: _patchConvoText then _pushConvoImages', () => {
+    it('nailabpre.html uses two-step sync: _pushConvoImages then _patchConvoText (images first to avoid race)', () => {
         const syncFn = html.match(/const _syncConversationToItsGist[\s\S]*?(?=\n\s*let _gistSyncInProgress)/);
         assert.ok(syncFn, '_syncConversationToItsGist function found');
         const body = syncFn[0];
@@ -127,7 +127,7 @@ describe('Source verification', () => {
         const pushIdx = body.indexOf('_pushConvoImages');
         assert.ok(patchIdx > -1, '_patchConvoText called');
         assert.ok(pushIdx > -1, '_pushConvoImages called');
-        assert.ok(patchIdx < pushIdx, '_patchConvoText is called before _pushConvoImages');
+        assert.ok(pushIdx < patchIdx, '_pushConvoImages is called before _patchConvoText (avoids PATCH→clone race)');
     });
     it('_pushConvoImages uses onAuth callback and window.gitHttp (not makeAuthHttp)', () => {
         const pushFn = html.match(/const _pushConvoImages[\s\S]*?(?=\n\s*const _syncConversationToItsGist)/);
