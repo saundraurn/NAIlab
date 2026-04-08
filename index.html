@@ -336,7 +336,18 @@
             };
             const makeAuthHttp = (token) => {
                 const authHeader = `Basic ${btoa(`oauth2:${token || getToken()}`)}`;
-                return { async request({ url, method, headers: h = {}, body, onProgress }) { return window.gitHttp.request({ url, method, body, onProgress, headers: { ...h, 'Authorization': authHeader } }); } };
+                return { async request({ url, method = 'GET', headers: h = {}, body }) {
+                    if (body) {
+                        const chunks = []; for await (const c of body) chunks.push(c);
+                        const len = chunks.reduce((s, c) => s + c.length, 0);
+                        const merged = new Uint8Array(len); let off = 0;
+                        for (const c of chunks) { merged.set(c, off); off += c.length; }
+                        body = merged;
+                    }
+                    const res = await fetch(url, { method, headers: { ...h, 'Authorization': authHeader }, body, cache: 'no-store' });
+                    return { url: res.url, method, statusCode: res.status, statusMessage: res.statusText,
+                        body: [new Uint8Array(await res.arrayBuffer())], headers: Object.fromEntries([...res.headers]) };
+                } };
             };
             const buildCorsProxy = () => {
                 let base = appStore.config.value.jssync.proxyUrl;
@@ -1586,8 +1597,8 @@ const TagCountBadge={
                 const dir = '/repo';
                 try { await syncFs.promises.mkdir(dir); } catch {}
                 const gitUrl = `https://gist.github.com/${gistId}.git`;
-                const onAuth = () => ({ username: 'oauth2', password: token });
-                await window.git.clone({ fs: syncFs, http: window.gitHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1, onAuth });
+                const authHttp = ghClient.makeAuthHttp(token);
+                await window.git.clone({ fs: syncFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1 });
                 let branch;
                 try { branch = await window.git.currentBranch({ fs: syncFs, dir }); } catch {}
                 branch = branch || 'main';
@@ -1609,7 +1620,7 @@ const TagCountBadge={
                 }
                 if (!staged) return;
                 await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync images' });
-                await window.git.push({ fs: syncFs, http: window.gitHttp, dir, corsProxy, remote: 'origin', ref: branch, onAuth });
+                await window.git.push({ fs: syncFs, http: authHttp, dir, corsProxy, remote: 'origin', ref: branch, force: true });
                 _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
             };
             const _syncConversationToItsGist = async (id) => {
