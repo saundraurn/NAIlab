@@ -1558,54 +1558,35 @@ const TagCountBadge={
                 await useSyncStore().push(true);
                 return gistData.id;
             };
-            // Per-gist mutex: serializes concurrent pushes to the same gist to prevent
-            // LightningFS IndexedDB lock contention and git pre-receive rejections.
-            const _pushConvoGistLocks = new Map();
-            const _pushConvoGist = (gistId, convoJson, imageIds, localFs) => {
-                const prev = _pushConvoGistLocks.get(gistId) || Promise.resolve();
-                const next = prev.then(() => _doPushConvoGist(gistId, convoJson, imageIds, localFs));
-                _pushConvoGistLocks.set(gistId, next.catch(() => {}));
-                return next;
-            };
-            // Unified push: writes conversation.json AND images in one git commit.
-            // This avoids the race condition where a separate REST API PATCH creates a
-            // commit that the subsequent shallow clone may not see due to replication
-            // lag between GitHub's API and git backends, causing non-fast-forward
-            // rejections from the pre-receive hook.
-            const _doPushConvoGist = async (gistId, convoJson, imageIds, localFs) => {
-                const corsProxy = ghClient.buildCorsProxy();
-                if (!corsProxy) {
-                    throw new Error('A CORS proxy URL is required to sync conversations.');
-                }
+            const _patchConvoText = async (gistId, convoJson) => {
                 const token = store.syncToken.value;
-                const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
-                // Unique FS name per invocation: prevents concurrent calls (e.g. from
-                // createConversationGist racing with _runGistSync) from sharing the same
-                // IndexedDB store and stealing each other's lock.
-                const syncFs = new LightningFS(`nailab-convo-push-${safeGistId}-${Date.now()}`, { wipe: true });
-                const dir = '/repo';
-                try { await syncFs.promises.mkdir(dir); } catch {}
-                const gitUrl = `https://gist.github.com/${gistId}.git`;
-                const authHttp = ghClient.makeAuthHttp(token);
-                await window.git.clone({ fs: syncFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1 });
-                // currentBranch throws 'Could not find HEAD' when the clone didn't fully
-                // complete or the gist has no commits yet; default to 'main'.
-                let branch;
-                try { branch = await window.git.currentBranch({ fs: syncFs, dir }); } catch {}
-                branch = branch || 'main';
-                let staged = false;
-                // Write conversation.json into the git working tree so text and images
-                // are committed atomically — no separate REST PATCH needed.
-                let existingConvo = null;
-                try { existingConvo = await syncFs.promises.readFile(dir + '/conversation.json', { encoding: 'utf8' }); } catch {}
-                if (existingConvo !== convoJson) {
-                    await syncFs.promises.writeFile(dir + '/conversation.json', convoJson);
-                    await window.git.add({ fs: syncFs, dir, filepath: 'conversation.json' });
-                    staged = true;
-                }
+                const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+                    method: 'PATCH',
+                    headers: ghClient.headers(token),
+                    body: JSON.stringify({ files: { 'conversation.json': { content: convoJson } } })
+                });
+                if (!res.ok) throw new Error(`Gist PATCH failed: ${res.status}`);
+            };
+            const _pushConvoImages = async (gistId, imageIds, localFs) => {
                 const syncedArr = _syncedConvoImages.value[gistId] || [];
                 const syncedSet = new Set(syncedArr);
                 const newImages = [...imageIds].filter(id => !syncedSet.has(id));
+                const maybeOrphaned = syncedArr.filter(id => !imageIds.has(id));
+                if (!newImages.length && !maybeOrphaned.length) return;
+                const corsProxy = ghClient.buildCorsProxy();
+                if (!corsProxy) {
+                    throw new Error('A CORS proxy URL is required to sync conversation images.');
+                }
+                const token = store.syncToken.value;
+                const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
+                const syncFs = new LightningFS(`nailab-convo-push-${safeGistId}`, { wipe: true });
+                const dir = '/repo';
+                try { await syncFs.promises.mkdir(dir); } catch {}
+                const gitUrl = `https://gist.github.com/${gistId}.git`;
+                const onAuth = () => ({ username: 'oauth2', password: token });
+                await window.git.clone({ fs: syncFs, http: window.gitHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1, onAuth });
+                const branch = await window.git.currentBranch({ fs: syncFs, dir }) || 'main';
+                let staged = false;
                 for (const imgId of newImages) {
                     try {
                         const imgData = await localFs.promises.readFile('/' + imgId);
@@ -1622,8 +1603,8 @@ const TagCountBadge={
                     }
                 }
                 if (!staged) return;
-                await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync conversation' });
-                await window.git.push({ fs: syncFs, http: authHttp, dir, corsProxy, remote: 'origin', ref: branch, force: true });
+                await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync images' });
+                await window.git.push({ fs: syncFs, http: window.gitHttp, dir, corsProxy, remote: 'origin', ref: branch, onAuth });
                 _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
             };
             const _syncConversationToItsGist = async (id) => {
@@ -1637,77 +1618,47 @@ const TagCountBadge={
                 catch { throw new Error('Conversation data not found locally.'); }
                 const convoData = JSON.parse(convoJson);
                 const imageIds = _collectImageIds(convoData);
-                await _pushConvoGist(gistId, convoJson, imageIds, localFs);
+                await _patchConvoText(gistId, convoJson);
+                await _pushConvoImages(gistId, imageIds, localFs);
             };
             let _gistSyncInProgress = false;
-            let _gistSyncPromise = null;
             const _gistSyncDirty = new Set();
-            const _runGistSync = () => {
-                if (_gistSyncInProgress) return _gistSyncPromise || Promise.resolve();
+            const _runGistSync = async () => {
+                if (_gistSyncInProgress) return;
                 _gistSyncInProgress = true;
-                _gistSyncPromise = (async () => {
-                    try {
-                        const ids = [..._gistSyncDirty];
-                        _gistSyncDirty.clear();
-                        for (const id of ids) {
-                            const gistId = conversationGists.value[id];
-                            if (!gistId) continue;
-                            convoSyncStatus[id] = 'syncing';
-                            try {
-                                await _syncConversationToItsGist(id);
-                                convoSyncStatus[id] = 'synced';
-                            } catch (e) {
-                                convoSyncStatus[id] = 'error';
-                                console.warn('Convo gist sync failed:', e);
-                                const title = _.find(savedConversations.value, {id})?.title || id;
-                                toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
-                            }
+                try {
+                    const ids = [..._gistSyncDirty];
+                    _gistSyncDirty.clear();
+                    for (const id of ids) {
+                        const gistId = conversationGists.value[id];
+                        if (!gistId) continue;
+                        convoSyncStatus[id] = 'syncing';
+                        try {
+                            await _syncConversationToItsGist(id);
+                            convoSyncStatus[id] = 'synced';
+                        } catch (e) {
+                            convoSyncStatus[id] = 'error';
+                            console.warn('Convo gist sync failed:', e);
                         }
-                    } finally {
-                        _gistSyncInProgress = false;
-                        _gistSyncPromise = null;
-                        if (_gistSyncDirty.size) await _runGistSync();
                     }
-                })();
-                return _gistSyncPromise;
+                } finally {
+                    _gistSyncInProgress = false;
+                    if (_gistSyncDirty.size) _runGistSync();
+                }
             };
-            const _debouncedGistSync = useDebounceFn(_runGistSync, 10000);
+            const _debouncedGistSync = useDebounceFn(_runGistSync, 30000);
             const _autoSyncGist = (immediate) => immediate ? _runGistSync() : _debouncedGistSync();
             const syncConversationNow = async (id) => {
-                if (!conversationGists.value[id]) {
-                    convoSyncStatus[id] = 'syncing';
-                    try {
-                        await createConversationGist(id);
-                        convoSyncStatus[id] = 'synced';
-                        toast.q('Synced to cloud');
-                    } catch (e) {
-                        convoSyncStatus[id] = 'error';
-                        toast.err('Sync failed: ' + e.message);
-                    }
-                    return;
+                convoSyncStatus[id] = 'syncing';
+                try {
+                    if (!conversationGists.value[id]) await createConversationGist(id);
+                    else await _syncConversationToItsGist(id);
+                    convoSyncStatus[id] = 'synced';
+                    toast.q('Synced to cloud');
+                } catch (e) {
+                    convoSyncStatus[id] = 'error';
+                    toast.err('Sync failed: ' + e.message);
                 }
-                convoSyncStatus[id] = 'pending';
-                _gistSyncDirty.add(id);
-                await _runGistSync();
-                // Poll until status resolves (handles case where sync was already in flight)
-                const deadline = Date.now() + 120000;
-                const gistSyncWaitTimedOut = Symbol('gistSyncWaitTimedOut');
-                while (convoSyncStatus[id] === 'pending' && Date.now() < deadline) {
-                    await new Promise(r => setTimeout(r, 500));
-                    if (_gistSyncPromise) {
-                        const remaining = deadline - Date.now();
-                        if (remaining <= 0) break;
-                        const result = await Promise.race([
-                            _gistSyncPromise,
-                            new Promise(resolve => setTimeout(() => resolve(gistSyncWaitTimedOut), remaining))
-                        ]);
-                        if (result === gistSyncWaitTimedOut) break;
-                    }
-                }
-                const status = convoSyncStatus[id];
-                if (status === 'synced') toast.q('Synced to cloud');
-                else if (status === 'error') toast.err('Sync failed');
-                else if (status === 'pending') toast.warn('Sync timed out — will retry automatically');
             };
             const deleteConversationGist = async (id) => {
                 const gistId = conversationGists.value[id];
