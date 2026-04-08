@@ -14,30 +14,13 @@
  *   - _syncConversationToItsGist orchestration
  */
 
-import { describe, it, beforeEach, mock } from 'node:test';
+import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-// ---------------------------------------------------------------------------
-// Extract pure functions from nailabpre.html source
-// ---------------------------------------------------------------------------
 const htmlPath = resolve(import.meta.dirname, '..', 'nailabpre.html');
 const html = readFileSync(htmlPath, 'utf-8');
-
-// Helper: grab a JS function body between markers in the HTML
-const extractFn = (src, name) => {
-    // Match:  const name = (args) => { ... };  OR  const name = (args) => expr;
-    const patterns = [
-        new RegExp(`const ${name} = \\(([^)]*)\\) => \\{([\\s\\S]*?)\\};`, 'm'),
-        new RegExp(`const ${name} = \\(([^)]*)\\) => ([^;]+);`, 'm'),
-    ];
-    for (const p of patterns) {
-        const m = src.match(p);
-        if (m) return m;
-    }
-    return null;
-};
 
 // ---------------------------------------------------------------------------
 // Re-implement _collectImageIds for testing (extracted from nailabpre source)
@@ -759,12 +742,14 @@ describe('syncConversationNow flow', () => {
         const conversationGists = {};
         const convoSyncStatus = {};
 
+        const _syncConversationToItsGist = async (id) => {
+            calls.push(`sync:${id}`);
+        };
         const createConversationGist = async (id) => {
             calls.push(`create:${id}`);
             conversationGists[id] = 'new-gist-id';
-        };
-        const _syncConversationToItsGist = async (id) => {
-            calls.push(`sync:${id}`);
+            // createConversationGist always calls _syncConversationToItsGist internally
+            await _syncConversationToItsGist(id);
         };
 
         // Simulated syncConversationNow
@@ -780,7 +765,8 @@ describe('syncConversationNow flow', () => {
         };
 
         await syncConversationNow('conv-123');
-        assert.deepEqual(calls, ['create:conv-123']);
+        assert.deepEqual(calls, ['create:conv-123', 'sync:conv-123']);
+        assert.equal(conversationGists['conv-123'], 'new-gist-id');
         assert.equal(convoSyncStatus['conv-123'], 'synced');
     });
 
@@ -918,18 +904,26 @@ describe('_syncConversationToItsGist orchestration', () => {
             pushArgs = { gistId, imageIds };
         };
 
-        // Simulated _syncConversationToItsGist
-        const token = 'tok';
-        const gistId = 'gist-abc';
-        const id = 'convo-1';
+        // Simulated _syncConversationToItsGist (matches source flow: read → parse → patch → push)
+        const _syncConversationToItsGist = async (id) => {
+            const gistId = 'gist-abc';
+            let json;
+            try {
+                json = await localFs.promises.readFile(`/convo_${id}.json`, { encoding: 'utf8' });
+            } catch {
+                throw new Error('Conversation data not found locally.');
+            }
+            const convoData = JSON.parse(json);
+            const imageIds = _collectImageIds(convoData);
+            await _patchConvoText(gistId, json);
+            await _pushConvoImages(gistId, imageIds, localFs);
+        };
 
-        const convoData = JSON.parse(convoJson);
-        const imageIds = _collectImageIds(convoData);
-        await _patchConvoText(gistId, convoJson);
-        await _pushConvoImages(gistId, imageIds, localFs);
+        await _syncConversationToItsGist('convo-1');
 
-        assert.deepEqual(callOrder, ['patch', 'push']);
+        assert.deepEqual(callOrder, ['readFile:/convo_convo-1.json', 'patch', 'push']);
         assert.equal(patchArgs.gistId, 'gist-abc');
+        assert.equal(patchArgs.json, convoJson);
         assert.equal(pushArgs.gistId, 'gist-abc');
         assert.ok(pushArgs.imageIds.has('img_1.webp'));
         assert.ok(pushArgs.imageIds.has('img_2.webp'));

@@ -513,13 +513,14 @@
             const startRename = (id, currentTitle) => {
                 renamingId.value = id;
                 renamingTitle.value = currentTitle || '';
-                nextTick(() => document.getElementById('rename-input-' + id)?.focus());
+                nextTick(() => document.querySelector('[id^="rename-input-"]')?.focus());
             };
             const commitRename = (onCommit) => {
                 const t = renamingTitle.value.trim();
                 const id = renamingId.value;
-                renamingId.value = null;
-                if (t && id != null && onCommit) onCommit(id, t);
+                if (!t || id == null) return;
+                const shouldClose = !onCommit || onCommit(id, t) !== false;
+                if (shouldClose) renamingId.value = null;
             };
             const cancelRename = () => { renamingId.value = null; };
             return { renamingId, renamingTitle, startRename, commitRename, cancelRename };
@@ -811,9 +812,9 @@ const TagCountBadge={
                 const featuredArtist = computed(() => { const a = splitTagString(displayedImage.value?.tag_string_artist)[0]; return a ? {name: a, type: 'artist'} : null; });
                 const {isOpen: isSavedOpen, root: savedRoot, close: closeSaved} = useDropdown();
                 const { renamingId: folderRenamingId, renamingTitle: folderRenamingTitle, startRename: startFolderRename, commitRename: _commitFolderRename, cancelRename: cancelFolderRename } = useInlineRename();
-                const commitFolderRename = () => _commitFolderRename((id, name) => { if (danbooru.value.folders.some(x => x.id !== id && x.name.toLowerCase() === name.toLowerCase())) return toast.err('Name taken.', 'danbooru'); const f = foldersById.value[id]; if (f) f.name = name; });
+                const commitFolderRename = () => _commitFolderRename((id, name) => { if (danbooru.value.folders.some(x => x.id !== id && x.name.toLowerCase() === name.toLowerCase())) { toast.err('Name taken.', 'danbooru'); return false; } const f = foldersById.value[id]; if (f) f.name = name; });
                 const { renamingId: searchRenamingId, renamingTitle: searchRenamingTitle, startRename: startSearchRename, commitRename: _commitSearchRename, cancelRename: cancelSearchRename } = useInlineRename();
-                const commitSearchRename = () => _commitSearchRename((oldName, newName) => { if (savedSearches.value.some(x => x.name !== oldName && x.name.toLowerCase() === newName.toLowerCase())) return toast.err('Name taken.', 'danbooru'); const item = _.find(savedSearches.value, {name: oldName}); if (item) item.name = newName; });
+                const commitSearchRename = () => _commitSearchRename((oldName, newName) => { if (savedSearches.value.some(x => x.name !== oldName && x.name.toLowerCase() === newName.toLowerCase())) { toast.err('Name taken.', 'danbooru'); return false; } const item = _.find(savedSearches.value, {name: oldName}); if (item) item.name = newName; });
                 return {
                     danbooru, isLoading, search, searchQueryInput, displayedImage, rightPanelRef, newFolderName, handleFolderButtonPress, goToFolder, activeFolderId, naiTagKnowledge, blacklist, sortOrder, ratingFilters, ratingMeta, savedSearches, savedSearchName, savedSearchAction, featuredArtist,
                     folderBtn: computed(() => newFolderName.value.trim() ? {icon: 'create_new_folder', color: 'btn-success text-white'} : {icon: 'create_new_folder', color: 'btn-ghost bg-white/5'}),
