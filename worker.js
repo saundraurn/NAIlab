@@ -6,10 +6,15 @@ const CORS_HEADERS = {
   'Access-Control-Max-Age': '86400',
 };
 
-function corsJson(data, status = 200) {
+const NO_CACHE_HEADERS = {
+  'Cache-Control': 'no-store, no-cache, must-revalidate',
+  'Pragma': 'no-cache',
+};
+
+function corsJson(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+    headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'Content-Type': 'application/json', ...extraHeaders },
   });
 }
 
@@ -26,7 +31,7 @@ async function handleR2(request, env, url) {
     if (request.method === 'GET') {
       const obj = await env.BUCKET.get('config.json');
       if (!obj) return corsJson({});
-      const headers = { ...CORS_HEADERS, 'Content-Type': 'application/json' };
+      const headers = { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'Content-Type': 'application/json' };
       if (obj.httpEtag) headers['ETag'] = obj.httpEtag;
       return new Response(obj.body, { headers });
     }
@@ -65,7 +70,7 @@ async function handleR2(request, env, url) {
       const obj = await env.BUCKET.get(`conversations/${convoId}/conversation.json`);
       if (!obj) return corsResponse('Not found', 404);
       return new Response(obj.body, {
-        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'Content-Type': 'application/json' },
       });
     }
     if (request.method === 'PUT') {
@@ -109,6 +114,10 @@ async function handleR2(request, env, url) {
       });
       return corsResponse('OK');
     }
+    if (request.method === 'DELETE') {
+      await env.BUCKET.delete(key);
+      return corsResponse('OK');
+    }
   }
 
   // ── List images for a conversation ───────────────────────────────────────
@@ -131,50 +140,30 @@ async function handleR2(request, env, url) {
     return corsJson(images);
   }
 
+  // ── Storage usage ──────────────────────────────────────────────────────────
+  if (path === 'usage' && request.method === 'GET') {
+    let totalSize = 0;
+    let objectCount = 0;
+    let cursor;
+    do {
+      const list = await env.BUCKET.list(cursor ? { cursor } : {});
+      for (const obj of list.objects) {
+        totalSize += obj.size;
+        objectCount++;
+      }
+      cursor = list.truncated ? list.cursor : null;
+    } while (cursor);
+    return corsJson({ totalBytes: totalSize, objectCount });
+  }
+
   return corsResponse('Not found', 404);
 }
 
-// ── Git CORS proxy for isomorphic-git ──────────────────────────────────────
-async function handleGitProxy(request, url) {
-  const targetPath = url.pathname.substring(5); // strip /git/
-  const targetUrl = 'https://' + targetPath + url.search;
-
-  const headers = new Headers(request.headers);
-  const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
-  const bodyBuffer = hasBody ? await request.arrayBuffer() : null;
-
-  let fetchUrl = targetUrl;
-  let response;
-  for (let hops = 0; hops < 5; hops++) {
-    try {
-      response = await fetch(new Request(fetchUrl, {
-        method: request.method,
-        headers,
-        body: bodyBuffer,
-        redirect: 'manual',
-      }));
-    } catch (err) {
-      return new Response(`Upstream fetch failed: ${err.message}`, { status: 502 });
-    }
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get('Location');
-      if (!location) break;
-      fetchUrl = location;
-      continue;
-    }
-    break;
-  }
-
-  const modifiedResponse = new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: new Headers(response.headers),
-  });
-  modifiedResponse.headers.set('Access-Control-Allow-Origin', '*');
-  modifiedResponse.headers.set('Access-Control-Allow-Headers', '*');
-  modifiedResponse.headers.set('Access-Control-Expose-Headers', '*');
-  return modifiedResponse;
-}
+// ── Allowed proxy hosts ─────────────────────────────────────────────────────
+const PROXY_ALLOWED_HOSTS = new Set([
+  'cdn.donmai.us',
+  'danbooru.donmai.us',
+]);
 
 // ── Main handler ───────────────────────────────────────────────────────────
 export default {
@@ -186,15 +175,15 @@ export default {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    // Git CORS proxy
-    if (url.pathname.startsWith('/git/')) {
-      return handleGitProxy(request, url);
-    }
-
-    // Danbooru image proxy
+    // Danbooru image proxy — restricted to allowed hosts
     if (url.pathname === '/proxy') {
       const target = url.searchParams.get('url');
       if (!target) return new Response('Missing url', { status: 400 });
+      let targetUrl;
+      try { targetUrl = new URL(target); } catch { return new Response('Invalid url', { status: 400 }); }
+      if (!PROXY_ALLOWED_HOSTS.has(targetUrl.hostname)) {
+        return new Response('Proxy target host not allowed', { status: 403 });
+      }
       try {
         return await fetch(new Request(target, {
           method: request.method,
