@@ -1379,9 +1379,9 @@ const TagCountBadge={
                 const dir = '/repo';
                 try { await tmpFs.promises.mkdir(dir); } catch {}
                 const gitUrl = `https://gist.github.com/${gistId}.git`;
-                const authHttp = ghClient.makeAuthHttp(token);
+                const onAuth = () => ({ username: 'oauth2', password: token });
                 try {
-                    await window.git.clone({ fs: tmpFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1 });
+                    await window.git.clone({ fs: tmpFs, http: window.gitHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1, onAuth });
                     const pulled = [];
                     for (const imgId of missing) {
                         try {
@@ -1586,8 +1586,8 @@ const TagCountBadge={
                 const dir = '/repo';
                 try { await syncFs.promises.mkdir(dir); } catch {}
                 const gitUrl = `https://gist.github.com/${gistId}.git`;
-                const authHttp = ghClient.makeAuthHttp(token);
-                await window.git.clone({ fs: syncFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1 });
+                const onAuth = () => ({ username: 'oauth2', password: token });
+                await window.git.clone({ fs: syncFs, http: window.gitHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1, onAuth });
                 // currentBranch throws 'Could not find HEAD' when the clone didn't fully
                 // complete or the gist has no commits yet; default to 'main'.
                 let branch;
@@ -1623,7 +1623,7 @@ const TagCountBadge={
                 }
                 if (!staged) return;
                 await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync conversation' });
-                await window.git.push({ fs: syncFs, http: authHttp, dir, corsProxy, remote: 'origin', ref: branch, force: true });
+                await window.git.push({ fs: syncFs, http: window.gitHttp, dir, corsProxy, remote: 'origin', ref: branch, force: true, onAuth });
                 _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
             };
             const _syncConversationToItsGist = async (id) => {
