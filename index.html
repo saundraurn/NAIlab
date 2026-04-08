@@ -428,13 +428,32 @@
                             cfg.jssync._deletedConversationIds = _pruneTombstones([...merged.values()]);
                         }
                     }
-                    // Pull conversation list from R2
+                    // Apply tombstones: remove locally-existing conversations that were deleted on another device
                     const gemini = useGeminiAPI();
+                    const tombstoneIds = new Set((cfg.jssync._deletedConversationIds || []).map(t => t.id));
+                    if (tombstoneIds.size) {
+                        let removedCount = 0;
+                        const localCloud = { ...gemini.cloudConversations.value };
+                        gemini.savedConversations.value = gemini.savedConversations.value.filter(c => {
+                            if (tombstoneIds.has(c.id)) {
+                                delete localCloud[c.id];
+                                const lfs = useImageStore().getLfs();
+                                if (lfs) lfs.promises.unlink(_convoPath(c.id)).catch(() => {});
+                                removedCount++;
+                                return false;
+                            }
+                            return true;
+                        });
+                        if (removedCount) {
+                            gemini.cloudConversations.value = localCloud;
+                            toast.info(`Removed ${removedCount} deleted conversation(s) from other device.`, 'sync', 3000);
+                        }
+                    }
+                    // Pull conversation list from R2
                     try {
                         const listRes = await r2Client.r2Fetch('GET', 'conversations');
                         if (listRes.ok) {
                             const remoteConvoIds = await listRes.json();
-                            const tombstoneIds = new Set((cfg.jssync._deletedConversationIds || []).map(t => t.id));
                             const localById = _.keyBy(gemini.savedConversations.value, 'id');
                             const localCloudMap = { ...gemini.cloudConversations.value };
                             let addedCount = 0;
@@ -493,24 +512,19 @@
                         const content = JSON.stringify(payload, null, 2);
                         await r2Client.r2Fetch('PUT', 'config', content, { contentType: 'application/json' });
                     }
-                    // Push dirty conversations individually
+                    // Push dirty conversations individually via useGeminiAPI's sync (which has locking)
                     const gemini = useGeminiAPI();
                     const lastSynced = cfg.jssync.lastSyncedAt || 0;
                     for (const meta of gemini.savedConversations.value) {
                         if (!gemini.cloudConversations.value[meta.id]) continue;
                         if ((meta.timestamp || 0) <= lastSynced) continue;
-                        try {
-                            const lfs = useImageStore().getLfs();
-                            if (lfs) {
-                                const json = await lfs.promises.readFile(_convoPath(meta.id), { encoding: 'utf8' });
-                                const convoData = JSON.parse(json);
-                                const imageIds = _collectImageIds(convoData);
-                                await _pushConvoToR2Direct(meta.id, json, imageIds, lfs);
-                            }
-                        } catch (e) { console.warn(`Failed to push convo ${meta.id}:`, e); }
+                        try { await gemini.syncConvoToR2(meta.id); }
+                        catch (e) { console.warn(`Failed to push convo ${meta.id}:`, e); }
                     }
-                    // Delete tombstoned conversations from R2
+                    // Delete tombstoned conversations from R2 (only recent ones)
+                    const lastSync = cfg.jssync.lastSyncedAt || 0;
                     for (const t of (cfg.jssync._deletedConversationIds || [])) {
+                        if (t.deletedAt <= lastSync) continue;
                         try { await r2Client.r2Fetch('DELETE', `conversations/${t.id}`); } catch {}
                     }
                     _finalizePush(cfg);
@@ -926,31 +940,6 @@ const TagCountBadge={
                 }
             }
             return ids;
-        };
-        const _pushConvoToR2Direct = async (convoId, convoJson, imageIds, localFs) => {
-            const r2Client = useR2Client();
-            await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json' });
-            const syncedR2 = JSON.parse(localStorage.getItem('nai-r2-synced-images') || '{}');
-            const syncedSet = new Set(syncedR2[convoId] || []);
-            const newImages = [...imageIds].filter(id => !syncedSet.has(id));
-            for (const imgId of newImages) {
-                try {
-                    const imgData = await localFs.promises.readFile('/' + imgId);
-                    await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
-                } catch {}
-            }
-            try {
-                const listRes = await r2Client.r2Fetch('GET', `conversations/${convoId}/images`);
-                if (listRes.ok) {
-                    const remoteImages = await listRes.json();
-                    const orphaned = remoteImages.filter(name => !imageIds.has(name));
-                    for (const name of orphaned) {
-                        try { await r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`); } catch {}
-                    }
-                }
-            } catch {}
-            syncedR2[convoId] = [...imageIds];
-            localStorage.setItem('nai-r2-synced-images', JSON.stringify(syncedR2));
         };
         const serializeConversation = async (messages) => {
             const imageStore = useImageStore();
@@ -1669,7 +1658,7 @@ const TagCountBadge={
                 isHiddenFromModel, toggleHiddenFromModel,
                 newChat, switchConversation, closeConversation,
                 saveConversation, loadConversation, deleteConversation, renameConversation,
-                syncConversationNow, deleteCloudConversation
+                syncConversationNow, deleteCloudConversation, syncConvoToR2: _syncConversationToR2
             };
         });
         const HiddenBadge = {template:`<div class="flex items-center gap-1 text-xs text-neutral-500"><material-icon icon="visibility_off" :size="12"/><span>Hidden from model</span></div>`};
