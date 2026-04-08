@@ -334,9 +334,22 @@
                 if (!res.ok) throw new Error(`${method} gist failed: ${res.status}`);
                 return [await res.json(), res.headers.get('ETag') || '', res.status];
             };
+            // Custom HTTP handler for isomorphic-git that bypasses the browser cache.
+            // isomorphic-git's built-in http/web module uses fetch() without cache:'no-store',
+            // so the browser may serve stale info/refs discovery responses.  After a
+            // successful push changes the remote ref, cached (old) refs cause every
+            // subsequent push to send a stale oldoid, which GitHub's pre-receive hook
+            // rejects — and retries keep failing for the rest of the session.
             const makeAuthHttp = (token) => {
                 const authHeader = `Basic ${btoa(`oauth2:${token || getToken()}`)}`;
-                return { async request({ url, method, headers: h = {}, body, onProgress }) { return window.gitHttp.request({ url, method, body, onProgress, headers: { ...h, 'Authorization': authHeader } }); } };
+                return {
+                    async request({ url, method = 'GET', headers: h = {}, body }) {
+                        if (body) { const c = []; for await (const ch of body) c.push(ch); const t = c.reduce((s, x) => s + x.byteLength, 0); body = new Uint8Array(t); let o = 0; for (const x of c) { body.set(x, o); o += x.byteLength; } }
+                        const res = await fetch(url, { method, headers: { ...h, 'Authorization': authHeader }, body, cache: 'no-store' });
+                        const hdrs = {}; for (const [k, v] of res.headers.entries()) hdrs[k] = v;
+                        return { url: res.url, method, statusCode: res.status, statusMessage: res.statusText, body: [new Uint8Array(await res.arrayBuffer())], headers: hdrs };
+                    }
+                };
             };
             const buildCorsProxy = () => {
                 let base = appStore.config.value.jssync.proxyUrl;

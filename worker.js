@@ -67,6 +67,10 @@ async function handleRequest(request) {
     modifiedResponse.headers.set('Access-Control-Allow-Origin', '*');
     modifiedResponse.headers.set('Access-Control-Allow-Headers', '*');
     modifiedResponse.headers.set('Access-Control-Expose-Headers', '*');
+    // Prevent browser from caching git protocol responses (info/refs, etc.).
+    // Stale cached refs cause isomorphic-git pushes to send outdated oldoid
+    // values, making GitHub's pre-receive hook reject every subsequent push.
+    modifiedResponse.headers.set('Cache-Control', 'no-store');
     return modifiedResponse;
   }
 
