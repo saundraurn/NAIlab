@@ -67,7 +67,6 @@ async function handleRequest(request) {
     modifiedResponse.headers.set('Access-Control-Allow-Origin', '*');
     modifiedResponse.headers.set('Access-Control-Allow-Headers', '*');
     modifiedResponse.headers.set('Access-Control-Expose-Headers', '*');
-    modifiedResponse.headers.set('Cache-Control', 'no-store');
     return modifiedResponse;
   }
 

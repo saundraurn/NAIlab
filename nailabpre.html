@@ -1434,7 +1434,6 @@ const TagCountBadge={
                 await _syncConversationToItsGist(id);
                 return gistData.id;
             };
-            const _noCacheHttp = { async request({ url, method, headers: h = {}, body }) { let bodyBytes; if (body) { const chunks = []; for await (const chunk of body) chunks.push(chunk); const len = chunks.reduce((s, c) => s + c.byteLength, 0); bodyBytes = new Uint8Array(len); let off = 0; for (const c of chunks) { bodyBytes.set(c, off); off += c.byteLength; } } const res = await fetch(url, { method, headers: h, body: bodyBytes, cache: 'no-store' }); return { url: res.url, method, statusCode: res.status, statusMessage: res.statusText, body: [new Uint8Array(await res.arrayBuffer())], headers: Object.fromEntries(res.headers.entries()) }; } };
             const _patchConvoText = async (gistId, convoJson) => {
                 const token = store.syncToken.value;
                 const res = await fetch(`https://api.github.com/gists/${gistId}`, {
@@ -1444,15 +1443,10 @@ const TagCountBadge={
                 });
                 if (!res.ok) throw new Error(`Gist PATCH failed: ${res.status}`);
             };
-            const _pushConvoImages = async (gistId, imageIds, localFs) => {
-                const syncedArr = _syncedConvoImages.value[gistId] || [];
-                const syncedSet = new Set(syncedArr);
-                const newImages = [...imageIds].filter(id => !syncedSet.has(id));
-                const maybeOrphaned = syncedArr.filter(id => !imageIds.has(id));
-                if (!newImages.length && !maybeOrphaned.length) return;
+            const _pushConvoGit = async (gistId, convoJson, imageIds, localFs) => {
                 const corsProxy = _buildCorsProxy();
                 if (!corsProxy) {
-                    throw new Error('A CORS proxy URL is required to sync conversation images.');
+                    throw new Error('A CORS proxy URL is required to sync conversations.');
                 }
                 const token = store.syncToken.value;
                 const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
@@ -1461,9 +1455,19 @@ const TagCountBadge={
                 try { await syncFs.promises.mkdir(dir); } catch {}
                 const gitUrl = `https://gist.github.com/${gistId}.git`;
                 const onAuth = () => ({ username: 'oauth2', password: token });
-                await window.git.clone({ fs: syncFs, http: _noCacheHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1, onAuth });
+                await window.git.clone({ fs: syncFs, http: window.gitHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1, onAuth });
                 const branch = await window.git.currentBranch({ fs: syncFs, dir }) || 'main';
                 let staged = false;
+                let existingConvo = null;
+                try { existingConvo = await syncFs.promises.readFile(dir + '/conversation.json', { encoding: 'utf8' }); } catch {}
+                if (existingConvo !== convoJson) {
+                    await syncFs.promises.writeFile(dir + '/conversation.json', convoJson);
+                    await window.git.add({ fs: syncFs, dir, filepath: 'conversation.json' });
+                    staged = true;
+                }
+                const syncedArr = _syncedConvoImages.value[gistId] || [];
+                const syncedSet = new Set(syncedArr);
+                const newImages = [...imageIds].filter(id => !syncedSet.has(id));
                 for (const imgId of newImages) {
                     try {
                         const imgData = await localFs.promises.readFile('/' + imgId);
@@ -1480,8 +1484,8 @@ const TagCountBadge={
                     }
                 }
                 if (!staged) return;
-                await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync images' });
-                await window.git.push({ fs: syncFs, http: _noCacheHttp, dir, corsProxy, remote: 'origin', ref: branch, onAuth });
+                await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync conversation' });
+                await window.git.push({ fs: syncFs, http: window.gitHttp, dir, corsProxy, remote: 'origin', ref: branch, onAuth });
                 _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
             };
             const _syncConversationToItsGist = async (id) => {
@@ -1495,8 +1499,15 @@ const TagCountBadge={
                 catch { throw new Error('Conversation data not found locally.'); }
                 const convoData = JSON.parse(convoJson);
                 const imageIds = _collectImageIds(convoData);
-                await _patchConvoText(gistId, convoJson);
-                await _pushConvoImages(gistId, imageIds, localFs);
+                const syncedArr = _syncedConvoImages.value[gistId] || [];
+                const syncedSet = new Set(syncedArr);
+                const needsImageSync = [...imageIds].some(id => !syncedSet.has(id))
+                    || syncedArr.some(id => !imageIds.has(id));
+                if (needsImageSync) {
+                    await _pushConvoGit(gistId, convoJson, imageIds, localFs);
+                } else {
+                    await _patchConvoText(gistId, convoJson);
+                }
             };
             let _gistSyncInProgress = false;
             const _gistSyncDirty = new Set();
