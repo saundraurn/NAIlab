@@ -25,14 +25,6 @@
     <script src="https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js"></script>
     <script src="https://unpkg.com/textarea-caret@3.1.0/index.js"></script>
     <script src="https://unpkg.com/@isomorphic-git/lightning-fs@4.6.2"></script>
-    <script>window.gitReady=new Promise(r=>window._resolveGitReady=r);</script>
-    <script type="module">
-        import git from 'https://esm.sh/isomorphic-git@1.37.2';
-        import http from 'https://esm.sh/isomorphic-git@1.37.2/http/web';
-        window.git = git;
-        window.gitHttp = http;
-        window._resolveGitReady();
-    </script>
     <link href="https://fonts.googleapis.com/css2?family=Raleway:wght@400;500;600;700&family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
     <style>[data-theme="ritrotheme"]{color-scheme:dark;--p:0.65 0.15 254;--pc:95% 0.05 205;--s:70% 0.25 280;--sc:0.94 0.0114 203;--a:65% 0.35 60;--ac:20% 0.1 60;--n:30% 0.05 240;--nc:90% 0.02 240;--b1:18% 0.04 240;--b2:25% 0.05 240;--b3:0.69 0.05 240;--bc:90% 0.02 240;--in:55% 0.15 220;--inc:95% 0.05 220;--su:60% 0.2 130;--suc:20% 0.1 130;--wa:70% 0.25 75;--wac:25% 0.1 75;--er:55% 0.28 10;--erc:90% 0.05 10;--radius-selector:0.5rem;--radius-field:2rem;--radius-box:0.5rem;--size-selector:0.25rem;--size-field:0.1875rem;--border:0.5px;--depth:1;--noise:0}</style>
     <style type="text/tailwindcss">
@@ -145,7 +137,6 @@
         // Migration: API renamed from snake_case to camelCase; saved data may use either
         const getThoughtSig = (p) => p.thoughtSignature || p.thought_signature;
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
-        const _stampSyncTime = (cfg, etag) => (cfg.jssync.lastSyncedAt = Date.now(), cfg.jssync.lastPulledEtag = etag || '');
         const useAppStore = createGlobalState(() => {
             const config = useLocalStorage('nai-app-settings', {
                 tagTest: {iterations:1, isInfinite:false, isControl:true, prompts:[{id:1, val:'1girl, solo, wearing casual clothes'}], nextPromptId:2, unwantedContent:'multiple views, monochrome, black and white, looking at viewer, pov', tagsToTest:'sunset lighting\nwarm colors\nnight scene\nfog\nrain', tagPos:'beginning', tagTarget:'prompt', tagStrength:1.0, hasExtendedRange:false, areTagsVisible:false, shouldFilterMiddleResults:false},
@@ -155,7 +146,7 @@
                 gemini: {apiKey:''},
                 danbooru: {folders:[], nextFolderId:1, gridCols:4, lastPath:'/danbooru', blacklist:'', sortOrder:'id', ratingFilters:{g:true, s:true, q:true, e:true}, savedSearches:[{name:'Trending', prompt:'order:rank'}]},
                 genState: {prompt:'1girl, solo, wearing casual clothes', uc:'multiple views, monochrome, black and white, looking at viewer, pov', charPrompts:[{id:1, val:''}], nextCharPromptId:2},
-                jssync: {gistId:'', proxyUrl:'', autoSync:true, lastSyncedAt:null, lastPulledEtag:''},
+                jssync: {proxyUrl:'', autoSync:true, lastSyncedAt:null},
                 _syncMeta: {tagTest:{updatedAt:0,rev:0}, genConfig:{updatedAt:0,rev:0}, genState:{updatedAt:0,rev:0}, app:{updatedAt:0,rev:0}, danbooru:{updatedAt:0,rev:0}}
             }, {mergeDefaults: true});
             _normalizeArrayFields(config.value);
@@ -240,23 +231,8 @@
         const useImageStore = createGlobalState(() => {
             const store = useAppStore();
             let localLfs = null;
-            const _renameMasterToMain = async (lfs) => {
-                try {
-                    const branches = await window.git.listBranches({ fs: lfs, dir: '/' });
-                    if (branches.includes('master') && !branches.includes('main')) {
-                        await window.git.branch({ fs: lfs, dir: '/', ref: 'main', object: 'master' });
-                        await window.git.deleteBranch({ fs: lfs, dir: '/', ref: 'master' });
-                        await window.git.checkout({ fs: lfs, dir: '/', ref: 'main' });
-                    }
-                } catch {}
-            };
             const init = async () => {
-                await window.gitReady;
                 localLfs = new LightningFS('nailab-git');
-                try { await localLfs.promises.stat('/.git'); } catch (e) {
-                    await window.git.init({ fs: localLfs, dir: '/', defaultBranch: 'main' });
-                }
-                await _renameMasterToMain(localLfs);
                 try { await localLfs.promises.unlink('/conversations.json'); } catch {}
             };
             const saveImage = async (imageId, uint8Array) => {
@@ -314,37 +290,28 @@
                 cleanupOrphanedImages, getLfs
             };
         });
-        const useGitHubClient = createGlobalState(() => {
+        const useR2Client = createGlobalState(() => {
             const appStore = useAppStore();
-            const getToken = () => appStore.syncToken.value;
-            const headers = (token) => ({
-                'Authorization': `Bearer ${token || getToken()}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/vnd.github+json',
-                'X-GitHub-Api-Version': '2022-11-28'
-            });
-            const gistFetch = async (method, url, body, extraHeaders) => {
-                const token = getToken();
-                if (!token) throw new Error('No GitHub token configured.');
-                const h = { ...headers(token), ...extraHeaders };
-                const res = await fetch(url, { method, headers: h, ...(body && { body: JSON.stringify(body) }) });
-                if (res.status === 404) throw new Error('Gist not found. Check your Gist ID.');
-                if (res.status === 401) throw new Error('Invalid GitHub token. Check your PAT.');
-                if (res.status === 304) return [null, res.headers.get('ETag') || '', 304];
-                if (!res.ok) throw new Error(`${method} gist failed: ${res.status}`);
-                return [await res.json(), res.headers.get('ETag') || '', res.status];
-            };
-            const makeAuthHttp = (token) => {
-                const authHeader = `Basic ${btoa(`oauth2:${token || getToken()}`)}`;
-                return { async request({ url, method, headers: h = {}, body, onProgress }) { return window.gitHttp.request({ url, method, body, onProgress, headers: { ...h, 'Authorization': authHeader } }); } };
-            };
-            const buildCorsProxy = () => {
+            const getWorkerUrl = () => {
                 let base = appStore.config.value.jssync.proxyUrl;
                 if (!base) return null;
                 if (!/^https?:\/\//i.test(base)) base = 'https://' + base;
-                return base.replace(/\/$/, '') + '/git';
+                return base.replace(/\/$/, '');
             };
-            return { getToken, headers, gistFetch, makeAuthHttp, buildCorsProxy };
+            const getSecret = () => appStore.syncToken.value;
+            const r2Fetch = async (method, path, body, options = {}) => {
+                const base = getWorkerUrl();
+                const secret = getSecret();
+                if (!base) throw new Error('Worker URL not configured.');
+                if (!secret) throw new Error('Sync secret not configured.');
+                const headers = { 'Authorization': `Bearer ${secret}` };
+                if (options.contentType) headers['Content-Type'] = options.contentType;
+                const res = await fetch(`${base}/r2/${path}`, { method, headers, body });
+                if (res.status === 401) throw new Error('Invalid sync secret.');
+                if (!res.ok && res.status !== 404) throw new Error(`R2 request failed: ${res.status}`);
+                return res;
+            };
+            return { r2Fetch, getWorkerUrl, getSecret };
         });
         const useSyncQueue = createGlobalState(() => {
             const _queue = reactive([]);
@@ -394,10 +361,10 @@
             const syncError = ref(null);
             const syncStatus = ref('idle');
             const appStore = useAppStore();
-            const ghClient = useGitHubClient();
+            const r2Client = useR2Client();
             const syncQueue = useSyncQueue();
-            const _finalizePush = (cfg, etag) => {
-                _stampSyncTime(cfg, etag);
+            const _finalizePush = (cfg) => {
+                cfg.jssync.lastSyncedAt = Date.now();
             };
             const withFlag = (f, fn) => { f.value = true; return Promise.resolve().then(fn).finally(() => { f.value = false; }); };
             const withSyncMerge = (fn) => withFlag(appStore.isSyncMerging, fn);
@@ -417,17 +384,14 @@
             };
             const pull = async () => {
                 const cfg = appStore.config.value;
-                const token = ghClient.getToken();
-                const { gistId } = cfg.jssync;
-                if (!token || !gistId) return;
+                const workerUrl = r2Client.getWorkerUrl();
+                const secret = r2Client.getSecret();
+                if (!workerUrl || !secret) return;
                 syncStatus.value = 'pulling'; syncError.value = null;
                 try {
-                    const extraHeaders = cfg.jssync.lastPulledEtag ? { 'If-None-Match': cfg.jssync.lastPulledEtag } : {};
-                    const [gistData, pulledEtag, status] = await ghClient.gistFetch('GET', `https://api.github.com/gists/${gistId}`, null, extraHeaders);
-                    if (status === 304) { syncStatus.value = 'idle'; return; }
-                    const fileContent = gistData.files?.['nailab-config.json']?.content;
-                    if (!fileContent) { syncStatus.value = 'idle'; return; }
-                    const remote = JSON.parse(fileContent);
+                    const res = await r2Client.r2Fetch('GET', 'config');
+                    const remote = await res.json();
+                    if (!remote || _.isEmpty(remote)) { syncStatus.value = 'idle'; return; }
                     const localMeta = cfg._syncMeta || {};
                     const remoteMeta = remote._syncMeta || {};
                     const lwwMerged = {};
@@ -448,7 +412,7 @@
                         });
                         toast.ok(`Pulled ${_.size(lwwMerged)} updated section(s).`, 'sync', 3000);
                     }
-                    if (remote._conversations || remote._conversationGists) {
+                    if (remote._conversations || remote._cloudConversations) {
                         const gemini = useGeminiAPI();
                         if (remote._conversations) {
                             const localById = _.keyBy(gemini.savedConversations.value, 'id');
@@ -459,13 +423,13 @@
                             }
                             gemini.savedConversations.value = Object.values(localById);
                         }
-                        if (remote._conversationGists) {
-                            gemini.conversationGists.value = { ...remote._conversationGists, ...gemini.conversationGists.value };
+                        if (remote._cloudConversations) {
+                            gemini.cloudConversations.value = { ...remote._cloudConversations, ...gemini.cloudConversations.value };
                         }
                         cfg.jssync._lastPushedConvos = _.cloneDeep(gemini.savedConversations.value);
-                        cfg.jssync._lastPushedConvoGists = _.cloneDeep(gemini.conversationGists.value);
+                        cfg.jssync._lastPushedCloudConvos = _.cloneDeep(gemini.cloudConversations.value);
                     }
-                    _stampSyncTime(cfg, pulledEtag);
+                    cfg.jssync.lastSyncedAt = Date.now();
                     syncStatus.value = 'idle';
                 } catch (e) {
                     _setSyncError(e);
@@ -474,16 +438,16 @@
             };
             const push = async (silent = false) => {
                 const cfg = appStore.config.value;
-                const token = ghClient.getToken();
-                const { gistId } = cfg.jssync;
-                if (!token || !gistId) return;
+                const workerUrl = r2Client.getWorkerUrl();
+                const secret = r2Client.getSecret();
+                if (!workerUrl || !secret) return;
                 syncStatus.value = 'pushing'; syncError.value = null;
                 try {
                     const payload = extractSyncPayload(cfg);
                     const gemini = useGeminiAPI();
                     payload._conversations = gemini.savedConversations.value;
-                    payload._conversationGists = gemini.conversationGists.value;
-                    const convoChanged = !_.isEqual(payload._conversations, cfg.jssync._lastPushedConvos) || !_.isEqual(payload._conversationGists, cfg.jssync._lastPushedConvoGists);
+                    payload._cloudConversations = gemini.cloudConversations.value;
+                    const convoChanged = !_.isEqual(payload._conversations, cfg.jssync._lastPushedConvos) || !_.isEqual(payload._cloudConversations, cfg.jssync._lastPushedCloudConvos);
                     const hasLocalChanges = _SYNC_KEYS.some(k => {
                         const localTime = cfg._syncMeta?.[k]?.updatedAt || 0;
                         const lastSynced = cfg.jssync.lastSyncedAt || 0;
@@ -491,40 +455,15 @@
                     });
                     if (!hasLocalChanges && !convoChanged) { syncStatus.value = 'idle'; return; }
                     const content = JSON.stringify(payload, null, 2);
-                    const [, pushedEtag] = await ghClient.gistFetch('PATCH', `https://api.github.com/gists/${gistId}`, { files: { ['nailab-config.json']: { content } } });
-                    _finalizePush(cfg, pushedEtag);
+                    await r2Client.r2Fetch('PUT', 'config', content, { contentType: 'application/json' });
+                    _finalizePush(cfg);
                     cfg.jssync._lastPushedConvos = _.cloneDeep(payload._conversations);
-                    cfg.jssync._lastPushedConvoGists = _.cloneDeep(payload._conversationGists);
+                    cfg.jssync._lastPushedCloudConvos = _.cloneDeep(payload._cloudConversations);
                     syncStatus.value = 'idle';
-                    if (!silent) toast.ok('Config pushed to Gist.', 'sync', 2500);
+                    if (!silent) toast.ok('Config synced to cloud.', 'sync', 2500);
                 } catch (e) {
                     _setSyncError(e);
                     if (!silent) toast.err(`Sync push failed: ${e.message}`, 'sync');
-                }
-            };
-            const createAndSetGist = async () => {
-                const cfg = appStore.config.value;
-                const token = ghClient.getToken();
-                if (!token) throw new Error('No GitHub token configured.');
-                syncStatus.value = 'pushing'; syncError.value = null;
-                try {
-                    const payload = extractSyncPayload(cfg);
-                    const gemini = useGeminiAPI();
-                    payload._conversations = gemini.savedConversations.value;
-                    payload._conversationGists = gemini.conversationGists.value;
-                    const content = JSON.stringify(payload, null, 2);
-                    const [gistData, createdEtag] = await ghClient.gistFetch('POST', 'https://api.github.com/gists', { description: 'NAILab Config Sync', public: false, files: { ['nailab-config.json']: { content } } });
-                    cfg.jssync.gistId = gistData.id;
-                    _finalizePush(cfg, createdEtag);
-                    cfg.jssync._lastPushedConvos = _.cloneDeep(payload._conversations);
-                    cfg.jssync._lastPushedConvoGists = _.cloneDeep(payload._conversationGists);
-                    syncStatus.value = 'idle';
-                    toast.ok('Gist created! ID saved.', 'sync');
-                    return gistData.id;
-                } catch (e) {
-                    _setSyncError(e);
-                    toast.err(`Create Gist failed: ${e.message}`, 'sync');
-                    throw e;
                 }
             };
             const syncNow = async () => {
@@ -537,7 +476,7 @@
             const queueSync = () => {
                 syncQueue.enqueue('config', syncNow);
             };
-            return { isSyncing, syncStatus, syncError, pull, push, syncNow, createAndSetGist, queueSync };
+            return { isSyncing, syncStatus, syncError, pull, push, syncNow, queueSync };
         });
         const TAG_COLORS={artist:['badge-warning','bg-warning/20'],character:['badge-success','bg-success/20'],copyright:['badge-accent','bg-accent/20'],meta:['badge-info','bg-info/20'],default:['badge-primary','bg-primary/20']};
         const useDropdown=()=>{const isOpen=ref(false),root=ref(null);return{isOpen,root,close:()=>{isOpen.value=false;if(document.activeElement&&root.value?.contains(document.activeElement))document.activeElement.blur();}};};
@@ -1064,8 +1003,8 @@ const TagCountBadge={
                 toast.q(msg.hidden ? 'Hidden from model' : 'Visible to model');
             };
             const savedConversations = useLocalStorage('nai-saved-conversations', []);
-            const conversationGists = useLocalStorage('nai-conversation-gists', {});
-            const _syncedConvoImages = useLocalStorage('nai-synced-convo-images', {});
+            const cloudConversations = useLocalStorage('nai-cloud-conversations', {});
+            const _syncedR2Images = useLocalStorage('nai-r2-synced-images', {});
             const convoSyncStatus = reactive({});
             const getList = () => savedConversations.value;
             const _requireGeminiKey = () => {
@@ -1240,9 +1179,9 @@ const TagCountBadge={
                 if (didSucceed) {
                     const isViewingThis = activeConvoId.value === convo.id && window.location.hash.includes('/banana');
                     if (!isViewingThis) store.incrementNotification('banana');
-                    if (!convo.isTemp && conversationGists.value[convo.id] && store.syncToken.value && store.config.value.jssync.autoSync) {
-                        _gistSyncDirty.add(convo.id);
-                        _autoSyncGist(true);
+                    if (!convo.isTemp && cloudConversations.value[convo.id] && store.syncToken.value && store.config.value.jssync.autoSync) {
+                        _r2SyncDirty.add(convo.id);
+                        _autoSyncR2(true);
                     }
                 }
             };
@@ -1329,39 +1268,23 @@ const TagCountBadge={
                 const idx = _.findIndex(list, {id: convo.id});
                 if (idx !== -1) list[idx] = meta; else list.unshift(meta);
                 toast.q('Chat saved');
-                if (store.syncToken.value && store.config.value.jssync.autoSync && !conversationGists.value[id]) {
-                    syncConversationNow(id).catch(e => console.warn('Auto-create gist failed:', e));
+                if (store.syncToken.value && store.config.value.jssync.autoSync && !cloudConversations.value[id]) {
+                    syncConversationNow(id).catch(e => console.warn('Auto-sync to cloud failed:', e));
                 }
                 return actualTitle;
             };
-            const _fetchConvoFromGist = async (gistId) => {
-                const token = store.syncToken.value;
-                if (!token || !gistId) return null;
+            const _fetchConvoFromR2 = async (convoId) => {
                 try {
-                    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
-                        method: 'GET', headers: ghClient.headers(token)
-                    });
-                    if (!res.ok) return null;
-                    const gistData = await res.json();
-                    const convoFile = gistData.files?.['conversation.json'];
-                    if (!convoFile) return null;
-                    let content = convoFile.content;
-                    if ((convoFile.truncated || typeof content !== 'string') && convoFile.raw_url) {
-                        const proxy = ghClient.buildCorsProxy();
-                        const rawUrl = proxy ? `${proxy}/${convoFile.raw_url.replace(/^https?:\/\//, '')}` : convoFile.raw_url;
-                        const rawRes = await fetch(rawUrl, {
-                            method: 'GET'
-                        });
-                        if (!rawRes.ok) return null;
-                        content = await rawRes.text();
-                    }
-                    if (!content) return null;
-                    try { return JSON.parse(content); } catch { return null; }
+                    const res = await r2Client.r2Fetch('GET', `conversations/${convoId}`);
+                    if (!res || res.status === 404) return null;
+                    const text = await res.text();
+                    if (!text) return null;
+                    try { return JSON.parse(text); } catch { return null; }
                 } catch {
                     return null;
                 }
             };
-            const _pullMissingImages = async (convoData, gistId, localFs) => {
+            const _pullMissingImagesFromR2 = async (convoData, convoId, localFs) => {
                 const imageIds = _collectImageIds(convoData);
                 if (!imageIds.size) return [];
                 const missing = [];
@@ -1369,36 +1292,27 @@ const TagCountBadge={
                     try { await localFs.promises.stat('/' + imgId); } catch { missing.push(imgId); }
                 }
                 if (!missing.length) return [...imageIds];
-                const corsProxy = ghClient.buildCorsProxy();
-                if (!corsProxy) return [...imageIds];
-                const token = store.syncToken.value;
-                if (!token) return [...imageIds];
-                const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
-                // Unique name per call to avoid lock contention if two pulls race.
-                const tmpFs = new LightningFS(`nailab-convo-pull-${safeGistId}-${Date.now()}`, { wipe: true });
-                const dir = '/repo';
-                try { await tmpFs.promises.mkdir(dir); } catch {}
-                const gitUrl = `https://gist.github.com/${gistId}.git`;
-                const authHttp = ghClient.makeAuthHttp(token);
                 try {
-                    await window.git.clone({ fs: tmpFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1 });
                     const pulled = [];
                     for (const imgId of missing) {
                         try {
-                            const data = await tmpFs.promises.readFile(dir + '/' + imgId);
-                            await localFs.promises.writeFile('/' + imgId, data);
-                            pulled.push(imgId);
+                            const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/images/${imgId}`);
+                            if (res && res.status !== 404) {
+                                const data = new Uint8Array(await res.arrayBuffer());
+                                await localFs.promises.writeFile('/' + imgId, data);
+                                pulled.push(imgId);
+                            }
                         } catch {}
                     }
-                    // Fix 4: bootstrap _syncedConvoImages with all image IDs found in the cloned repo
-                    const clonedFiles = await tmpFs.promises.readdir(dir);
-                    const clonedImageIds = clonedFiles.filter(f => f.startsWith('img_') && f.endsWith('.webp'));
-                    if (clonedImageIds.length) {
-                        _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: clonedImageIds };
+                    // Update synced image tracking
+                    if (pulled.length) {
+                        const existing = _syncedR2Images.value[convoId] || [];
+                        const merged = new Set([...existing, ...pulled]);
+                        _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...merged] };
                     }
                     return [...imageIds];
                 } catch (e) {
-                    console.warn('Failed to pull images from gist:', e);
+                    console.warn('Failed to pull images from R2:', e);
                     return [...imageIds];
                 }
             };
@@ -1430,10 +1344,9 @@ const TagCountBadge={
                             } catch {}
                         }
                     }
-                    // Fix 2: fall back to fetching from the conversation's Gist
-                    const gistId = conversationGists.value[id];
-                    if (!convoData && gistId) {
-                        convoData = await _fetchConvoFromGist(gistId);
+                    // Fall back to fetching from R2 cloud storage
+                    if (!convoData && cloudConversations.value[id]) {
+                        convoData = await _fetchConvoFromR2(id);
                         if (convoData && lfs) {
                             try { await _writeConvoToLfs(lfs, id, convoData.messages, convoData.params); } catch {}
                         }
@@ -1444,9 +1357,9 @@ const TagCountBadge={
                         if (activeConvoId.value === id) { const r = [...conversationMap.keys()]; activeConvoId.value = r.length ? r[r.length-1] : newChat(); }
                         return;
                     }
-                    // Fix 3 + 4: pull missing images from gist before deserialization
-                    if (gistId && lfs) {
-                        await _pullMissingImages(convoData, gistId, lfs);
+                    // Pull missing images from R2 before deserialization
+                    if (cloudConversations.value[id] && lfs) {
+                        await _pullMissingImagesFromR2(convoData, id, lfs);
                     }
                     if (convoData.params) Object.assign(convo.params, convoData.params);
                     const deserialized = await deserializeConversation(convoData);
@@ -1462,7 +1375,7 @@ const TagCountBadge={
                     if (lfs) { lfs.promises.unlink(_convoPath(id)).catch(() => {}); }
                 }
                 if (conversationMap.has(id)) closeConversation(id);
-                deleteConversationGist(id).catch(() => {});
+                deleteCloudConversation(id).catch(() => {});
                 toast.q('Removed from saved chats');
                 imageStore.cleanupOrphanedImages(savedConversations.value).catch(() => {});
             };
@@ -1472,25 +1385,6 @@ const TagCountBadge={
                 if (convo) convo.title = t;
                 const s = _.find(savedConversations.value, {id});
                 if (s) s.title = t;
-                const gistId = conversationGists.value[id];
-                const token = store.syncToken.value;
-                if (gistId && token) {
-                    (async () => {
-                        try {
-                            const res = await fetch(`https://api.github.com/gists/${gistId}`, {
-                                method: 'PATCH', headers: ghClient.headers(token),
-                                body: JSON.stringify({ description: `NAILab: ${t}` })
-                            });
-                            if (!res.ok) {
-                                console.warn(`Failed to update gist description: ${res.status} ${res.statusText}`);
-                                toast.warn('Failed to update cloud title', 'sync', 3000);
-                            }
-                        } catch (e) {
-                            console.warn('Failed to update gist description:', e);
-                            toast.warn('Failed to update cloud title', 'sync', 3000);
-                        }
-                    })();
-                }
             };
             const pruneNoImageMessages = () => withActiveConvo(convo => {
                 const genMsgId = convo.generatingMsgId;
@@ -1519,17 +1413,17 @@ const TagCountBadge={
                 const convo = activeConvo.value;
                 if (convo && !convo.isTemp && !convo.generating && !convo.isHydrating) {
                     _saveConvoDirect(convo);
-                    if (conversationGists.value[convo.id] && store.syncToken.value && store.config.value.jssync.autoSync) {
+                    if (cloudConversations.value[convo.id] && store.syncToken.value && store.config.value.jssync.autoSync) {
                         if (convoSyncStatus[convo.id] !== 'syncing') convoSyncStatus[convo.id] = 'pending';
-                        _gistSyncDirty.add(convo.id);
-                        _autoSyncGist();
+                        _r2SyncDirty.add(convo.id);
+                        _autoSyncR2();
                     }
                 }
             }, 1500);
             watch(() => activeConvo.value && !activeConvo.value.isTemp ? activeConvo.value.messages : null, (msgs) => {
                 if (msgs) _autoSave();
             }, { deep: true });
-            const ghClient = useGitHubClient();
+            const r2Client = useR2Client();
             const _collectImageIds = (convoData) => {
                 const ids = new Set();
                 for (const msg of convoData.messages || []) {
@@ -1541,95 +1435,31 @@ const TagCountBadge={
                 }
                 return ids;
             };
-            const createConversationGist = async (id) => {
-                const token = store.syncToken.value;
-                if (!token) throw new Error('No GitHub token configured.');
-                const convo = conversationMap.get(id);
-                const title = convo?.title || _.find(savedConversations.value, {id})?.title || 'Conversation';
-                const res = await fetch('https://api.github.com/gists', {
-                    method: 'POST',
-                    headers: ghClient.headers(token),
-                    body: JSON.stringify({ description: `NAILab: ${title}`, public: false, files: { 'conversation.json': { content: '{}' } } })
-                });
-                if (!res.ok) throw new Error(`Create gist failed: ${res.status}`);
-                const gistData = await res.json();
-                conversationGists.value = { ...conversationGists.value, [id]: gistData.id };
-                await _syncConversationToItsGist(id);
-                await useSyncStore().push(true);
-                return gistData.id;
-            };
-            // Per-gist mutex: serializes concurrent pushes to the same gist to prevent
-            // LightningFS IndexedDB lock contention and git pre-receive rejections.
-            const _pushConvoGistLocks = new Map();
-            const _pushConvoGist = (gistId, convoJson, imageIds, localFs) => {
-                const prev = _pushConvoGistLocks.get(gistId) || Promise.resolve();
-                const next = prev.then(() => _doPushConvoGist(gistId, convoJson, imageIds, localFs));
-                _pushConvoGistLocks.set(gistId, next.catch(() => {}));
+            // Push conversation JSON + images to R2 via the worker
+            const _pushConvoR2Locks = new Map();
+            const _pushConvoToR2 = (convoId, convoJson, imageIds, localFs) => {
+                const prev = _pushConvoR2Locks.get(convoId) || Promise.resolve();
+                const next = prev.then(() => _doPushConvoToR2(convoId, convoJson, imageIds, localFs));
+                _pushConvoR2Locks.set(convoId, next.catch(() => {}));
                 return next;
             };
-            // Unified push: writes conversation.json AND images in one git commit.
-            // This avoids the race condition where a separate REST API PATCH creates a
-            // commit that the subsequent shallow clone may not see due to replication
-            // lag between GitHub's API and git backends, causing non-fast-forward
-            // rejections from the pre-receive hook.
-            const _doPushConvoGist = async (gistId, convoJson, imageIds, localFs) => {
-                const corsProxy = ghClient.buildCorsProxy();
-                if (!corsProxy) {
-                    throw new Error('A CORS proxy URL is required to sync conversations.');
-                }
-                const token = store.syncToken.value;
-                const safeGistId = String(gistId).replace(/[^a-zA-Z0-9_-]/g, '-');
-                // Unique FS name per invocation: prevents concurrent calls (e.g. from
-                // createConversationGist racing with _runGistSync) from sharing the same
-                // IndexedDB store and stealing each other's lock.
-                const syncFs = new LightningFS(`nailab-convo-push-${safeGistId}-${Date.now()}`, { wipe: true });
-                const dir = '/repo';
-                try { await syncFs.promises.mkdir(dir); } catch {}
-                const gitUrl = `https://gist.github.com/${gistId}.git`;
-                const authHttp = ghClient.makeAuthHttp(token);
-                await window.git.clone({ fs: syncFs, http: authHttp, dir, corsProxy, url: gitUrl, singleBranch: true, depth: 1 });
-                // currentBranch throws 'Could not find HEAD' when the clone didn't fully
-                // complete or the gist has no commits yet; default to 'main'.
-                let branch;
-                try { branch = await window.git.currentBranch({ fs: syncFs, dir }); } catch {}
-                branch = branch || 'main';
-                let staged = false;
-                // Write conversation.json into the git working tree so text and images
-                // are committed atomically — no separate REST PATCH needed.
-                let existingConvo = null;
-                try { existingConvo = await syncFs.promises.readFile(dir + '/conversation.json', { encoding: 'utf8' }); } catch {}
-                if (existingConvo !== convoJson) {
-                    await syncFs.promises.writeFile(dir + '/conversation.json', convoJson);
-                    await window.git.add({ fs: syncFs, dir, filepath: 'conversation.json' });
-                    staged = true;
-                }
-                const syncedArr = _syncedConvoImages.value[gistId] || [];
+            const _doPushConvoToR2 = async (convoId, convoJson, imageIds, localFs) => {
+                // Push conversation JSON
+                await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json' });
+                // Push new images
+                const syncedArr = _syncedR2Images.value[convoId] || [];
                 const syncedSet = new Set(syncedArr);
                 const newImages = [...imageIds].filter(id => !syncedSet.has(id));
                 for (const imgId of newImages) {
                     try {
                         const imgData = await localFs.promises.readFile('/' + imgId);
-                        await syncFs.promises.writeFile(dir + '/' + imgId, imgData);
-                        await window.git.add({ fs: syncFs, dir, filepath: imgId });
-                        staged = true;
+                        await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
                     } catch {}
                 }
-                const gistFiles = (await syncFs.promises.readdir(dir)).filter(f => f !== '.git');
-                for (const f of gistFiles) {
-                    if (f.startsWith('img_') && f.endsWith('.webp') && !imageIds.has(f)) {
-                        await window.git.remove({ fs: syncFs, dir, filepath: f });
-                        staged = true;
-                    }
-                }
-                if (!staged) return;
-                await window.git.commit({ fs: syncFs, dir, author: { name: 'NAILab', email: 'nailab@local' }, message: 'Sync conversation' });
-                await window.git.push({ fs: syncFs, http: authHttp, dir, corsProxy, remote: 'origin', ref: branch, force: true });
-                _syncedConvoImages.value = { ..._syncedConvoImages.value, [gistId]: [...imageIds] };
+                _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...imageIds] };
             };
-            const _syncConversationToItsGist = async (id) => {
-                const token = store.syncToken.value;
-                const gistId = conversationGists.value[id];
-                if (!token || !gistId) return;
+            const _syncConversationToR2 = async (id) => {
+                if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 const localFs = imageStore.getLfs();
                 if (!localFs) throw new Error('Local storage not initialized.');
                 let convoJson;
@@ -1637,71 +1467,75 @@ const TagCountBadge={
                 catch { throw new Error('Conversation data not found locally.'); }
                 const convoData = JSON.parse(convoJson);
                 const imageIds = _collectImageIds(convoData);
-                await _pushConvoGist(gistId, convoJson, imageIds, localFs);
+                await _pushConvoToR2(id, convoJson, imageIds, localFs);
             };
-            let _gistSyncInProgress = false;
-            let _gistSyncPromise = null;
-            const _gistSyncDirty = new Set();
-            const _runGistSync = () => {
-                if (_gistSyncInProgress) return _gistSyncPromise || Promise.resolve();
-                _gistSyncInProgress = true;
-                _gistSyncPromise = (async () => {
+            let _r2SyncInProgress = false;
+            let _r2SyncPromise = null;
+            const _r2SyncDirty = new Set();
+            const _runR2Sync = () => {
+                if (_r2SyncInProgress) return _r2SyncPromise || Promise.resolve();
+                _r2SyncInProgress = true;
+                _r2SyncPromise = (async () => {
                     try {
-                        const ids = [..._gistSyncDirty];
-                        _gistSyncDirty.clear();
+                        const ids = [..._r2SyncDirty];
+                        _r2SyncDirty.clear();
                         for (const id of ids) {
-                            const gistId = conversationGists.value[id];
-                            if (!gistId) continue;
+                            if (!cloudConversations.value[id]) continue;
                             convoSyncStatus[id] = 'syncing';
                             try {
-                                await _syncConversationToItsGist(id);
+                                await _syncConversationToR2(id);
                                 convoSyncStatus[id] = 'synced';
                             } catch (e) {
                                 convoSyncStatus[id] = 'error';
-                                console.warn('Convo gist sync failed:', e);
+                                console.warn('Convo R2 sync failed:', e);
                                 const title = _.find(savedConversations.value, {id})?.title || id;
                                 toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
                             }
                         }
                     } finally {
-                        _gistSyncInProgress = false;
-                        _gistSyncPromise = null;
-                        if (_gistSyncDirty.size) await _runGistSync();
+                        _r2SyncInProgress = false;
+                        _r2SyncPromise = null;
+                        if (_r2SyncDirty.size) await _runR2Sync();
                     }
                 })();
-                return _gistSyncPromise;
+                return _r2SyncPromise;
             };
-            const _debouncedGistSync = useDebounceFn(_runGistSync, 10000);
-            const _autoSyncGist = (immediate) => immediate ? _runGistSync() : _debouncedGistSync();
+            const _debouncedR2Sync = useDebounceFn(_runR2Sync, 10000);
+            const _autoSyncR2 = (immediate) => immediate ? _runR2Sync() : _debouncedR2Sync();
             const syncConversationNow = async (id) => {
-                if (!conversationGists.value[id]) {
+                if (!cloudConversations.value[id]) {
                     convoSyncStatus[id] = 'syncing';
                     try {
-                        await createConversationGist(id);
+                        cloudConversations.value = { ...cloudConversations.value, [id]: true };
+                        await _syncConversationToR2(id);
+                        await useSyncStore().push(true);
                         convoSyncStatus[id] = 'synced';
                         toast.q('Synced to cloud');
                     } catch (e) {
+                        // Roll back cloud marker on failure
+                        const g = { ...cloudConversations.value };
+                        delete g[id];
+                        cloudConversations.value = g;
                         convoSyncStatus[id] = 'error';
                         toast.err('Sync failed: ' + e.message);
                     }
                     return;
                 }
                 convoSyncStatus[id] = 'pending';
-                _gistSyncDirty.add(id);
-                await _runGistSync();
-                // Poll until status resolves (handles case where sync was already in flight)
+                _r2SyncDirty.add(id);
+                await _runR2Sync();
                 const deadline = Date.now() + 120000;
-                const gistSyncWaitTimedOut = Symbol('gistSyncWaitTimedOut');
+                const syncWaitTimedOut = Symbol('syncWaitTimedOut');
                 while (convoSyncStatus[id] === 'pending' && Date.now() < deadline) {
                     await new Promise(r => setTimeout(r, 500));
-                    if (_gistSyncPromise) {
+                    if (_r2SyncPromise) {
                         const remaining = deadline - Date.now();
                         if (remaining <= 0) break;
                         const result = await Promise.race([
-                            _gistSyncPromise,
-                            new Promise(resolve => setTimeout(() => resolve(gistSyncWaitTimedOut), remaining))
+                            _r2SyncPromise,
+                            new Promise(resolve => setTimeout(() => resolve(syncWaitTimedOut), remaining))
                         ]);
-                        if (result === gistSyncWaitTimedOut) break;
+                        if (result === syncWaitTimedOut) break;
                     }
                 }
                 const status = convoSyncStatus[id];
@@ -1709,32 +1543,28 @@ const TagCountBadge={
                 else if (status === 'error') toast.err('Sync failed');
                 else if (status === 'pending') toast.warn('Sync timed out — will retry automatically');
             };
-            const deleteConversationGist = async (id) => {
-                const gistId = conversationGists.value[id];
-                if (!gistId) return;
-                const token = store.syncToken.value;
-                if (token) {
-                    try {
-                        await fetch(`https://api.github.com/gists/${gistId}`, { method: 'DELETE', headers: ghClient.headers(token) });
-                    } catch {}
-                }
-                const g = { ...conversationGists.value };
+            const deleteCloudConversation = async (id) => {
+                if (!cloudConversations.value[id]) return;
+                try {
+                    await r2Client.r2Fetch('DELETE', `conversations/${id}`);
+                } catch {}
+                const g = { ...cloudConversations.value };
                 delete g[id];
-                conversationGists.value = g;
-                const s = { ..._syncedConvoImages.value };
-                delete s[gistId];
-                _syncedConvoImages.value = s;
+                cloudConversations.value = g;
+                const s = { ..._syncedR2Images.value };
+                delete s[id];
+                _syncedR2Images.value = s;
                 delete convoSyncStatus[id];
             };
             return {
                 conversationMap, activeConvoId, activeConvo,
-                messages, savedConversations, conversationGists, convoSyncStatus, generating, generatingMsgId, generatingVarIdx, isHydrating,
+                messages, savedConversations, cloudConversations, convoSyncStatus, generating, generatingMsgId, generatingVarIdx, isHydrating,
                 sendMessage, regenerateMessage, regenerateUserMessage,
                 deleteMessage, deleteAllVariants, abort, pruneNoImageMessages, initFromStorage,
                 isHiddenFromModel, toggleHiddenFromModel,
                 newChat, switchConversation, closeConversation,
                 saveConversation, loadConversation, deleteConversation, renameConversation,
-                createConversationGist, syncConversationNow, deleteConversationGist
+                syncConversationNow, deleteCloudConversation
             };
         });
         const HiddenBadge = {template:`<div class="flex items-center gap-1 text-xs text-neutral-500"><material-icon icon="visibility_off" :size="12"/><span>Hidden from model</span></div>`};
@@ -1787,7 +1617,7 @@ const TagCountBadge={
                 const store = useAppStore();
                 const imageStore = useImageStore();
                 const {conversationMap, activeConvoId, activeConvo, savedConversations,
-                       conversationGists, convoSyncStatus,
+                       cloudConversations, convoSyncStatus,
                        generating, messages, isHydrating,
                        sendMessage, newChat, abort, switchConversation, closeConversation,
                        saveConversation, loadConversation, deleteConversation, renameConversation,
@@ -1900,7 +1730,7 @@ const TagCountBadge={
                     removePendingImage, downloadImage,
                     autoResize, onKeydown, onPaste,
                     activeConvoId, conversationMap,
-                    conversationGists, convoSyncStatus, syncConversationNow,
+                    conversationGists: cloudConversations, convoSyncStatus, syncConversationNow,
                     syncToken: store.syncToken,
                     openConversations, closedSavedConversations,
                     switchConversation, closeConversation, saveConversation, loadConversation, deleteConversation,
@@ -1920,29 +1750,23 @@ const TagCountBadge={
                 const {app, gemini, jssync} = appStore.config.value;
                 const syncToken = appStore.syncToken;
                 const { isSyncing, syncStatus, syncError } = syncStore;
-                const isCreatingGist = ref(false);
                 const statusMeta = computed(() => {
                     const m = {
                         idle: { icon: 'cloud_done', color: 'text-success', text: jssync.lastSyncedAt ? `Last synced ${fmtAgo(jssync.lastSyncedAt)}` : 'Never synced' },
-                        pulling: { icon: 'cloud_download', color: 'text-info', text: 'Pulling from Gist...' },
-                        pushing: { icon: 'cloud_upload', color: 'text-info', text: 'Pushing to Gist...' },
+                        pulling: { icon: 'cloud_download', color: 'text-info', text: 'Pulling from cloud...' },
+                        pushing: { icon: 'cloud_upload', color: 'text-info', text: 'Pushing to cloud...' },
                         error: { icon: 'cloud_off', color: 'text-error', text: syncError.value || 'Sync error' }
                     };
                     return m[syncStatus.value] || m.idle;
                 });
-                const handleCreateGist = async () => {
-                    if (!syncToken.value) return toast.err('Enter your GitHub PAT first.', 'sync');
-                    isCreatingGist.value = true;
-                    try { await syncStore.createAndSetGist(); } finally { isCreatingGist.value = false; }
-                };
                 const handleSyncNow = () => {
                     if (!syncToken.value) return toast.err('Configure sync first.', 'sync');
-                    if (!jssync.gistId) return toast.err('No Gist ID. Create or enter one.', 'sync');
+                    if (!jssync.proxyUrl) return toast.err('Enter your Worker URL first.', 'sync');
                     syncStore.syncNow();
                 };
-                return { app, gemini, jssync, syncToken, models, isSyncing, syncStatus, syncError, statusMeta, isCreatingGist, handleCreateGist, handleSyncNow };
+                return { app, gemini, jssync, syncToken, models, isSyncing, syncStatus, syncError, statusMeta, handleSyncNow };
             },
-            template:`<div class="max-w-4xl mx-auto p-4 space-y-4 h-full custom-scroll"><collapsible-panel title="API Configuration" storage-key="api-config"><div class="pt-2 space-y-5"><setting-input type="password" v-model="app.apiKey" label="NovelAI API Key" help-text="Stored locally in your browser."></setting-input><setting-input type="password" v-model="gemini.apiKey" label="Vertex AI API Key" placeholder="AIzaSy..." help-text="Get a key from &lt;a href='https://console.cloud.google.com/apis/credentials' target='_blank' class='text-primary hover:underline'&gt;Google Cloud Console → APIs &amp; Services → Credentials&lt;/a&gt;. Stored locally."></setting-input></div></collapsible-panel><collapsible-panel title="Application Settings" storage-key="app-settings"><div class="pt-2"><setting-input v-model="app.model" label="NovelAI Model" type="select" :options="models"></setting-input></div></collapsible-panel><collapsible-panel storage-key="sync-settings"><template #header><span class="flex-row-gap"><material-icon icon="cloud_sync" :size="20" class="text-primary/80 shrink-0"/><span>Cross-Browser Config Sync</span></span><span v-if="syncToken && jssync.gistId" class="flex items-center gap-1.5 ml-1 shrink-0"><spin-icon :loading="isSyncing" :icon="statusMeta.icon" :size="16" :class="isSyncing ? 'text-info' : statusMeta.color"></spin-icon><span class="text-xs font-medium" :class="statusMeta.color">{{ statusMeta.text }}</span></span></template><template #actions><button @click.stop="handleSyncNow" :disabled="isSyncing || !syncToken || !jssync.gistId" class="btn btn-ghost btn-xs btn-wborder gap-1" title="Sync Now"><spin-icon :loading="isSyncing" icon="sync" :size="14"></spin-icon><span>Sync Now</span></button></template><div class="pt-1 space-y-4"><div class="alert bg-primary/8 border border-primary/15 text-sm gap-2 py-2.5"><material-icon icon="info" :size="18" class="text-primary/70 shrink-0"/><div class="text-xs text-neutral-400 leading-relaxed"> Sync your settings across browsers using a private <strong class="text-neutral-300">GitHub Gist</strong>. Requires a GitHub account and a Personal Access Token scoped to <code class="text-primary/80">gist</code> only. <a href="https://github.com/settings/tokens/new?scopes=gist&description=NAILab+Sync" target="_blank" class="text-primary hover:underline ml-1">Create PAT ↗</a></div></div><setting-input type="password" v-model="syncToken" label="GitHub Personal Access Token" placeholder="github_pat_..." help-text="Stored locally only. Never synced to Gist."></setting-input><div class="relative"><floating-label label="Gist ID"/><div class="flex gap-2 mt-1"><input v-model="jssync.gistId" placeholder="e.g. a1b2c3d4e5f6..." class="input input-sm input-bordered flex-1 pt-2 text-sm font-mono"><button @click="handleCreateGist" :disabled="isCreatingGist || !syncToken" class="btn btn-sm btn-secondary gap-1 shrink-0" title="Create new private Gist automatically"><spin-icon :loading="isCreatingGist" icon="add" :size="14"></spin-icon><span>New</span></button></div><p class="text-xs text-neutral-600 mt-1 ml-1">Leave blank and click "New" to create one automatically.</p></div><div class="space-y-2"><setting-input type="text" v-model="jssync.proxyUrl" label="Cloudflare Worker URL (CORS/Image Proxy)" label-color="badge-ghost" placeholder="https://my-worker.workers.dev"></setting-input><p class="text-xs text-neutral-600 ml-1">Used to proxy Danbooru images and some sync-related CORS requests through your worker, including certain text/JSON/Git fetches. Leave blank to connect directly where possible (may not work in all browsers).</p></div><div class="flex flex-wrap gap-x-6 gap-y-2 py-1"><label class="flex-row-gap cursor-pointer"><input type="checkbox" v-model="jssync.autoSync" class="toggle toggle-xs toggle-primary"><span class="text-sm text-neutral-300">Auto-sync on changes</span><span class="text-xs text-neutral-600">(5s debounce)</span></label></div></div></collapsible-panel></div>`
+            template:`<div class="max-w-4xl mx-auto p-4 space-y-4 h-full custom-scroll"><collapsible-panel title="API Configuration" storage-key="api-config"><div class="pt-2 space-y-5"><setting-input type="password" v-model="app.apiKey" label="NovelAI API Key" help-text="Stored locally in your browser."></setting-input><setting-input type="password" v-model="gemini.apiKey" label="Vertex AI API Key" placeholder="AIzaSy..." help-text="Get a key from &lt;a href='https://console.cloud.google.com/apis/credentials' target='_blank' class='text-primary hover:underline'&gt;Google Cloud Console → APIs &amp; Services → Credentials&lt;/a&gt;. Stored locally."></setting-input></div></collapsible-panel><collapsible-panel title="Application Settings" storage-key="app-settings"><div class="pt-2"><setting-input v-model="app.model" label="NovelAI Model" type="select" :options="models"></setting-input></div></collapsible-panel><collapsible-panel storage-key="sync-settings"><template #header><span class="flex-row-gap"><material-icon icon="cloud_sync" :size="20" class="text-primary/80 shrink-0"/><span>Cross-Browser Cloud Sync</span></span><span v-if="syncToken && jssync.proxyUrl" class="flex items-center gap-1.5 ml-1 shrink-0"><spin-icon :loading="isSyncing" :icon="statusMeta.icon" :size="16" :class="isSyncing ? 'text-info' : statusMeta.color"></spin-icon><span class="text-xs font-medium" :class="statusMeta.color">{{ statusMeta.text }}</span></span></template><template #actions><button @click.stop="handleSyncNow" :disabled="isSyncing || !syncToken || !jssync.proxyUrl" class="btn btn-ghost btn-xs btn-wborder gap-1" title="Sync Now"><spin-icon :loading="isSyncing" icon="sync" :size="14"></spin-icon><span>Sync Now</span></button></template><div class="pt-1 space-y-4"><div class="alert bg-primary/8 border border-primary/15 text-sm gap-2 py-2.5"><material-icon icon="info" :size="18" class="text-primary/70 shrink-0"/><div class="text-xs text-neutral-400 leading-relaxed"> Sync your settings and conversations across browsers using <strong class="text-neutral-300">Cloudflare R2</strong> via your Cloudflare Worker. Configure your Worker URL and the shared secret (set as <code class="text-primary/80">R2_AUTH_SECRET</code> in your Worker environment).</div></div><div class="space-y-2"><setting-input type="text" v-model="jssync.proxyUrl" label="Cloudflare Worker URL" placeholder="https://my-worker.workers.dev" help-text="Your Cloudflare Worker URL. Handles R2 storage, Danbooru image proxy, and CORS proxying."></setting-input></div><setting-input type="password" v-model="syncToken" label="Sync Secret" placeholder="your-shared-secret" help-text="Must match the R2_AUTH_SECRET configured in your Cloudflare Worker. Stored locally only."></setting-input><div class="flex flex-wrap gap-x-6 gap-y-2 py-1"><label class="flex-row-gap cursor-pointer"><input type="checkbox" v-model="jssync.autoSync" class="toggle toggle-xs toggle-primary"><span class="text-sm text-neutral-300">Auto-sync on changes</span><span class="text-xs text-neutral-600">(5s debounce)</span></label></div></div></collapsible-panel></div>`
         };
         const routes = [
             {path:'/', redirect:'/tagtest'},
@@ -1970,7 +1794,7 @@ const TagCountBadge={
                     const jssync = config.value.jssync;
                     const imageStore = useImageStore();
                     const geminiAPI = useGeminiAPI();
-                    if (syncToken.value && jssync.gistId) {
+                    if (syncToken.value && jssync.proxyUrl) {
                         syncStore.pull().catch(() => {});
                     }
                     await imageStore.init();
@@ -1978,7 +1802,7 @@ const TagCountBadge={
                     imageStore.cleanupOrphanedImages(geminiAPI.savedConversations.value).catch(() => {});
                     const _debouncedAutoSync = useDebounceFn(() => {
                         const js = config.value.jssync;
-                        if (!js.autoSync || !syncToken.value || !js.gistId) return;
+                        if (!js.autoSync || !syncToken.value || !js.proxyUrl) return;
                         syncStore.queueSync();
                     }, 5000);
                     watch(
@@ -1994,7 +1818,7 @@ const TagCountBadge={
                         { deep: true }
                     );
                     watch(
-                        () => [geminiAPI.savedConversations.value, geminiAPI.conversationGists.value],
+                        () => [geminiAPI.savedConversations.value, geminiAPI.cloudConversations.value],
                         _debouncedAutoSync,
                         { deep: true }
                     );
