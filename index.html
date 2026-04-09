@@ -1434,15 +1434,12 @@ const TagCountBadge={
                                 try { await _writeConvoToLfs(lfs, id, convoData.messages, convoData.params); } catch {}
                             }
                             // Update metadata from R2 data (fixes titles for pre-metadata conversations)
+                            const s = _.find(savedConversations.value, {id});
                             if (convoData.title) {
                                 convo.title = convoData.title;
-                                const s = _.find(savedConversations.value, {id});
                                 if (s) s.title = convoData.title;
                             }
-                            if (convoData.timestamp) {
-                                const s = _.find(savedConversations.value, {id});
-                                if (s) s.timestamp = convoData.timestamp;
-                            }
+                            if (convoData.timestamp && s) s.timestamp = convoData.timestamp;
                         }
                     }
                     if (!convoData) {
