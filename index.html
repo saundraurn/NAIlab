@@ -437,12 +437,23 @@
                     if (tombstoneIds.size) {
                         let removedCount = 0;
                         const localCloud = { ...gemini.cloudConversations.value };
+                        const activeWasTombstoned = tombstoneIds.has(gemini.activeConvoId.value);
                         gemini.savedConversations.value = gemini.savedConversations.value.filter(c => {
                             if (tombstoneIds.has(c.id)) {
                                 delete localCloud[c.id];
                                 const lfs = useImageStore().getLfs();
                                 if (lfs) lfs.promises.unlink(_convoPath(c.id)).catch(() => {});
-                                gemini.conversationMap.delete(c.id);
+                                // Use closeConversation for proper cleanup (abort, prune thinking state)
+                                // but only if open; closing active convo defers switching until after filter
+                                if (gemini.conversationMap.has(c.id) && !activeWasTombstoned) {
+                                    gemini.closeConversation(c.id);
+                                } else if (gemini.conversationMap.has(c.id)) {
+                                    // Abort in-flight generation but don't let closeConversation switch
+                                    // activeConvoId yet — we'll pick a better fallback below
+                                    const convo = gemini.conversationMap.get(c.id);
+                                    if (convo?.generating && convo.abortCtrl) convo.abortCtrl.abort();
+                                    gemini.conversationMap.delete(c.id);
+                                }
                                 removedCount++;
                                 return false;
                             }
@@ -450,11 +461,12 @@
                         });
                         if (removedCount) {
                             gemini.cloudConversations.value = localCloud;
-                            // If active conversation was tombstoned, switch away
-                            const activeId = gemini.activeConvoId.value;
-                            if (activeId && tombstoneIds.has(activeId)) {
-                                const remaining = [...gemini.conversationMap.keys()];
-                                gemini.activeConvoId.value = remaining.length ? remaining[remaining.length - 1] : null;
+                            // If active conversation was tombstoned, load most-recent saved or start new chat
+                            if (activeWasTombstoned) {
+                                const fallback = gemini.savedConversations.value
+                                    .slice().sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))[0];
+                                if (fallback) gemini.loadConversation(fallback.id).catch(() => gemini.newChat());
+                                else gemini.newChat();
                             }
                             toast.info(`Removed ${removedCount} deleted conversation(s) from other device.`, 'sync', 3000);
                         }
@@ -486,7 +498,7 @@
                                     localById[remoteId].title = title;
                                     localById[remoteId].timestamp = ts;
                                     if (lfs) lfs.promises.unlink(_convoPath(remoteId)).catch(() => {});
-                                    gemini.conversationMap.delete(remoteId);
+                                    if (gemini.conversationMap.has(remoteId)) gemini.closeConversation(remoteId);
                                     updatedCount++;
                                 }
                             }
@@ -498,17 +510,24 @@
                                 if (localById[cid]) {
                                     delete localById[cid];
                                     if (lfs) lfs.promises.unlink(_convoPath(cid)).catch(() => {});
-                                    gemini.conversationMap.delete(cid);
+                                    if (gemini.conversationMap.has(cid)) gemini.closeConversation(cid);
                                     removedCount++;
                                 }
                             }
                             gemini.savedConversations.value = Object.values(localById);
                             gemini.cloudConversations.value = localCloudMap;
-                            // If active conversation was removed, switch away; if updated, reload it
+                            // If active conversation was removed, load a recent saved one or start new chat
+                            // If active conversation was updated (evicted from map), reload it from R2
                             const activeId = gemini.activeConvoId.value;
-                            if (activeId && !localById[activeId]) {
-                                const remaining = [...gemini.conversationMap.keys()];
-                                gemini.activeConvoId.value = remaining.length ? remaining[remaining.length - 1] : null;
+                            if (activeId && !localById[activeId] && !gemini.conversationMap.has(activeId)) {
+                                const fallbackSaved = Object.values(localById)
+                                    .filter(c => c && typeof c.id === 'string' && c.id !== activeId)
+                                    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))[0];
+                                if (fallbackSaved) {
+                                    gemini.loadConversation(fallbackSaved.id).catch(() => gemini.newChat());
+                                } else {
+                                    gemini.newChat();
+                                }
                             } else if (activeId && !gemini.conversationMap.has(activeId) && localById[activeId]) {
                                 gemini.loadConversation(activeId).catch(() => {});
                             }
