@@ -289,12 +289,12 @@
                 if (options.contentType) headers['Content-Type'] = options.contentType;
                 if (options.customHeaders) {
                     for (const [key, value] of Object.entries(options.customHeaders)) {
-                        if (/^x-convo-/i.test(key)) headers[key] = value;
+                        if (/^(x-convo-|if-none-match)/i.test(key)) headers[key] = value;
                     }
                 }
                 const res = await fetch(`${base}/r2/${path}`, { method, headers, body, cache: 'no-store' });
                 if (res.status === 401) throw new Error('Invalid sync secret.');
-                if (!res.ok && res.status !== 404) throw new Error(`R2 request failed: ${res.status}`);
+                if (!res.ok && res.status !== 404 && res.status !== 304) throw new Error(`R2 request failed: ${res.status}`);
                 return res;
             };
             return { r2Fetch, getWorkerUrl, getSecret };
@@ -369,6 +369,8 @@
                 if (snap.app) delete snap.app.apiKey;
                 return snap;
             };
+            const _configEtag = useLocalStorage('nai-config-etag', null);
+            watch(() => [appStore.config.value.jssync.proxyUrl, appStore.syncToken.value], () => { _configEtag.value = null; });
             const _pruneTombstones = (tombstones) => {
                 const cutoff = Date.now() - TOMBSTONE_TTL_MS;
                 return (tombstones || []).filter(t => t.deletedAt > cutoff);
@@ -378,10 +380,15 @@
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 syncStatus.value = 'pulling'; syncError.value = null;
                 try {
+                    const configHeaders = {};
+                    if (_configEtag.value) configHeaders['If-None-Match'] = _configEtag.value;
                     const [res, listRes] = await Promise.all([
-                        r2Client.r2Fetch('GET', 'config'),
+                        r2Client.r2Fetch('GET', 'config', null, { customHeaders: configHeaders }),
                         r2Client.r2Fetch('GET', 'conversations').catch(e => { console.warn('Sync pull: failed to fetch conversations list.', e); return null; })
                     ]);
+                    if (res.status !== 304) {
+                    const etag = res.headers.get('ETag');
+                    if (etag) _configEtag.value = etag;
                     const remote = await res.json();
                     if (remote && Object.keys(remote).length) {
                         const localMeta = cfg._syncMeta || {};
@@ -414,7 +421,7 @@
                             }
                             cfg.jssync._deletedConversationIds = _pruneTombstones([...merged.values()]);
                         }
-                    }
+                    } // end if (res.status !== 304)
                     const gemini = useGeminiAPI();
                     const tombstoneIds = new Set((cfg.jssync._deletedConversationIds || []).map(t => t.id));
                     if (tombstoneIds.size) {
@@ -517,6 +524,7 @@
                     payload._deletedConversationIds = _pruneTombstones(tombstones);
                     if (_SYNC_KEYS.some(k=>(cfg._syncMeta?.[k]?.updatedAt||0)>lastSynced) || tombstones.some(t=>t.deletedAt>lastSynced)) {
                         await r2Client.r2Fetch('PUT', 'config', JSON.stringify(payload), { contentType: 'application/json' });
+                        _configEtag.value = null;
                     }
                     const gemini = useGeminiAPI();
                     const localCloudMap = { ...gemini.cloudConversations.value };
