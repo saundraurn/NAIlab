@@ -397,7 +397,7 @@
                 try {
                     const [res, listRes] = await Promise.all([
                         r2Client.r2Fetch('GET', 'config'),
-                        r2Client.r2Fetch('GET', 'conversations').catch(() => null)
+                        r2Client.r2Fetch('GET', 'conversations').catch(e => { console.warn('Sync pull: failed to fetch conversations list.', e); return null; })
                     ]);
                     const remote = await res.json();
                     if (remote && Object.keys(remote).length) {
@@ -567,10 +567,12 @@
                         dirtyMetas.push(meta);
                     }
                     if (cloudMapDirty) gemini.cloudConversations.value = localCloudMap;
-                    await Promise.all(dirtyMetas.map(async meta => {
-                        try { await gemini.syncConversationToR2(meta.id); }
-                        catch (e) { console.warn(`Failed to push convo ${meta.id}:`, e); }
-                    }));
+                    for (let i = 0; i < dirtyMetas.length; i += 5) {
+                        await Promise.all(dirtyMetas.slice(i, i + 5).map(async meta => {
+                            try { await gemini.syncConversationToR2(meta.id); }
+                            catch (e) { console.warn(`Failed to push convo ${meta.id}:`, e); }
+                        }));
+                    }
                     const tombstonesToDelete = tombstones.filter(t => t.deletedAt > lastSynced);
                     for (let i = 0; i < tombstonesToDelete.length; i += 5) {
                         await Promise.all(tombstonesToDelete.slice(i, i + 5)
