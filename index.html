@@ -1270,7 +1270,7 @@ const TagCountBadge={
                     if (!convo.isTemp && _isSyncReady()) {
                         if (!cloudConversations.value[convo.id]) cloudConversations.value = { ...cloudConversations.value, [convo.id]: true };
                         _r2SyncDirty.add(convo.id);
-                        _autoSyncR2(true);
+                        _runR2Sync();
                     }
                 }
             };
@@ -1506,7 +1506,7 @@ const TagCountBadge={
                         if (!cloudConversations.value[convo.id]) cloudConversations.value = { ...cloudConversations.value, [convo.id]: true };
                         if (convoSyncStatus[convo.id] !== 'syncing') convoSyncStatus[convo.id] = 'pending';
                         _r2SyncDirty.add(convo.id);
-                        _autoSyncR2();
+                        _runR2Sync();
                     }
                 }
             }, 1500);
@@ -1594,8 +1594,7 @@ const TagCountBadge={
                 })();
                 return _r2SyncPromise;
             };
-            const _debouncedR2Sync = useDebounceFn(_runR2Sync, 3000);
-            const _autoSyncR2 = (immediate) => immediate ? _runR2Sync() : _debouncedR2Sync();
+
             const syncConversationNow = async (id) => {
                 if (!cloudConversations.value[id]) {
                     convoSyncStatus[id] = 'syncing';
