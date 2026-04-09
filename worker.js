@@ -59,7 +59,26 @@ async function handleR2(request, env, url) {
       }
       cursor = list.truncated ? list.cursor : null;
     } while (cursor);
-    return corsJson(ids);
+    // Fetch lightweight metadata for each conversation via head() in batches
+    const BATCH_SIZE = 20;
+    const convos = [];
+    for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+      const batch = ids.slice(i, i + BATCH_SIZE);
+      const results = await Promise.all(batch.map(async (id) => {
+        try {
+          const head = await env.BUCKET.head(`conversations/${id}/conversation.json`);
+          if (!head) return null; // no conversation.json — skip ghost prefix
+          const meta = head.customMetadata || {};
+          let title = 'Cloud Chat';
+          if (meta.title) { try { title = decodeURIComponent(meta.title); } catch { title = meta.title; } }
+          return { id, title, timestamp: Number(meta.timestamp) || Date.now() };
+        } catch {
+          return null;
+        }
+      }));
+      for (const result of results) { if (result) convos.push(result); }
+    }
+    return corsJson(convos);
   }
 
   // ── Single conversation (JSON) ───────────────────────────────────────────
@@ -74,10 +93,19 @@ async function handleR2(request, env, url) {
       });
     }
     if (request.method === 'PUT') {
+      const title = request.headers.get('X-Convo-Title');
+      const timestamp = request.headers.get('X-Convo-Timestamp');
+      const putOptions = { httpMetadata: { contentType: 'application/json' } };
+      if (title || timestamp) {
+        const customMetadata = {};
+        if (title) customMetadata.title = title;
+        if (timestamp) customMetadata.timestamp = timestamp;
+        putOptions.customMetadata = customMetadata;
+      }
       await env.BUCKET.put(
         `conversations/${convoId}/conversation.json`,
         request.body,
-        { httpMetadata: { contentType: 'application/json' } }
+        putOptions
       );
       return corsResponse('OK');
     }

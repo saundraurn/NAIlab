@@ -306,6 +306,11 @@
                 if (!secret) throw new Error('Sync secret not configured.');
                 const headers = { 'Authorization': `Bearer ${secret}` };
                 if (options.contentType) headers['Content-Type'] = options.contentType;
+                if (options.customHeaders) {
+                    for (const [key, value] of Object.entries(options.customHeaders)) {
+                        if (/^x-convo-/i.test(key)) headers[key] = value;
+                    }
+                }
                 const res = await fetch(`${base}/r2/${path}`, { method, headers, body, cache: 'no-store' });
                 if (res.status === 401) throw new Error('Invalid sync secret.');
                 if (!res.ok && res.status !== 404) throw new Error(`R2 request failed: ${res.status}`);
@@ -453,31 +458,23 @@
                     try {
                         const listRes = await r2Client.r2Fetch('GET', 'conversations');
                         if (listRes.ok) {
-                            const remoteConvoIds = await listRes.json();
+                            const remoteConvos = await listRes.json();
                             const localById = _.keyBy(gemini.savedConversations.value, 'id');
                             const localCloudMap = { ...gemini.cloudConversations.value };
                             let addedCount = 0;
-                            for (const remoteId of remoteConvoIds) {
+                            for (const entry of remoteConvos) {
+                                // Support both new {id,title,timestamp} and legacy plain-ID formats
+                                const isObj = entry && typeof entry === 'object' && !Array.isArray(entry);
+                                const remoteId = isObj ? entry.id : entry;
+                                if (typeof remoteId !== 'string' || !remoteId) continue;
+                                const title = (isObj && entry.title) || 'Cloud Chat';
+                                const ts = (isObj && entry.timestamp) || Date.now();
                                 // Skip tombstoned conversations
                                 if (tombstoneIds.has(remoteId)) continue;
                                 localCloudMap[remoteId] = true;
                                 if (!localById[remoteId]) {
-                                    // Fetch metadata for new remote conversation
-                                    try {
-                                        const convoRes = await r2Client.r2Fetch('GET', `conversations/${remoteId}`);
-                                        if (convoRes.ok) {
-                                            const convoData = await convoRes.json();
-                                            const title = convoData?.title || convoData?.messages?.[0]?.text?.substring(0, 40) || 'Cloud Chat';
-                                            const ts = convoData?.timestamp || Date.now();
-                                            localById[remoteId] = { id: remoteId, title, timestamp: ts };
-                                            // Write to local LFS
-                                            const lfs = useImageStore().getLfs();
-                                            if (lfs && convoData) {
-                                                try { await lfs.promises.writeFile(_convoPath(remoteId), JSON.stringify(convoData)); } catch {}
-                                            }
-                                            addedCount++;
-                                        }
-                                    } catch {}
+                                    localById[remoteId] = { id: remoteId, title, timestamp: ts };
+                                    addedCount++;
                                 }
                             }
                             gemini.savedConversations.value = Object.values(localById);
@@ -1437,8 +1434,23 @@ const TagCountBadge={
                     // Fall back to fetching from R2 cloud storage
                     if (!convoData && cloudConversations.value[id]) {
                         convoData = await _fetchConvoFromR2(id);
-                        if (convoData && lfs) {
-                            try { await _writeConvoToLfs(lfs, id, convoData.messages, convoData.params); } catch {}
+                        if (convoData) {
+                            if (lfs) {
+                                try { await _writeConvoToLfs(lfs, id, convoData.messages, convoData.params); } catch {}
+                            }
+                            // Update metadata from R2 data (fixes titles for pre-metadata conversations)
+                            const s = _.find(savedConversations.value, {id});
+                            if (convoData.title) {
+                                convo.title = convoData.title;
+                                if (s) s.title = convoData.title;
+                            }
+                            if (convoData.timestamp != null) {
+                                const timestamp = Number(convoData.timestamp);
+                                if (Number.isFinite(timestamp)) {
+                                    convo.timestamp = timestamp;
+                                    if (s) s.timestamp = timestamp;
+                                }
+                            }
                         }
                     }
                     if (!convoData) {
@@ -1526,18 +1538,21 @@ const TagCountBadge={
             const r2Client = useR2Client();
             // Push conversation JSON + images to R2 via the worker
             const _pushConvoR2Locks = new Map();
-            const _pushConvoToR2 = (convoId, convoJson, imageIds, localFs) => {
+            const _pushConvoToR2 = (convoId, convoJson, imageIds, localFs, meta) => {
                 const prev = _pushConvoR2Locks.get(convoId) || Promise.resolve();
-                const next = prev.then(() => _doPushConvoToR2(convoId, convoJson, imageIds, localFs));
+                const next = prev.then(() => _doPushConvoToR2(convoId, convoJson, imageIds, localFs, meta));
                 const lock = next.catch(() => {}).finally(() => {
                     if (_pushConvoR2Locks.get(convoId) === lock) _pushConvoR2Locks.delete(convoId);
                 });
                 _pushConvoR2Locks.set(convoId, lock);
                 return next;
             };
-            const _doPushConvoToR2 = async (convoId, convoJson, imageIds, localFs) => {
-                // Push conversation JSON
-                await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json' });
+            const _doPushConvoToR2 = async (convoId, convoJson, imageIds, localFs, meta) => {
+                // Push conversation JSON with title/timestamp as R2 custom metadata
+                const customHeaders = {};
+                if (meta?.title) customHeaders['X-Convo-Title'] = encodeURIComponent(meta.title);
+                if (meta?.timestamp) customHeaders['X-Convo-Timestamp'] = String(meta.timestamp);
+                await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json', customHeaders });
                 // Push new images
                 const syncedArr = _syncedR2Images.value[convoId] || [];
                 const syncedSet = new Set(syncedArr);
@@ -1573,7 +1588,7 @@ const TagCountBadge={
                 // Enrich with metadata for cross-browser pull
                 const meta = _.find(savedConversations.value, { id });
                 if (meta) { convoData.title = meta.title; convoData.timestamp = meta.timestamp; }
-                await _pushConvoToR2(id, JSON.stringify(convoData), imageIds, localFs);
+                await _pushConvoToR2(id, JSON.stringify(convoData), imageIds, localFs, meta ? { title: meta.title, timestamp: meta.timestamp } : null);
             };
             let _r2SyncInProgress = false;
             let _r2SyncPromise = null;
