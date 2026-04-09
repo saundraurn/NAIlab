@@ -123,7 +123,7 @@
         const _FM='gemini-3.1-flash-image-preview',_PM='gemini-3-pro-image-preview',_WP='image/webp';
         const blobToWebP = async (blob) => { const bm = await createImageBitmap(blob), c = new OffscreenCanvas(bm.width, bm.height); c.getContext('2d').drawImage(bm, 0, 0); return new Uint8Array(await (await c.convertToBlob({type:_WP,quality:1})).arrayBuffer()); };
         const _IMGTOK = {'0.5K': 747, '1K': 1120, '2K': 1680, '4K': 2520};
-        const _MODEL_PRICING = {[_FM]:{inPerM:0.50,txtPerM:3,imgPerM:60,label:'Nano Banana 2',shortLabel:'NB2',tooltipPricing:'$0.50/M in · $3/M text · $60/M img'},[_PM]:{inPerM:1.25,txtPerM:5,imgPerM:120,label:'Nano Banana Pro',shortLabel:'NBPro',tooltipPricing:'$1.25/M in · $5/M text · $120/M img'}};
+        const _MODEL_PRICING = {[_FM]:{inPerM:0.50,txtPerM:3,imgPerM:60,label:'Nano Banana 2',tooltipPricing:'$0.50/M in · $3/M text · $60/M img'},[_PM]:{inPerM:1.25,txtPerM:5,imgPerM:120,label:'Nano Banana Pro',tooltipPricing:'$1.25/M in · $5/M text · $120/M img'}};
         const _BANANA_MODELS = Object.entries(_MODEL_PRICING).map(([val,{label:text}])=>({val,text}));
         const _DCP = () => ({thinkingLevel:'MINIMAL', aspectRatio:'9:16', imageSize:'0.5K', autoRetry:true, hideVariantsNoImage:false, bananaModel:_FM, flexInference:true});
         const calcVariantCost = (usage, imageCount, imageSize, model, isFlexInference) => { if (!usage) return null; const p = _MODEL_PRICING[model] || _MODEL_PRICING[_FM], d = usage.candidatesTokensDetails?.find(d => d.modality === 'IMAGE'), imgT = d ? (d.tokenCount || 0) : (imageCount || 0) * (_IMGTOK[imageSize] || _IMGTOK['1K']), cost = ((usage.promptTokenCount || 0) * p.inPerM + Math.max(0, (usage.candidatesTokenCount || 0) - imgT) * p.txtPerM + imgT * p.imgPerM) / 1e6; return isFlexInference ? cost * 0.5 : cost; };
@@ -136,6 +136,8 @@
         const MAX_SEED=9e15;
         const _batch5 = async (arr, fn) => { for (let i = 0; i < arr.length; i += 5) await Promise.all(arr.slice(i, i + 5).map(fn)); };
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
+        const _parseConvo = (json) => json ? (typeof json === 'string' ? JSON.parse(json) : json) : null;
+        const _normalizeUrl = (url) => { if (!url) return ''; if (!/^https?:\/\//i.test(url)) url = 'https://' + url; return url.replace(/\/$/, ''); };
         const useAppStore = createGlobalState(() => {
             const config = useLocalStorage('nai-app-settings', {
                 tagTest: {iterations:1, isInfinite:false, isControl:true, prompts:[{id:1, val:'1girl, solo, wearing casual clothes'}], nextPromptId:2, unwantedContent:'multiple views, monochrome, black and white, looking at viewer, pov', tagsToTest:'sunset lighting\nwarm colors\nnight scene\nfog\nrain', tagPos:'beginning', tagTarget:'prompt', tagStrength:1.0, hasExtendedRange:false, areTagsVisible:false, shouldFilterMiddleResults:false},
@@ -218,18 +220,15 @@
                     }
                 } finally {isDispatcherRunning.value = false;}
             };
-            return {config, toasts, addToast, removeToast, notifications, resetNotificationNum: (src) => updateNotification(src, 0), incrementNotification: (src) => updateNotification(src, 1), queue, isDispatcherRunning, isApiHalted, addReqs, clearQueueBySource, startDispatcher, isSyncMerging, syncToken};
+            return {config, toasts, addToast, removeToast, notifications, resetNotificationNum: (src) => updateNotification(src, 0), incrementNotification: (src) => updateNotification(src, 1), queue, isDispatcherRunning, isApiHalted, addReqs, clearQueueBySource, isSyncMerging, syncToken};
         });
         const danbooruImgSrc = (url) => {
             if (!url) return '';
-            let {proxyUrl} = useAppStore().config.value.jssync;
+            const proxyUrl = _normalizeUrl(useAppStore().config.value.jssync.proxyUrl);
             if (!proxyUrl) return url;
-            if (!/^https?:\/\//i.test(proxyUrl)) proxyUrl = 'https://' + proxyUrl;
-            return `${proxyUrl.replace(/\/$/, '')}/proxy?url=${encodeURIComponent(url)}`;
+            return `${proxyUrl}/proxy?url=${encodeURIComponent(url)}`;
         };
         const useImageStore = createGlobalState(() => {
-            const store = useAppStore();
-            const init = async () => {};
             const saveImage = async (imageId, uint8Array) => {
                 await idbSet(imageId, uint8Array, _idb);
             };
@@ -253,44 +252,33 @@
                 try { return await idbGet(imageId, _idb) || null; } catch { return null; }
             };
             const cleanupOrphanedImages = async (savedConvosList) => {
-                const metas = savedConvosList || [];
                 const referenced = new Set();
-                for (const meta of metas) {
-                    if (!meta || !meta.id) continue;
+                for (const meta of savedConvosList || []) {
+                    if (!meta?.id) continue;
                     try {
-                        const json = await idbGet(_convoPath(meta.id), _idb);
-                        if (!json) continue;
-                        const convo = typeof json === 'string' ? JSON.parse(json) : json;
-                        for (const msg of convo.messages || []) {
-                            for (const img of msg.images || []) { if (img.imageId) referenced.add(img.imageId); }
-                            for (const v of msg.variants || []) {
-                                for (const part of v.parts || []) { if (part._imageRef) referenced.add(part._imageRef); }
-                                for (const img of v._images || []) { if (img.imageId) referenced.add(img.imageId); }
-                            }
-                        }
+                        const convo = _parseConvo(await idbGet(_convoPath(meta.id), _idb));
+                        if (convo) _collectImageIds(convo).forEach(id => referenced.add(id));
                     } catch {}
                 }
                 try {
                     const allKeys = await idbKeys(_idb);
                     for (const k of allKeys) {
-                        if (typeof k === 'string' && k.startsWith('img_') && k.endsWith('.webp') && !referenced.has(k)) {
+                        if (typeof k === 'string' && k.startsWith('img_') && !referenced.has(k)) {
                             idbDel(k, _idb).catch(() => {});
                         }
                     }
                 } catch {}
             };
             return {
-                init, saveImage, loadImage, ingestImage,
+                saveImage, loadImage, ingestImage,
                 cleanupOrphanedImages
             };
         });
         const useR2Client = createGlobalState(() => {
             const appStore = useAppStore();
             const getWorkerUrl = () => {
-                let base = appStore.config.value.jssync.proxyUrl;
-                if (!base) return null;
-                if (!/^https?:\/\//i.test(base)) base = 'https://' + base;
-                return base.replace(/\/$/, '');
+                const base = _normalizeUrl(appStore.config.value.jssync.proxyUrl);
+                return base || null;
             };
             const getSecret = () => appStore.syncToken.value;
             const r2Fetch = async (method, path, body, options = {}) => {
@@ -735,7 +723,7 @@ const TagCountBadge={
             template: `<div class="toast toast-bottom toast-end z-[1000] p-4 pointer-events-none"><transition-group name="list" tag="div" class="flex flex-col items-end space-y-2"><div v-for="toast in toasts" :key="toast.id" class="alert shadow-lg w-fit max-w-md cursor-pointer flex border border-white/10 text-white pointer-events-auto" :class="[toastConfig[toast.type] || '', 'bg-opacity-80 backdrop-blur-md']" @click="removeToast(toast.id)"><span> {{toast.msg}} <span v-if="toast.count > 1" class="font-bold text-sm"> (x{{toast.count}})</span><span v-if="toast.source && toast.source !== 'default'" class="text-xs opacity-75 ml-1">(from {{toast.source}})</span></span></div></transition-group></div>`
         };
         const _GEN_SAMPLERS = 'k_euler_ancestral,k_euler,k_dpmpp_2s_ancestral,k_dpmpp_2m_sde,k_dpmpp_2m,k_dpmpp_sde,ddim_v3,ddim'.split(',');
-        const _GEN_SCHEDULERS = ['karras','exponential','polyexponential'].map(v=>({val:v,text:v[0].toUpperCase()+v.slice(1)}));
+        const _GEN_SCHEDULERS = ['karras','exponential','polyexponential'].map(v=>({val:v,text:_.capitalize(v)}));
         const GenerationSettingsPanel = {
             props: {config: {type: Object, required: true}},
             setup(props) {
@@ -1402,7 +1390,7 @@ const TagCountBadge={
                     let convoData = null;
                     try {
                         const json = await idbGet(_convoPath(id), _idb);
-                        if (json) convoData = typeof json === 'string' ? JSON.parse(json) : json;
+                        if (json) convoData = _parseConvo(json);
                     } catch {}
                     if (!convoData && cloudConversations.value[id]) {
                         convoData = await _fetchConvoFromR2(id);
@@ -1538,7 +1526,7 @@ const TagCountBadge={
                 try {
                     const json = await idbGet(_convoPath(id), _idb);
                     if (!json) throw new Error('not found');
-                    convoData = typeof json === 'string' ? JSON.parse(json) : json;
+                    convoData = _parseConvo(json);
                 }
                 catch { throw new Error('Conversation data not found locally.'); }
                 const imageIds = _collectImageIds(convoData);
@@ -1711,8 +1699,7 @@ const TagCountBadge={
                 const availableImageSizes = computed(() => convoParams.value.bananaModel === _PM ? ['1K','2K','4K'] : _BANANA_IMAGE_SIZES);
                 const scrollToBottom = () => nextTick(() => { if (chatEl.value) chatEl.value.scrollTo({top: chatEl.value.scrollHeight, behavior: 'smooth'}); });
                 const handleFileUpload = async (files, forEdit = false) => {
-                    const arr = files instanceof FileList ? Array.from(files) : Array.isArray(files) ? files : [files];
-                    const valid = arr.filter(f => f?.type?.startsWith('image/'));
+                    const valid = Array.from(files).filter(f => f?.type?.startsWith('image/'));
                     if (!valid.length) { toast.err('Please upload an image file'); return; }
                     const imageObjects = valid.map(f => {
                         const img = reactive({
@@ -1802,7 +1789,6 @@ const TagCountBadge={
             },
             template: `<split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #header><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0 w-28"><setting-input v-model="convoParams.aspectRatio" label="Aspect Ratio" type="select" :options="aspectRatios"></setting-input></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></template><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><convo-list-item v-for="convo in openConversations" :key="convo.id" :convo="convo" :is-active="activeConvoId===convo.id" is-open :cloud-linked="!convo.isTemp&&!!conversationGists[convo.id]" :sync-status="convoSyncStatus[convo.id]" @click="switchConversation(convo.id)" @rename="handleRename(convo,$event)"><template v-if="convo.messages.length" #preview><span class="truncate flex-1">{{getConvoPreview(convo.messages)}}</span><span class="shrink-0 text-neutral-600 tabular-nums">· {{convo.messages.length}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn v-if="convo.isTemp&&convo.messages.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/><icon-btn icon="close" @click.stop="closeConversation(convo.id)" title="Close" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item><template v-if="closedSavedConversations.length"><div class="divider text-xs text-neutral-600 my-2 select-none">Saved ({{ closedSavedConversations.length }})</div><convo-list-item v-for="convo in closedSavedConversations" :key="convo.id" :convo="convo" :cloud-linked="!!conversationGists[convo.id]" @click="loadConversation(convo.id)" @rename="handleRename(convo,$event)"><template #preview><span class="shrink-0 text-neutral-600 tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn icon="delete" @click.stop="deleteConversation(convo.id)" title="Delete" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item></template><div v-if="!openConversations.length && !closedSavedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()"></chat-message></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><image-preview-card v-for="(img, idx) in pendingImages" :key="idx" :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport>`
         };
-        /* ConflictResolutionModal removed — sync now uses last-write-wins */
         const Settings = {
             setup() {
                 const appStore = useAppStore();
@@ -1876,16 +1862,14 @@ const TagCountBadge={
                 });
                 onMounted(async () => {
                     const jssync = config.value.jssync;
-                    const imageStore = useImageStore();
                     const geminiAPI = useGeminiAPI();
-                    await imageStore.init();
                     let pullDone = Promise.resolve();
                     if (syncToken.value && jssync.proxyUrl) {
                         pullDone = syncStore.pull().catch(() => {});
                     }
                     await geminiAPI.initFromStorage();
                     await pullDone;
-                    imageStore.cleanupOrphanedImages(geminiAPI.savedConversations.value).catch(() => {});
+                    useImageStore().cleanupOrphanedImages(geminiAPI.savedConversations.value).catch(() => {});
                     const _debouncedAutoSync = useDebounceFn(() => {
                         const js = config.value.jssync;
                         if (!syncToken.value || !js.proxyUrl) return;
