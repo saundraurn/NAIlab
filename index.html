@@ -589,9 +589,11 @@
                     }
                     // Delete tombstoned conversations from R2 (only recent ones)
                     const lastSync = cfg.jssync.lastSyncedAt || 0;
-                    await Promise.all((cfg.jssync._deletedConversationIds || [])
-                        .filter(t => t.deletedAt > lastSync)
-                        .map(t => r2Client.r2Fetch('DELETE', `conversations/${t.id}`).catch(() => {})));
+                    const tombstonesToDelete = (cfg.jssync._deletedConversationIds || []).filter(t => t.deletedAt > lastSync);
+                    for (let i = 0; i < tombstonesToDelete.length; i += 5) {
+                        await Promise.all(tombstonesToDelete.slice(i, i + 5)
+                            .map(t => r2Client.r2Fetch('DELETE', `conversations/${t.id}`).catch(() => {})));
+                    }
                     _finalizePush(cfg);
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config synced to cloud.', 'sync', 2500);
@@ -1603,8 +1605,10 @@ const TagCountBadge={
                         const listRes = await r2Client.r2Fetch('GET', `conversations/${convoId}/images`);
                         if (listRes.ok) {
                             const orphaned = (await listRes.json()).filter(name => !imageIds.has(name));
-                            await Promise.all(orphaned.map(name =>
-                                r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {})));
+                            for (let i = 0; i < orphaned.length; i += 5) {
+                                await Promise.all(orphaned.slice(i, i + 5)
+                                    .map(name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {})));
+                            }
                         }
                     } catch {}
                 }
@@ -1694,9 +1698,11 @@ const TagCountBadge={
                     toast.warn('Failed to delete cloud conversation', 'sync', 3000);
                     return;
                 }
-                const { [id]: _c, ...restCloud } = cloudConversations.value;
+                const restCloud = { ...cloudConversations.value };
+                delete restCloud[id];
                 cloudConversations.value = restCloud;
-                const { [id]: _s, ...restSync } = _syncedR2Images.value;
+                const restSync = { ..._syncedR2Images.value };
+                delete restSync[id];
                 _syncedR2Images.value = restSync;
                 delete convoSyncStatus[id];
             };
