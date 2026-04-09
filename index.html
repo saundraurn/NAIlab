@@ -134,6 +134,7 @@
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
         const _META_KEYS = ['id', 'title', 'timestamp'];
+        const _batch5 = async (arr, fn) => { for (let i = 0; i < arr.length; i += 5) await Promise.all(arr.slice(i, i + 5).map(fn)); };
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
         const useAppStore = createGlobalState(() => {
             const config = useLocalStorage('nai-app-settings', {
@@ -392,13 +393,13 @@
             };
             const pull = async () => {
                 const cfg = appStore.config.value;
-                const workerUrl = r2Client.getWorkerUrl();
-                const secret = r2Client.getSecret();
-                if (!workerUrl || !secret) return;
+                if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 syncStatus.value = 'pulling'; syncError.value = null;
                 try {
-                    // Pull config (settings only, no conversations)
-                    const res = await r2Client.r2Fetch('GET', 'config');
+                    const [res, listRes] = await Promise.all([
+                        r2Client.r2Fetch('GET', 'config'),
+                        r2Client.r2Fetch('GET', 'conversations').catch(e => { console.warn('Sync pull: failed to fetch conversations list.', e); return null; })
+                    ]);
                     const remote = await res.json();
                     if (remote && Object.keys(remote).length) {
                         const localMeta = cfg._syncMeta || {};
@@ -421,7 +422,6 @@
                             });
                             toast.ok(`Pulled ${mergedKeys.length} updated section(s).`, 'sync', 3000);
                         }
-                        // Merge tombstones from remote
                         if (remote._deletedConversationIds) {
                             const localTombstones = cfg.jssync._deletedConversationIds || [];
                             const merged = new Map();
@@ -433,7 +433,6 @@
                             cfg.jssync._deletedConversationIds = _pruneTombstones([...merged.values()]);
                         }
                     }
-                    // Apply tombstones: remove locally-existing conversations that were deleted on another device
                     const gemini = useGeminiAPI();
                     const tombstoneIds = new Set((cfg.jssync._deletedConversationIds || []).map(t => t.id));
                     if (tombstoneIds.size) {
@@ -445,13 +444,9 @@
                                 delete localCloud[c.id];
                                 const lfs = useImageStore().getLfs();
                                 if (lfs) lfs.promises.unlink(_convoPath(c.id)).catch(() => {});
-                                // Use closeConversation for proper cleanup (abort, prune thinking state)
-                                // but only if open; closing active convo defers switching until after filter
                                 if (gemini.conversationMap.has(c.id) && !activeWasTombstoned) {
                                     gemini.closeConversation(c.id);
                                 } else if (gemini.conversationMap.has(c.id)) {
-                                    // Abort in-flight generation but don't let closeConversation switch
-                                    // activeConvoId yet — we'll pick a better fallback below
                                     const convo = gemini.conversationMap.get(c.id);
                                     if (convo?.generating && convo.abortCtrl) convo.abortCtrl.abort();
                                     gemini.conversationMap.delete(c.id);
@@ -463,20 +458,16 @@
                         });
                         if (removedCount) {
                             gemini.cloudConversations.value = localCloud;
-                            // If active conversation was tombstoned, load most-recent saved or start new chat
                             if (activeWasTombstoned) {
-                                const fallback = gemini.savedConversations.value
-                                    .slice().sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))[0];
+                                const fallback = _.maxBy(gemini.savedConversations.value, 'timestamp');
                                 if (fallback) gemini.loadConversation(fallback.id).catch(() => gemini.newChat());
                                 else gemini.newChat();
                             }
                             toast.info(`Removed ${removedCount} deleted conversation(s) from other device.`, 'sync', 3000);
                         }
                     }
-                    // Pull conversation list from R2
                     try {
-                        const listRes = await r2Client.r2Fetch('GET', 'conversations');
-                        if (listRes.ok) {
+                        if (listRes?.ok) {
                             const remoteConvos = await listRes.json();
                             const localById = _.keyBy(gemini.savedConversations.value, 'id');
                             const localCloudMap = { ...gemini.cloudConversations.value };
@@ -496,7 +487,6 @@
                                     localById[remoteId] = { id: remoteId, title, timestamp: ts };
                                     addedCount++;
                                 } else if (ts > (localById[remoteId].timestamp || 0)) {
-                                    // Remote is newer — update metadata and invalidate local cache
                                     localById[remoteId].title = title;
                                     localById[remoteId].timestamp = ts;
                                     if (lfs) lfs.promises.unlink(_convoPath(remoteId)).catch(() => {});
@@ -504,7 +494,6 @@
                                     updatedCount++;
                                 }
                             }
-                            // Remove local cloud conversations that no longer exist in R2
                             let removedCount = 0;
                             for (const cid of Object.keys(localCloudMap)) {
                                 if (remoteIdSet.has(cid) || tombstoneIds.has(cid)) continue;
@@ -518,25 +507,15 @@
                             }
                             gemini.savedConversations.value = Object.values(localById);
                             gemini.cloudConversations.value = localCloudMap;
-                            // If active conversation was removed, load a recent saved one or start new chat
-                            // If active conversation was updated (evicted from map), reload it from R2
                             const activeId = gemini.activeConvoId.value;
                             if (activeId && !localById[activeId] && !gemini.conversationMap.has(activeId)) {
-                                const fallbackSaved = Object.values(localById)
-                                    .filter(c => c && typeof c.id === 'string' && c.id !== activeId)
-                                    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))[0];
-                                if (fallbackSaved) {
-                                    gemini.loadConversation(fallbackSaved.id).catch(() => gemini.newChat());
-                                } else {
-                                    gemini.newChat();
-                                }
+                                const fallbackSaved = _.maxBy(Object.values(localById).filter(c => c?.id && c.id !== activeId), 'timestamp');
+                                if (fallbackSaved) gemini.loadConversation(fallbackSaved.id).catch(() => gemini.newChat());
+                                else gemini.newChat();
                             } else if (activeId && !gemini.conversationMap.has(activeId) && localById[activeId]) {
                                 gemini.loadConversation(activeId).catch(() => {});
                             }
-                            const parts = [];
-                            if (addedCount) parts.push(`${addedCount} new`);
-                            if (updatedCount) parts.push(`${updatedCount} updated`);
-                            if (removedCount) parts.push(`${removedCount} removed`);
+                            const parts = [addedCount && `${addedCount} new`, updatedCount && `${updatedCount} updated`, removedCount && `${removedCount} removed`].filter(Boolean);
                             if (parts.length) toast.ok(`Conversations: ${parts.join(', ')}.`, 'sync', 3000);
                         }
                     } catch (e) { console.warn('Failed to pull conversations list:', e); }
@@ -549,32 +528,17 @@
             };
             const push = async (silent = false) => {
                 const cfg = appStore.config.value;
-                const workerUrl = r2Client.getWorkerUrl();
-                const secret = r2Client.getSecret();
-                if (!workerUrl || !secret) return;
+                if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 syncStatus.value = 'pushing'; syncError.value = null;
                 try {
-                    // Push config (settings sections only)
-                    const payload = extractSyncPayload(cfg);
-                    // Include tombstones in config
-                    payload._deletedConversationIds = _pruneTombstones(cfg.jssync._deletedConversationIds || []);
-                    const hasLocalChanges = _SYNC_KEYS.some(k => {
-                        const localTime = cfg._syncMeta?.[k]?.updatedAt || 0;
-                        const lastSynced = cfg.jssync.lastSyncedAt || 0;
-                        return localTime > lastSynced;
-                    });
-                    // Also push config if there are new tombstones
-                    const hasDirtyTombstones = (cfg.jssync._deletedConversationIds || []).some(
-                        t => t.deletedAt > (cfg.jssync.lastSyncedAt || 0)
-                    );
-                    if (hasLocalChanges || hasDirtyTombstones) {
-                        const content = JSON.stringify(payload);
-                        await r2Client.r2Fetch('PUT', 'config', content, { contentType: 'application/json' });
-                    }
-                    // Push dirty conversations individually via useGeminiAPI's sync (which has locking)
-                    const gemini = useGeminiAPI();
+                    const tombstones = cfg.jssync._deletedConversationIds || [];
                     const lastSynced = cfg.jssync.lastSyncedAt || 0;
-                    // Batch-mark all dirty saved conversations as cloud before syncing
+                    const payload = extractSyncPayload(cfg);
+                    payload._deletedConversationIds = _pruneTombstones(tombstones);
+                    if (_SYNC_KEYS.some(k=>(cfg._syncMeta?.[k]?.updatedAt||0)>lastSynced) || tombstones.some(t=>t.deletedAt>lastSynced)) {
+                        await r2Client.r2Fetch('PUT', 'config', JSON.stringify(payload), { contentType: 'application/json' });
+                    }
+                    const gemini = useGeminiAPI();
                     const localCloudMap = { ...gemini.cloudConversations.value };
                     let cloudMapDirty = false;
                     const dirtyMetas = [];
@@ -584,17 +548,12 @@
                         dirtyMetas.push(meta);
                     }
                     if (cloudMapDirty) gemini.cloudConversations.value = localCloudMap;
-                    for (const meta of dirtyMetas) {
+                    await _batch5(dirtyMetas, async meta => {
                         try { await gemini.syncConversationToR2(meta.id); }
                         catch (e) { console.warn(`Failed to push convo ${meta.id}:`, e); }
-                    }
-                    // Delete tombstoned conversations from R2 (only recent ones)
-                    const lastSync = cfg.jssync.lastSyncedAt || 0;
-                    const tombstonesToDelete = (cfg.jssync._deletedConversationIds || []).filter(t => t.deletedAt > lastSync);
-                    for (let i = 0; i < tombstonesToDelete.length; i += 5) {
-                        await Promise.all(tombstonesToDelete.slice(i, i + 5)
-                            .map(t => r2Client.r2Fetch('DELETE', `conversations/${t.id}`).catch(() => {})));
-                    }
+                    });
+                    const tombstonesToDelete = tombstones.filter(t => t.deletedAt > lastSynced);
+                    await _batch5(tombstonesToDelete, t => r2Client.r2Fetch('DELETE', `conversations/${t.id}`).catch(() => {}));
                     _finalizePush(cfg);
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config synced to cloud.', 'sync', 2500);
@@ -935,7 +894,7 @@ const TagCountBadge={
                     isSavedOpen, savedRoot, closeSaved
                 };
             },
-            template: `<split-pane config-key="splitSizesDanbooru" right-class="overflow-hidden"><template #header><collapsible-panel storage-key="danbooru-search" flush><template #header><span>Danbooru Search</span><div class="flex flex-1 items-center gap-2" @click.stop><div class="join flex-1 min-w-0 shadow-sm"><div class="join-item flex-1 relative flex items-center bg-base-100 input input-sm input-bordered h-auto min-h-[2rem] py-0.5 px-2 focus-within:border-primary focus-within:z-10"><div class="flex-1 w-full"><autocomplete-field tag="input" v-model:model-val="searchQueryInput" @keydown.enter.prevent="search" class="!border-none !shadow-none !bg-transparent !p-0 !h-6 !min-h-0 focus:outline-none w-full text-sm" placeholder="Search tags..."></autocomplete-field></div></div><button @click="search" class="join-item btn btn-primary btn-sm px-3" :disabled="isLoading"><spin-icon :loading="isLoading" icon="search" :size="20"></spin-icon></button></div><div ref="savedRoot" class="dropdown dropdown-end" :class="{'dropdown-open': isSavedOpen}" @mouseenter="isSavedOpen = true" @mouseleave="closeSaved"><div tabindex="0" role="button" class="btn btn-sm glass font-normal gap-2 px-3 text-white" @click.stop @mousedown.stop><material-icon icon="bookmarks" size="18"/><span>Saved</span></div><ul tabindex="0" class="dropdown-content z-[100] menu menu-sm p-2 shadow-2xl bg-base-200 rounded-box w-80 max-h-[500px] custom-scroll border border-white/10 gap-1"><li class="mb-2"><div class="join flex w-full shadow-sm p-0 border border-white/10 !bg-base-100 cursor-default"><input v-model="savedSearchName" class="join-item input input-sm input-ghost flex-1 w-full min-w-0 text-xs focus:bg-transparent" placeholder="Save current search..." @keydown.enter.prevent="savedSearchAction('save')"><icon-btn class="join-item shrink-0" icon="save" color="btn-secondary" @click="savedSearchAction('save')"/></div></li><li v-if="!savedSearches.length" class="empty-notice"><span>No saved searches</span></li><li v-for="item in savedSearches" :key="item.name" class="relative group"><a class="justify-between py-2 gap-2"><inline-edit :model-value="item.name" @update:model-value="renameSavedSearch(item, $event)" display-class="truncate font-medium text-sm" input-class="input input-xs input-bordered bg-base-100/60 w-full text-xs"></inline-edit><span class="text-neutral-500 text-xs ml-1 font-normal shrink-0 cursor-pointer" @click.stop="savedSearchAction('load', item)">{{item.prompt?.length > 25 ? item.prompt.slice(0,22)+'...' : item.prompt}}</span></a><div class="absolute right-1 top-1/2 -translate-y-1/2 flex gap-1 hover-reveal group-hover:opacity-100 bg-inherit px-1 rounded"><icon-btn icon="play_arrow" size="btn-xs" color="text-primary hover:bg-primary/20 min-h-0" @click.stop="savedSearchAction('load', item)" tooltip="Load"/><icon-btn icon="delete" size="btn-xs" color="text-error hover:bg-error/20 min-h-0" @click.stop="savedSearchAction('delete', item)" tooltip="Delete"/></div></li></ul></div><div class="ml-2"><counter :count="danbooru.gridCols" :on-update="val => danbooru.gridCols = Math.max(1, Math.min(6, danbooru.gridCols + val))"><template #icon><material-icon icon="add_column_right" size="16"/></template></counter></div></div></template><div class="flex flex-col gap-2 pt-2"><div class="flex flex-wrap items-center gap-2"><div class="min-w-[150px] flex-1"><autocomplete-field tag="input" label="Blacklist" v-model:model-val="blacklist" is-uc placeholder="e.g. text, blur..." class="!min-h-0 !h-8 !p-0 !px-3 !pt-2 text-sm" @keydown.enter.prevent="search"></autocomplete-field></div><setting-input v-model="sortOrder" label="Sort" type="select" :options="[{val:'id',text:'ID'},{val:'score',text:'Score'}]" class="shrink-0 w-24"></setting-input><div class="join shadow-sm shrink-0 h-8"><button class="join-item btn btn-sm px-2 h-full min-h-0 glass hover:bg-white/10 text-neutral-300" @click="updateRatings()">All</button><button v-for="r in ratingMeta" :key="r.k" class="join-item btn btn-sm px-2 h-full min-h-0" :class="ratingFilters[r.k] ? r.active : r.inactive" @click="ratingFilters[r.k] = !ratingFilters[r.k]" @dblclick.prevent="updateRatings(r.k)">{{r.label}}</button></div></div></div></collapsible-panel></template><template #left><collapsible-panel storage-key="danbooru-tags" class="relative z-10"><template #header><span class="mr-2">Tags</span><tag-pill v-if="featuredArtist" :tag="featuredArtist" :knowledge="naiTagKnowledge[featuredArtist.name]"></tag-pill></template><placeholder v-if="!displayedImage" icon="touch_app" text="Hover over or select an image to view its tags." class="py-6"/><div v-else class="flex flex-wrap gap-1.5"><tag-pill v-for="tag in displayedTags" :key="tag.name" :tag="tag" :knowledge="naiTagKnowledge[tag.name]"></tag-pill></div></collapsible-panel><collapsible-panel storage-key="danbooru-folders"><template #header><span>Folders</span></template><template #actions><div class="join shadow-sm" @click.stop><input placeholder="New folder..." class="join-item input input-sm input-bordered w-32 text-xs focus:z-10" v-model="newFolderName" @keydown.enter.prevent="handleFolderButtonPress"><icon-btn class="join-item border-white/20" :color="folderBtn.color" :icon="folderBtn.icon" @click="handleFolderButtonPress"/></div></template><div class="space-y-1 pt-1"><placeholder v-if="danbooru.folders.length === 0" icon="folder" text="No folders created yet."/><transition-group name="list" tag="div" class="space-y-1"><div v-for="folder in danbooru.folders" :key="folder.id" class="flex-row-gap px-2 py-1 rounded-lg transition-colors group/folder cursor-pointer" :class="activeFolderId == folder.id ? 'bg-primary/20' : 'hover:bg-base-300/40'" @click="goToFolder(folder)"><material-icon :icon="activeFolderId == folder.id ? 'folder_open' : 'folder'" size="20" class="text-primary shrink-0"/><inline-edit :model-value="folder.name" @update:model-value="renameFolder(folder, $event)" display-class="flex-1 truncate font-medium" input-class="input input-xs bg-transparent border-b border-b-primary border-0 rounded-none focus:outline-none focus:ring-0 w-full"></inline-edit><span class="text-xs text-neutral-400 shrink-0 group-hover/folder:hidden">{{folder.postIds.length}}</span><icon-btn icon="delete" size="btn-xs" color="btn-ghost text-error/50 hover:text-error" class="shrink-0 hidden group-hover/folder:inline-flex" @click.stop="deleteFolder(folder)"/></div></transition-group></div></collapsible-panel></template><template #right><div class="h-full overflow-y-auto custom-scroll" ref="rightPanelRef"><router-view v-slot="{Component}"><keep-alive><component :is="Component" /></keep-alive></router-view></div></template></split-pane>`
+            template: `<split-pane config-key="splitSizesDanbooru" right-class="overflow-hidden"><template #header><collapsible-panel storage-key="danbooru-search" flush><template #header><span>Danbooru Search</span><div class="flex flex-1 items-center gap-2" @click.stop><div class="join flex-1 min-w-0 shadow-sm"><div class="join-item flex-1 relative flex items-center bg-base-100 input input-sm input-bordered h-auto min-h-[2rem] py-0.5 px-2 focus-within:border-primary focus-within:z-10"><div class="flex-1 w-full"><autocomplete-field tag="input" v-model:model-val="searchQueryInput" @keydown.enter.prevent="search" class="!border-none !shadow-none !bg-transparent !p-0 !h-6 !min-h-0 focus:outline-none w-full text-sm" placeholder="Search tags..."></autocomplete-field></div></div><button @click="search" class="join-item btn btn-primary btn-sm px-3" :disabled="isLoading"><spin-icon :loading="isLoading" icon="search" :size="20"></spin-icon></button></div><div ref="savedRoot" class="dropdown dropdown-end" :class="{'dropdown-open': isSavedOpen}" @mouseenter="isSavedOpen = true" @mouseleave="closeSaved"><div tabindex="0" role="button" class="btn btn-sm glass font-normal gap-2 px-3 text-white" @click.stop @mousedown.stop><material-icon icon="bookmarks" size="18"/><span>Saved</span></div><ul tabindex="0" class="dropdown-content z-[100] menu menu-sm p-2 shadow-2xl bg-base-200 rounded-box w-80 max-h-[500px] custom-scroll border border-white/10 gap-1"><li class="mb-2"><div class="join flex w-full shadow-sm p-0 border border-white/10 !bg-base-100 cursor-default"><input v-model="savedSearchName" class="join-item input input-sm input-ghost flex-1 w-full min-w-0 text-xs focus:bg-transparent" placeholder="Save current search..." @keydown.enter.prevent="savedSearchAction('save')"><icon-btn class="join-item shrink-0" icon="save" color="btn-secondary" @click="savedSearchAction('save')"/></div></li><li v-if="!savedSearches.length" class="empty-notice"><span>No saved searches</span></li><li v-for="item in savedSearches" :key="item.name" class="relative group"><a class="justify-between py-2 gap-2" @click="savedSearchAction('load', item)"><inline-edit :model-value="item.name" @update:model-value="renameSavedSearch(item, $event)" display-class="truncate font-medium text-sm" input-class="input input-xs input-bordered bg-base-100/60 w-full text-xs"></inline-edit><span class="text-neutral-500 text-xs ml-1 font-normal shrink-0">{{item.prompt?.length > 25 ? item.prompt.slice(0,22)+'...' : item.prompt}}</span></a><div class="absolute right-1 top-1/2 -translate-y-1/2 flex gap-1 hover-reveal group-hover:opacity-100 bg-inherit px-1 rounded"><icon-btn icon="delete" size="btn-xs" color="text-error hover:bg-error/20 min-h-0" @click.stop="savedSearchAction('delete', item)" tooltip="Delete"/></div></li></ul></div><div class="ml-2"><counter :count="danbooru.gridCols" :on-update="val => danbooru.gridCols = Math.max(1, Math.min(6, danbooru.gridCols + val))"><template #icon><material-icon icon="add_column_right" size="16"/></template></counter></div></div></template><div class="flex flex-col gap-2 pt-2"><div class="flex flex-wrap items-center gap-2"><div class="min-w-[150px] flex-1"><autocomplete-field tag="input" label="Blacklist" v-model:model-val="blacklist" is-uc placeholder="e.g. text, blur..." class="!min-h-0 !h-8 !p-0 !px-3 !pt-2 text-sm" @keydown.enter.prevent="search"></autocomplete-field></div><setting-input v-model="sortOrder" label="Sort" type="select" :options="[{val:'id',text:'ID'},{val:'score',text:'Score'}]" class="shrink-0 w-24"></setting-input><div class="join shadow-sm shrink-0 h-8"><button class="join-item btn btn-sm px-2 h-full min-h-0 glass hover:bg-white/10 text-neutral-300" @click="updateRatings()">All</button><button v-for="r in ratingMeta" :key="r.k" class="join-item btn btn-sm px-2 h-full min-h-0" :class="ratingFilters[r.k] ? r.active : r.inactive" @click="ratingFilters[r.k] = !ratingFilters[r.k]" @dblclick.prevent="updateRatings(r.k)">{{r.label}}</button></div></div></div></collapsible-panel></template><template #left><collapsible-panel storage-key="danbooru-tags" class="relative z-10"><template #header><span class="mr-2">Tags</span><tag-pill v-if="featuredArtist" :tag="featuredArtist" :knowledge="naiTagKnowledge[featuredArtist.name]"></tag-pill></template><placeholder v-if="!displayedImage" icon="touch_app" text="Hover over or select an image to view its tags." class="py-6"/><div v-else class="flex flex-wrap gap-1.5"><tag-pill v-for="tag in displayedTags" :key="tag.name" :tag="tag" :knowledge="naiTagKnowledge[tag.name]"></tag-pill></div></collapsible-panel><collapsible-panel storage-key="danbooru-folders"><template #header><span>Folders</span></template><template #actions><div class="join shadow-sm" @click.stop><input placeholder="New folder..." class="join-item input input-sm input-bordered w-32 text-xs focus:z-10" v-model="newFolderName" @keydown.enter.prevent="handleFolderButtonPress"><icon-btn class="join-item border-white/20" :color="folderBtn.color" :icon="folderBtn.icon" @click="handleFolderButtonPress"/></div></template><div class="space-y-1 pt-1"><placeholder v-if="danbooru.folders.length === 0" icon="folder" text="No folders created yet."/><transition-group name="list" tag="div" class="space-y-1"><div v-for="folder in danbooru.folders" :key="folder.id" class="flex-row-gap px-2 py-1 rounded-lg transition-colors group/folder cursor-pointer" :class="activeFolderId == folder.id ? 'bg-primary/20' : 'hover:bg-base-300/40'" @click="goToFolder(folder)"><material-icon :icon="activeFolderId == folder.id ? 'folder_open' : 'folder'" size="20" class="text-primary shrink-0"/><inline-edit :model-value="folder.name" @update:model-value="renameFolder(folder, $event)" display-class="truncate font-medium" input-class="input input-xs bg-transparent border-b border-b-primary border-0 rounded-none focus:outline-none focus:ring-0 flex-1"></inline-edit><span class="text-xs text-neutral-400 ml-auto group-hover/folder:hidden">{{folder.postIds.length}}</span><icon-btn icon="delete" size="btn-xs" color="btn-ghost text-error/50 hover:text-error" class="shrink-0 hidden group-hover/folder:inline-flex" @click.stop="deleteFolder(folder)"/></div></transition-group></div></collapsible-panel></template><template #right><div class="h-full overflow-y-auto custom-scroll" ref="rightPanelRef"><router-view v-slot="{Component}"><keep-alive><component :is="Component" /></keep-alive></router-view></div></template></split-pane>`
         };
         const DanbooruGrid = {
             template: `<div v-if="isSingleView" class="flex flex-col items-center gap-4 p-4 pb-24 group min-h-full" @mouseleave="closeMenu"><div class="relative flex-center w-full my-auto"><hover-card rounded="rounded-lg" class="w-full max-w-2xl shadow-2xl" :overflow="false"><lazy-image v-if="currentImg" :key="currentImg.id" :src="danbooruImgSrc(currentImg.file_url)" :alt="currentImg.tag_string_general" :aspect-ratio="currentImg.image_width/currentImg.image_height"></lazy-image><template v-if="folders.length && currentImg" #overlay-tr><folder-dropdown :post="currentImg" menu-class="dropdown-end"></folder-dropdown></template></hover-card></div><div class="sticky bottom-6 mt-auto z-[500]"><div class="join shadow-2xl border border-white/10 backdrop-blur-md bg-black/40"><icon-btn icon="arrow_back" size="btn-md" color="glass text-neutral-100 hover:bg-white/20 border-white/10 join-item" @click="nav(-1)"/><button @click="showGrid" class="join-item btn btn-md btn-primary px-8 border-white/10"><material-icon icon="grid_view" class="mr-2"/>Back to Grid</button><icon-btn icon="arrow_forward" size="btn-md" color="glass text-neutral-100 hover:bg-white/20 border-white/10 join-item" @click="nav(1)"/></div></div></div><div v-else><div v-if="!isLoading && !posts.length" class="flex-center h-[50vh]"><placeholder icon="image" :text="statusMsg"/></div><div v-show="posts.length" class="masonry-grid w-full p-1" :style="{'grid-template-columns': 'repeat(' + gridSize + ', 1fr)'}"><div v-for="post in posts" :key="post.id" class="grid-item" :class="{'col-span-2': (post.image_width / post.image_height) > 1.2}" @mouseenter="hoveredImage = post" @mouseleave="hoveredImage = null; closeMenu($event)"><hover-card @click="showSingle(post)" :overflow="false"><lazy-image :src="danbooruImgSrc(post.large_file_url)" :alt="post.tag_string_general" :aspect-ratio="post.image_width / post.image_height"></lazy-image><template v-if="folders.length" #overlay-tr><folder-dropdown :post="post" menu-class="dropdown-end"></folder-dropdown></template></hover-card></div></div><div v-if="isLoadingMore" class="text-center py-8"><span class="loading loading-spinner loading-lg"></span><p class="text-neutral-400 mt-2">Loading more...</p></div><div v-else-if="posts.length && !hasMorePages" class="text-center py-8"><p class="text-neutral-400">No more images</p></div></div>`,
@@ -1416,36 +1375,26 @@ const TagCountBadge={
                 const idArr = [...imageIds];
                 const results = await Promise.allSettled(idArr.map(id => localFs.promises.stat('/' + id)));
                 const missing = idArr.filter((_, i) => results[i].status === 'rejected');
-                if (!missing.length) return [...imageIds];
+                if (!missing.length) return idArr;
                 try {
                     const pulled = [];
-                    const CONCURRENCY = 5;
-                    for (let i = 0; i < missing.length; i += CONCURRENCY) {
-                        const batch = missing.slice(i, i + CONCURRENCY);
-                        const batchResults = await Promise.all(batch.map(async (imgId) => {
-                            try {
-                                const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/images/${imgId}`);
-                                if (res && res.status !== 404) {
-                                    const data = new Uint8Array(await res.arrayBuffer());
-                                    await localFs.promises.writeFile('/' + imgId, data);
-                                    return imgId;
-                                }
-                            } catch {}
-                            return null;
-                        }));
-                        pulled.push(...batchResults.filter(Boolean));
-                    }
-                    // Update synced image tracking
+                    await _batch5(missing, async (imgId) => {
+                        try {
+                            const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/images/${imgId}`);
+                            if (res?.status !== 404) {
+                                const data = new Uint8Array(await res.arrayBuffer());
+                                await localFs.promises.writeFile('/' + imgId, data);
+                                pulled.push(imgId);
+                            }
+                        } catch {}
+                    });
                     if (pulled.length) {
-                        const existing = _syncedR2Images.value[convoId] || [];
-                        const merged = new Set([...existing, ...pulled]);
-                        _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...merged] };
+                        _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...new Set([...(_syncedR2Images.value[convoId]||[]),...pulled])] };
                     }
-                    return [...imageIds];
                 } catch (e) {
                     console.warn('Failed to pull images from R2:', e);
-                    return [...imageIds];
                 }
+                return idArr;
             };
             const loadConversation = async (id) => {
                 if (conversationMap.has(id)) { activeConvoId.value = id; return; }
@@ -1464,24 +1413,21 @@ const TagCountBadge={
                             convoData = JSON.parse(json);
                         } catch {}
                     }
-                    // Fall back to fetching from R2 cloud storage
                     if (!convoData && cloudConversations.value[id]) {
                         convoData = await _fetchConvoFromR2(id);
                         if (convoData) {
                             if (lfs) {
                                 try { await _writeConvoToLfs(lfs, id, convoData.messages, convoData.params); } catch {}
                             }
-                            // Update metadata from R2 data (fixes titles for pre-metadata conversations)
-                            const s = savedConversations.value.find(x => x.id === id);
                             if (convoData.title) {
                                 convo.title = convoData.title;
-                                if (s) s.title = convoData.title;
+                                if (meta) meta.title = convoData.title;
                             }
                             if (convoData.timestamp != null) {
-                                const timestamp = Number(convoData.timestamp);
-                                if (Number.isFinite(timestamp)) {
-                                    convo.timestamp = timestamp;
-                                    if (s) s.timestamp = timestamp;
+                                const ts = +convoData.timestamp;
+                                if (Number.isFinite(ts)) {
+                                    convo.timestamp = ts;
+                                    if (meta) meta.timestamp = ts;
                                 }
                             }
                         }
@@ -1489,10 +1435,9 @@ const TagCountBadge={
                     if (!convoData) {
                         toast.warn('Conversation data not found on this device.');
                         conversationMap.delete(id);
-                        if (activeConvoId.value === id) { const r = [...conversationMap.keys()]; activeConvoId.value = r.length ? r[r.length-1] : newChat(); }
+                        if (activeConvoId.value === id) { activeConvoId.value = [...conversationMap.keys()].at(-1) ?? newChat(); }
                         return;
                     }
-                    // Pull missing images from R2 before deserialization
                     if (cloudConversations.value[id] && lfs) {
                         await _pullMissingImagesFromR2(convoData, id, lfs);
                     }
@@ -1509,7 +1454,6 @@ const TagCountBadge={
                     const lfs = imageStore.getLfs();
                     if (lfs) { lfs.promises.unlink(_convoPath(id)).catch(() => {}); }
                 }
-                // Add tombstone so pull won't resurrect this conversation
                 if (cloudConversations.value[id]) {
                     const cfg = store.config.value;
                     const tombstones = cfg.jssync._deletedConversationIds || [];
@@ -1520,8 +1464,7 @@ const TagCountBadge={
                 }
                 if (conversationMap.has(id)) closeConversation(id);
                 deleteCloudConversation(id).catch(() => {});
-                // Push tombstone to R2 so other devices see the deletion
-                if (_isSyncReady()) useSyncStore().push(true).catch(() => {});
+                _isSyncReady() && useSyncStore().push(true).catch(() => {});
                 toast.q('Removed from saved chats');
                 imageStore.cleanupOrphanedImages(savedConversations.value).catch(() => {});
             };
@@ -1571,7 +1514,6 @@ const TagCountBadge={
                 if (msgs) _autoSave();
             }, { deep: true });
             const r2Client = useR2Client();
-            // Push conversation JSON + images to R2 via the worker
             const _pushConvoR2Locks = new Map();
             const _pushConvoToR2 = (convoId, convoJson, imageIds, localFs, meta) => {
                 const prev = _pushConvoR2Locks.get(convoId) || Promise.resolve();
@@ -1583,35 +1525,26 @@ const TagCountBadge={
                 return next;
             };
             const _doPushConvoToR2 = async (convoId, convoJson, imageIds, localFs, meta) => {
-                // Push conversation JSON with title/timestamp as R2 custom metadata
-                const customHeaders = {
-                    ...(meta?.title && { 'X-Convo-Title': encodeURIComponent(meta.title) }),
-                    ...(meta?.timestamp && { 'X-Convo-Timestamp': String(meta.timestamp) })
-                };
+                const customHeaders = {};
+                if (meta?.title) customHeaders['X-Convo-Title'] = encodeURIComponent(meta.title);
+                if (meta?.timestamp) customHeaders['X-Convo-Timestamp'] = String(meta.timestamp);
                 await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json', customHeaders });
-                // Push new images
                 const syncedArr = _syncedR2Images.value[convoId] || [];
                 const syncedSet = new Set(syncedArr);
                 const newImages = [...imageIds].filter(id => !syncedSet.has(id));
-                for (let i = 0; i < newImages.length; i += 5) {
-                    await Promise.all(newImages.slice(i, i + 5).map(async (imgId) => {
-                        try {
-                            const imgData = await localFs.promises.readFile('/' + imgId);
-                            await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
-                        } catch {}
-                    }));
-                }
-                // Delete orphaned remote images only if image set potentially changed
+                await _batch5(newImages, async (imgId) => {
+                    try {
+                        const imgData = await localFs.promises.readFile('/' + imgId);
+                        await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
+                    } catch {}
+                });
                 const syncedMatch = syncedArr.length === imageIds.size && syncedArr.every(id => imageIds.has(id));
                 if (!syncedMatch) {
                     try {
                         const listRes = await r2Client.r2Fetch('GET', `conversations/${convoId}/images`);
                         if (listRes.ok) {
                             const orphaned = (await listRes.json()).filter(name => !imageIds.has(name));
-                            for (let i = 0; i < orphaned.length; i += 5) {
-                                await Promise.all(orphaned.slice(i, i + 5)
-                                    .map(name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {})));
-                            }
+                            await _batch5(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}));
                         }
                     } catch {}
                 }
@@ -1625,10 +1558,10 @@ const TagCountBadge={
                 try { convoData = JSON.parse(await localFs.promises.readFile(_convoPath(id), { encoding: 'utf8' })); }
                 catch { throw new Error('Conversation data not found locally.'); }
                 const imageIds = _collectImageIds(convoData);
-                // Enrich with metadata for cross-browser pull
                 const meta = savedConversations.value.find(x => x.id === id);
-                if (meta) { convoData.title = meta.title; convoData.timestamp = meta.timestamp; }
-                await _pushConvoToR2(id, JSON.stringify(convoData), imageIds, localFs, meta && { title: meta.title, timestamp: meta.timestamp });
+                const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
+                if (metaPick) Object.assign(convoData, metaPick);
+                await _pushConvoToR2(id, JSON.stringify(convoData), imageIds, localFs, metaPick);
             };
             let _r2SyncInProgress = false;
             let _r2SyncPromise = null;
@@ -1673,7 +1606,6 @@ const TagCountBadge={
                         convoSyncStatus[id] = 'synced';
                         toast.q('Synced to cloud');
                     } catch (e) {
-                        // Roll back cloud marker on failure
                         const g = { ...cloudConversations.value };
                         delete g[id];
                         cloudConversations.value = g;
@@ -1764,7 +1696,7 @@ const TagCountBadge={
             },
             template: `<div v-if="msg.role === 'user'" class="flex flex-row-reverse items-start gap-3 group/umsg"><div class="shrink-0 mt-1.5"><div class="w-8 h-8 rounded-full bg-primary/15 border border-primary/20 flex-center"><material-icon icon="person" :size="16" class="text-primary/70"/></div></div><div class="flex flex-col items-end flex-1 min-w-0"><div v-if="isEditing" class="bubble-user w-full max-w-[90%] p-3 space-y-2.5"><textarea v-model="editState.text" class="textarea textarea-bordered w-full text-sm min-h-[64px] bg-base-100/40 resize-none leading-relaxed" rows="3" @keydown.ctrl.enter.prevent="saveEdit"></textarea><div class="flex flex-wrap gap-1.5"><image-preview-card v-for="(img, i) in editState.images" :key="img.id" :src="imgSrc(img)" @close="editState.images.splice(i, 1)"></image-preview-card><button @click="emit('request-edit-upload')" class="h-14 w-14 shrink-0 rounded-lg border-2 border-dashed border-white/20 flex-center text-neutral-500 hover:text-neutral-300 hover:border-white/40 transition-colors"><material-icon icon="add_photo_alternate" :size="20"/></button></div><div class="flex gap-2 justify-end"><button @click="saveEdit" class="btn btn-primary btn-xs shadow-sm">Save</button><button @click="emit('update:editState', null)" class="btn btn-ghost btn-xs">Cancel</button></div></div><div v-else class="bubble-user max-w-[82%] p-3" :class="msg.hidden ? 'opacity-40 !border-dashed' : ''"><div v-if="msg.hidden" class="mb-1.5 pb-1.5 border-b border-white/10"><hidden-badge></hidden-badge></div><div v-if="msg.images?.length" class="flex flex-wrap gap-1.5 mb-2 p-0.5"><div v-for="img in msg.images" :key="img.id" class="shrink-0" :class="img.hidden ? 'opacity-40' : ''"><hover-card class="cursor-pointer shadow-lg"><img :src="imgSrc(img)" class="max-h-28 max-w-[8rem] object-cover block" @click="emit('open-lightbox', imgSrc(img))"><div v-if="img.hidden" class="absolute inset-0 flex-center bg-black/40 pointer-events-none" style="z-index:2"><material-icon icon="visibility_off" :size="14" class="text-white/70"/></div><template #overlay-tr><icon-btn :icon="img.hidden ? 'visibility' : 'visibility_off'" @click.stop="toggleHideImage(img.id)" :title="img.hidden ? 'Show to model' : 'Hide from model'" overlay/><icon-btn icon="delete" @click.stop="deleteImage(img.id)" title="Remove image" overlay/></template></hover-card></div></div><p v-if="msg.text" class="text-sm whitespace-pre-wrap leading-relaxed">{{msg.text}}</p></div><div v-if="!isEditing" class="flex gap-0.5 mt-1 opacity-0 group-hover/umsg:opacity-100 focus-within:opacity-100 transition-opacity"><icon-btn icon="edit" @click="startEdit" title="Edit" circle/><icon-btn icon="refresh" @click="regenerateUserMessage(msg.id)" :disabled="generating" title="Regenerate" circle/><icon-btn :icon="msg.hidden ? 'visibility' : 'visibility_off'" @click="toggleHiddenFromModel(msg.id)" :title="msg.hidden ? 'Show' : 'Hide'" circle/><icon-btn icon="delete" @click="deleteMessage(msg.id)" title="Delete" color="btn-ghost text-error/70 hover:text-error" circle/></div></div></div><div v-else class="flex flex-row items-start gap-3 group/mmsg"><div class="shrink-0 mt-1.5"><div class="w-8 h-8 rounded-full flex-center" style="background:linear-gradient(135deg,#4285f4,#8b5cf6,#c084fc)"><material-icon icon="auto_awesome" :size="16" class="text-white"/></div></div><div class="flex flex-col items-start flex-1 min-w-0"><div class="bubble-model max-w-[88%] space-y-2 p-3" :class="msg.hidden ? 'opacity-40 !border-dashed' : ''"><div v-if="msg.hidden" class="pb-1.5 border-b border-white/10"><hidden-badge></hidden-badge></div><collapsible-panel v-if="variant?._thinking" :storage-key="'banana-thinking-' + msg.id" box-class="rounded-xl border border-secondary/25 bg-secondary/8 overflow-hidden"><template #header><span class="flex items-center gap-1.5 text-xs font-semibold text-secondary"><material-icon icon="psychology" :size="14"/>Thinking</span></template><div class="font-mono text-xs text-neutral-500 leading-relaxed -mt-1" v-html="variant._thinking"></div></collapsible-panel><div v-if="isAwaitingContent" class="py-1 px-1"><span class="loading loading-dots loading-sm text-white/60"></span></div><div v-if="variant?._text" class="text-sm leading-relaxed prose prose-sm max-w-none prose-invert prose-p:my-1 prose-pre:bg-base-300/80 prose-code:text-accent/90" v-html="variant._text"></div><div v-if="variant?._images?.length" class="flex flex-wrap gap-2 p-0.5"><div v-for="(img, i) in variant._images" :key="i"><hover-card class="cursor-pointer shadow-lg"><img :src="imgSrc(img)" class="max-h-72 block w-full" @click="emit('open-lightbox', imgSrc(img))"><template #overlay-tr><icon-btn icon="download" @click.stop="downloadImage(imgSrc(img))" title="Download" overlay/></template></hover-card></div></div><div v-if="variant?._error" role="alert" class="alert alert-error p-2 gap-2 text-sm"><material-icon :icon="variant?._isPromptBlock ? 'block' : 'output'" :size="16"/><div><p v-if="variant?._blockReason" class="font-bold text-xs uppercase tracking-wide opacity-80 mb-0.5">{{variant?._isPromptBlock ? 'Prompt blocked' : 'Output blocked'}} · {{variant._blockReason}}</p><p>{{variant?._error}}</p></div></div><div v-if="variant?._usage && !isActiveVarGenerating" class="flex items-center gap-1.5 text-xs text-neutral-600 pt-1 border-t border-white/5 mt-1"><material-icon icon="data_usage" :size="12"/><span>{{fmtNum(variant._usage.promptTokenCount)}} in / {{fmtNum(variant._usage.candidatesTokenCount)}} out</span><span class="text-neutral-700">·</span><span class="font-mono tabular-nums" :title="(modelPricing[variant._model || _FM]?.tooltipPricing || '') + (variant._flexInference ? ' · Flex -50%' : '')">{{fmtCost(calcVariantCost(variant._usage, variant?._images?.length, variant._imageSize || '1K', variant._model, variant._flexInference))}}</span><template v-if="variant._genTimeMs"><span class="text-neutral-700">·</span><span class="flex items-center gap-0.5" :title="'Generation time: ' + (variant._genTimeMs / 1000).toFixed(1) + 's'"><material-icon icon="timer" :size="11"/>{{(variant._genTimeMs / 1000).toFixed(1)}}s</span></template></div></div><div class="flex items-center gap-0.5 mt-1 flex-wrap opacity-0 group-hover/mmsg:opacity-100 focus-within:opacity-100 transition-opacity"><template v-if="msg.variants?.length > 1"><icon-btn icon="chevron_left" @click="navigateVariant(-1)" :disabled="msg.activeVariant <= 0" circle class="disabled:opacity-30"/><span class="text-xs text-neutral-600 font-mono select-none tabular-nums">{{msg.activeVariant + 1}}/{{msg.variants.length}}</span><icon-btn icon="chevron_right" @click="navigateVariant(1)" :disabled="msg.activeVariant >= msg.variants.length - 1" circle class="disabled:opacity-30"/></template><icon-btn v-if="!isGen" icon="refresh" @click="regenerateMessage(msg.id)" title="Regenerate" circle/><icon-btn :icon="msg.hidden ? 'visibility' : 'visibility_off'" @click="toggleHiddenFromModel(msg.id)" :title="msg.hidden ? 'Show' : 'Hide'" circle/><icon-btn v-if="!isActiveVarGenerating" icon="delete" @click="deleteMessage(msg.id)" :title="msg.variants?.length > 1 ? 'Delete this variant' : 'Delete'" color="btn-ghost text-error/50 hover:text-error" circle/><icon-btn v-if="msg.variants?.length > 1 && !isGen" icon="delete_sweep" @click="deleteAllVariants(msg.id)" title="Delete all variants" color="btn-ghost text-error/70 hover:text-error" circle/></div></div></div>`
         };
-        const ConvoListItem={props:['convo','isActive','isOpen','renamingId','renamingTitle'],emits:['update:renamingTitle','click','commit','cancel','rename'],template:`<div @click="$emit('click')" class="group relative p-2 rounded-lg cursor-pointer transition-colors duration-150 border" :class="isActive?'glass-nested border-primary/20':'hover:bg-white/5 border-transparent'"><div v-if="renamingId===convo.id" class="flex items-center gap-1" @click.stop><input :id="'rename-input-'+convo.id" :value="renamingTitle" @input="$emit('update:renamingTitle',$event.target.value)" class="convo-rename input input-xs input-bordered" @keydown.enter.prevent="$emit('commit')" @keydown.escape.prevent="$emit('cancel')" @blur="$emit('commit')" @click.stop></div><div v-else class="flex items-center gap-1.5 pr-8"><slot name="icon"></slot><span @click.stop="$emit('rename')" class="font-medium text-sm truncate cursor-text hover:underline decoration-neutral-500 underline-offset-2" :class="isActive?'text-neutral-100':isOpen?'text-neutral-300':'text-neutral-400'" title="Click to rename">{{convo.title}}</span></div><div v-if="renamingId!==convo.id&&$slots.preview" class="flex items-center gap-1 text-xs text-neutral-500 mt-0.5 pl-5"><slot name="preview"></slot></div><div v-if="renamingId!==convo.id" class="absolute right-1 top-1.5 flex gap-0.5" :class="isActive?'opacity-100':'hover-reveal group-hover:opacity-100'"><slot name="actions"></slot></div></div>`};
+        const ConvoListItem={props:['convo','isActive','isOpen'],emits:['click','rename'],template:`<div @click="$emit('click')" class="group relative p-2 rounded-lg cursor-pointer transition-colors duration-150 border" :class="isActive?'glass-nested border-primary/20':'hover:bg-white/5 border-transparent'"><div class="flex items-center gap-1.5 pr-8"><slot name="icon"></slot><inline-edit :model-value="convo.title" @update:model-value="$emit('rename',$event)" :display-class="'font-medium text-sm truncate '+(isActive?'text-neutral-100':isOpen?'text-neutral-300':'text-neutral-400')" input-class="convo-rename input input-xs input-bordered" placeholder="Untitled Chat"></inline-edit></div><div v-if="$slots.preview" class="flex items-center gap-1 text-xs text-neutral-500 mt-0.5 pl-5"><slot name="preview"></slot></div><div class="absolute right-1 top-1.5 flex gap-0.5" :class="isActive?'opacity-100':'hover-reveal group-hover:opacity-100'"><slot name="actions"></slot></div></div>`};
         const NanoBanana = {
             setup() {
                 const store = useAppStore();
@@ -1787,7 +1719,6 @@ const TagCountBadge={
                 const geminiApiConfig = store.config.value.gemini;
                 const convoParams = computed(() => activeConvo.value?.params || _DCP());
                 const hasApiKey = computed(() => !!geminiApiConfig.apiKey);
-                // Pro model doesn't support 0.5K; clamp if needed when switching models
                 watch(() => convoParams.value.bananaModel, (model) => {
                     if (model === _PM && convoParams.value.imageSize === '0.5K') {
                         if (activeConvo.value?.params) activeConvo.value.params.imageSize = '1K';
@@ -1843,20 +1774,12 @@ const TagCountBadge={
                     await sendMessage(text, imgs, scrollToBottom);
                 };
                 onKeyStroke('Escape', () => { if (lightboxSrc.value) lightboxSrc.value = null; });
-                const renamingId = ref(null);
-                const renamingTitle = ref('');
                 const openConversations = computed(() => _.orderBy([...conversationMap.values()], 'timestamp', 'desc'));
                 const closedSavedConversations = computed(() => {
                     const openIds = new Set(conversationMap.keys());
                     return _.orderBy((savedConversations.value || []).filter(c => !openIds.has(c.id)), 'timestamp', 'desc');
                 });
-                const startRename = (convo) => {
-                    renamingId.value = convo.id;
-                    renamingTitle.value = convo.title || '';
-                    nextTick(() => document.getElementById('rename-input-' + convo.id)?.focus());
-                };
-                const commitRename = (id) => { const t = renamingTitle.value.trim(); if (t) { conversationMap.get(id)?.isTemp ? saveConversation(id, t) : renameConversation(id, t); } renamingId.value = null; };
-                const cancelRename = () => { renamingId.value = null; };
+                const handleRename = (convo, t) => { if (!t?.trim()) return; conversationMap.get(convo.id)?.isTemp ? saveConversation(convo.id, t) : renameConversation(convo.id, t); };
                 const allHiddenFromModel = computed(() => messages.value.length > 0 && messages.value.every(m => m.hidden));
                 const hasNoImageMessages = computed(() => {
                     const genMsgId = activeConvo.value?.generatingMsgId;
@@ -1887,13 +1810,13 @@ const TagCountBadge={
                     syncToken: store.syncToken,
                     openConversations, closedSavedConversations,
                     switchConversation, closeConversation, saveConversation, loadConversation, deleteConversation,
-                    renamingId, renamingTitle, startRename, commitRename, cancelRename,
+                    handleRename,
                     allHiddenFromModel, toggleHideAllFromModel,
                     hasNoImageMessages, pruneNoImageMessages,
                     fmtAgo, getConvoPreview: _getConvoPreview
                 };
             },
-            template: `<split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #header><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0 w-28"><setting-input v-model="convoParams.aspectRatio" label="Aspect Ratio" type="select" :options="aspectRatios"></setting-input></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></template><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><convo-list-item v-for="convo in openConversations" :key="convo.id" :convo="convo" :is-active="activeConvoId===convo.id" is-open :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&switchConversation(convo.id)" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><span v-if="convo.generating" class="loading loading-spinner loading-xs text-primary shrink-0"></span><material-icon v-else-if="convo.isTemp" icon="schedule" :size="14" class="text-neutral-500 shrink-0"/><span v-else-if="convo._lastGenStatus==='success'" class="w-2 h-2 rounded-full bg-success/60 shrink-0 inline-block"></span><span v-else-if="convo._lastGenStatus==='error'" class="w-2 h-2 rounded-full bg-error/60 shrink-0 inline-block"></span><material-icon v-else icon="bookmark" :size="14" class="text-primary/70 shrink-0"/><span v-if="!convo.isTemp&&conversationGists[convo.id]" class="shrink-0 flex-center w-4 h-4" :title="convoSyncStatus[convo.id]==='error'?'Sync error':convoSyncStatus[convo.id]==='syncing'?'Syncing...':convoSyncStatus[convo.id]==='pending'?'Sync pending':convoSyncStatus[convo.id]==='synced'?'Synced to cloud':'Linked to cloud'"><span v-if="convoSyncStatus[convo.id]==='syncing'" class="loading loading-spinner" style="width:10px;height:10px;color:oklch(var(--in))"></span><material-icon v-else-if="convoSyncStatus[convo.id]==='error'" icon="cloud_off" :size="11" class="text-error/70"/><material-icon v-else-if="convoSyncStatus[convo.id]==='pending'" icon="cloud_upload" :size="11" class="text-info/50"/><material-icon v-else-if="convoSyncStatus[convo.id]==='synced'" icon="cloud_done" :size="11" class="text-success/50"/><material-icon v-else icon="cloud" :size="11" class="text-neutral-500/50"/></span></template><template v-if="convo.messages.length" #preview><span class="truncate flex-1">{{getConvoPreview(convo.messages)}}</span><span class="shrink-0 text-neutral-600 tabular-nums">· {{convo.messages.length}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn v-if="convo.isTemp&&convo.messages.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/><icon-btn icon="close" @click.stop="closeConversation(convo.id)" title="Close" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item><template v-if="closedSavedConversations.length"><div class="divider text-xs text-neutral-600 my-2 select-none">Saved ({{ closedSavedConversations.length }})</div><convo-list-item v-for="convo in closedSavedConversations" :key="convo.id" :convo="convo" :renaming-id="renamingId" v-model:renaming-title="renamingTitle" @click="renamingId!==convo.id&&loadConversation(convo.id)" @commit="commitRename(convo.id)" @cancel="cancelRename" @rename="startRename(convo)"><template #icon><material-icon icon="bookmark" :size="14" class="text-neutral-500 shrink-0"/><span v-if="conversationGists[convo.id]" class="shrink-0 flex-center w-4 h-4" title="Linked to cloud"><material-icon icon="cloud" :size="11" class="text-neutral-500/50"/></span></template><template #preview><span class="shrink-0 text-neutral-600 tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn icon="delete" @click.stop="deleteConversation(convo.id)" title="Delete" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item></template><div v-if="!openConversations.length && !closedSavedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()"></chat-message></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><image-preview-card v-for="(img, idx) in pendingImages" :key="idx" :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport>`
+            template: `<split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #header><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0 w-28"><setting-input v-model="convoParams.aspectRatio" label="Aspect Ratio" type="select" :options="aspectRatios"></setting-input></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></template><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><convo-list-item v-for="convo in openConversations" :key="convo.id" :convo="convo" :is-active="activeConvoId===convo.id" is-open @click="switchConversation(convo.id)" @rename="handleRename(convo,$event)"><template #icon><span v-if="convo.generating" class="loading loading-spinner loading-xs text-primary shrink-0"></span><material-icon v-else-if="convo.isTemp" icon="schedule" :size="14" class="text-neutral-500 shrink-0"/><span v-else-if="convo._lastGenStatus==='success'" class="w-2 h-2 rounded-full bg-success/60 shrink-0 inline-block"></span><span v-else-if="convo._lastGenStatus==='error'" class="w-2 h-2 rounded-full bg-error/60 shrink-0 inline-block"></span><material-icon v-else icon="bookmark" :size="14" class="text-primary/70 shrink-0"/><span v-if="!convo.isTemp&&conversationGists[convo.id]" class="shrink-0 flex-center w-4 h-4" :title="convoSyncStatus[convo.id]==='error'?'Sync error':convoSyncStatus[convo.id]==='syncing'?'Syncing...':convoSyncStatus[convo.id]==='pending'?'Sync pending':convoSyncStatus[convo.id]==='synced'?'Synced to cloud':'Linked to cloud'"><span v-if="convoSyncStatus[convo.id]==='syncing'" class="loading loading-spinner" style="width:10px;height:10px;color:oklch(var(--in))"></span><material-icon v-else-if="convoSyncStatus[convo.id]==='error'" icon="cloud_off" :size="11" class="text-error/70"/><material-icon v-else-if="convoSyncStatus[convo.id]==='pending'" icon="cloud_upload" :size="11" class="text-info/50"/><material-icon v-else-if="convoSyncStatus[convo.id]==='synced'" icon="cloud_done" :size="11" class="text-success/50"/><material-icon v-else icon="cloud" :size="11" class="text-neutral-500/50"/></span></template><template v-if="convo.messages.length" #preview><span class="truncate flex-1">{{getConvoPreview(convo.messages)}}</span><span class="shrink-0 text-neutral-600 tabular-nums">· {{convo.messages.length}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn v-if="convo.isTemp&&convo.messages.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/><icon-btn icon="close" @click.stop="closeConversation(convo.id)" title="Close" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item><template v-if="closedSavedConversations.length"><div class="divider text-xs text-neutral-600 my-2 select-none">Saved ({{ closedSavedConversations.length }})</div><convo-list-item v-for="convo in closedSavedConversations" :key="convo.id" :convo="convo" @click="loadConversation(convo.id)" @rename="handleRename(convo,$event)"><template #icon><material-icon icon="bookmark" :size="14" class="text-neutral-500 shrink-0"/><span v-if="conversationGists[convo.id]" class="shrink-0 flex-center w-4 h-4" title="Linked to cloud"><material-icon icon="cloud" :size="11" class="text-neutral-500/50"/></span></template><template #preview><span class="shrink-0 text-neutral-600 tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn icon="delete" @click.stop="deleteConversation(convo.id)" title="Delete" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item></template><div v-if="!openConversations.length && !closedSavedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()"></chat-message></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><image-preview-card v-for="(img, idx) in pendingImages" :key="idx" :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport>`
         };
         /* ConflictResolutionModal removed — sync now uses last-write-wins */
         const Settings = {
