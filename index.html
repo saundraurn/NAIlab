@@ -1429,8 +1429,20 @@ const TagCountBadge={
                     // Fall back to fetching from R2 cloud storage
                     if (!convoData && cloudConversations.value[id]) {
                         convoData = await _fetchConvoFromR2(id);
-                        if (convoData && lfs) {
-                            try { await _writeConvoToLfs(lfs, id, convoData.messages, convoData.params); } catch {}
+                        if (convoData) {
+                            if (lfs) {
+                                try { await _writeConvoToLfs(lfs, id, convoData.messages, convoData.params); } catch {}
+                            }
+                            // Update metadata from R2 data (fixes titles for pre-metadata conversations)
+                            if (convoData.title) {
+                                convo.title = convoData.title;
+                                const s = _.find(savedConversations.value, {id});
+                                if (s) s.title = convoData.title;
+                            }
+                            if (convoData.timestamp) {
+                                const s = _.find(savedConversations.value, {id});
+                                if (s) s.timestamp = convoData.timestamp;
+                            }
                         }
                     }
                     if (!convoData) {
