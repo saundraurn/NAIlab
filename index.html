@@ -400,7 +400,7 @@
                     // Pull config (settings only, no conversations)
                     const res = await r2Client.r2Fetch('GET', 'config');
                     const remote = await res.json();
-                    if (remote && !_.isEmpty(remote)) {
+                    if (remote && Object.keys(remote).length) {
                         const localMeta = cfg._syncMeta || {};
                         const remoteMeta = remote._syncMeta || {};
                         const lwwMerged = {};
@@ -411,20 +411,21 @@
                             const winner = _lwwPickWinner(localMeta[key], remoteMeta[key]);
                             if (winner === 'remote') lwwMerged[key] = remote[key];
                         });
-                        if (!_.isEmpty(lwwMerged)) {
+                        if (Object.keys(lwwMerged).length) {
                             await withSyncMerge(() => {
                                 _applySectionDict(cfg, lwwMerged);
                                 _.forOwn(lwwMerged, (_v, k) => {
                                     if (remoteMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remoteMeta[k]);
                                 });
                             });
-                            toast.ok(`Pulled ${_.size(lwwMerged)} updated section(s).`, 'sync', 3000);
+                            toast.ok(`Pulled ${Object.keys(lwwMerged).length} updated section(s).`, 'sync', 3000);
                         }
                         // Merge tombstones from remote
                         if (remote._deletedConversationIds) {
                             const localTombstones = cfg.jssync._deletedConversationIds || [];
                             const merged = new Map();
-                            for (const t of [...localTombstones, ...remote._deletedConversationIds]) {
+                            for (const t of localTombstones) merged.set(t.id, t);
+                            for (const t of remote._deletedConversationIds) {
                                 const existing = merged.get(t.id);
                                 if (!existing || t.deletedAt > existing.deletedAt) merged.set(t.id, t);
                             }
@@ -588,10 +589,9 @@
                     }
                     // Delete tombstoned conversations from R2 (only recent ones)
                     const lastSync = cfg.jssync.lastSyncedAt || 0;
-                    for (const t of (cfg.jssync._deletedConversationIds || [])) {
-                        if (t.deletedAt <= lastSync) continue;
-                        try { await r2Client.r2Fetch('DELETE', `conversations/${t.id}`); } catch {}
-                    }
+                    await Promise.all((cfg.jssync._deletedConversationIds || [])
+                        .filter(t => t.deletedAt > lastSync)
+                        .map(t => r2Client.r2Fetch('DELETE', `conversations/${t.id}`).catch(() => {})));
                     _finalizePush(cfg);
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config synced to cloud.', 'sync', 2500);
@@ -1273,7 +1273,7 @@ const TagCountBadge={
                     const serialized = await serializeConversation(convo.messages);
                     await _writeConvoToLfs(lfs, convo.id, serialized.messages, convo.params);
                     const list = getList();
-                    const meta = _.find(list, {id: convo.id});
+                    const meta = list.find(x => x.id === convo.id);
                     if (meta) { meta.timestamp = Date.now(); }
                 } catch (e) { console.warn('Auto-save failed:', e); }
             };
@@ -1392,7 +1392,7 @@ const TagCountBadge={
                     catch (e) { toast.err('Failed to save conversation: ' + e.message); return; }
                 }
                 const list = getList();
-                const idx = _.findIndex(list, {id: convo.id});
+                const idx = list.findIndex(x => x.id === convo.id);
                 if (idx !== -1) list[idx] = meta; else list.unshift(meta);
                 toast.q('Chat saved');
                 if (_isSyncReady()) {
@@ -1403,33 +1403,34 @@ const TagCountBadge={
             const _fetchConvoFromR2 = async (convoId) => {
                 try {
                     const res = await r2Client.r2Fetch('GET', `conversations/${convoId}`);
-                    if (!res || res.status === 404) return null;
-                    const text = await res.text();
-                    if (!text) return null;
-                    try { return JSON.parse(text); } catch { return null; }
-                } catch {
-                    return null;
-                }
+                    if (!res.ok) return null;
+                    return JSON.parse(await res.text());
+                } catch { return null; }
             };
             const _pullMissingImagesFromR2 = async (convoData, convoId, localFs) => {
                 const imageIds = _collectImageIds(convoData);
                 if (!imageIds.size) return [];
-                const missing = [];
-                for (const imgId of imageIds) {
-                    try { await localFs.promises.stat('/' + imgId); } catch { missing.push(imgId); }
-                }
+                const idArr = [...imageIds];
+                const results = await Promise.allSettled(idArr.map(id => localFs.promises.stat('/' + id)));
+                const missing = idArr.filter((_, i) => results[i].status === 'rejected');
                 if (!missing.length) return [...imageIds];
                 try {
                     const pulled = [];
-                    for (const imgId of missing) {
-                        try {
-                            const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/images/${imgId}`);
-                            if (res && res.status !== 404) {
-                                const data = new Uint8Array(await res.arrayBuffer());
-                                await localFs.promises.writeFile('/' + imgId, data);
-                                pulled.push(imgId);
-                            }
-                        } catch {}
+                    const CONCURRENCY = 5;
+                    for (let i = 0; i < missing.length; i += CONCURRENCY) {
+                        const batch = missing.slice(i, i + CONCURRENCY);
+                        const batchResults = await Promise.all(batch.map(async (imgId) => {
+                            try {
+                                const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/images/${imgId}`);
+                                if (res && res.status !== 404) {
+                                    const data = new Uint8Array(await res.arrayBuffer());
+                                    await localFs.promises.writeFile('/' + imgId, data);
+                                    return imgId;
+                                }
+                            } catch {}
+                            return null;
+                        }));
+                        pulled.push(...batchResults.filter(Boolean));
                     }
                     // Update synced image tracking
                     if (pulled.length) {
@@ -1445,7 +1446,7 @@ const TagCountBadge={
             };
             const loadConversation = async (id) => {
                 if (conversationMap.has(id)) { activeConvoId.value = id; return; }
-                const meta = _.find(savedConversations.value, {id});
+                const meta = savedConversations.value.find(x => x.id === id);
                 if (!meta) return;
                 const convo = _createConvoState({ id, title: meta.title, isTemp: false, timestamp: meta.timestamp });
                 convo.isHydrating = true;
@@ -1468,7 +1469,7 @@ const TagCountBadge={
                                 try { await _writeConvoToLfs(lfs, id, convoData.messages, convoData.params); } catch {}
                             }
                             // Update metadata from R2 data (fixes titles for pre-metadata conversations)
-                            const s = _.find(savedConversations.value, {id});
+                            const s = savedConversations.value.find(x => x.id === id);
                             if (convoData.title) {
                                 convo.title = convoData.title;
                                 if (s) s.title = convoData.title;
@@ -1499,7 +1500,7 @@ const TagCountBadge={
             };
             const deleteConversation = async (id) => {
                 const list = getList();
-                const idx = _.findIndex(list, {id});
+                const idx = list.findIndex(x => x.id === id);
                 if (idx !== -1) {
                     list.splice(idx, 1);
                     const lfs = imageStore.getLfs();
@@ -1525,7 +1526,7 @@ const TagCountBadge={
                 const t = newTitle?.trim(); if (!t) return;
                 const convo = conversationMap.get(id);
                 if (convo) convo.title = t;
-                const s = _.find(savedConversations.value, {id});
+                const s = savedConversations.value.find(x => x.id === id);
                 if (s) s.title = t;
             };
             const pruneNoImageMessages = () => withActiveConvo(convo => {
@@ -1580,9 +1581,10 @@ const TagCountBadge={
             };
             const _doPushConvoToR2 = async (convoId, convoJson, imageIds, localFs, meta) => {
                 // Push conversation JSON with title/timestamp as R2 custom metadata
-                const customHeaders = {};
-                if (meta?.title) customHeaders['X-Convo-Title'] = encodeURIComponent(meta.title);
-                if (meta?.timestamp) customHeaders['X-Convo-Timestamp'] = String(meta.timestamp);
+                const customHeaders = {
+                    ...(meta?.title && { 'X-Convo-Title': encodeURIComponent(meta.title) }),
+                    ...(meta?.timestamp && { 'X-Convo-Timestamp': String(meta.timestamp) })
+                };
                 await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json', customHeaders });
                 // Push new images
                 const syncedArr = _syncedR2Images.value[convoId] || [];
@@ -1594,32 +1596,32 @@ const TagCountBadge={
                         await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
                     } catch {}
                 }
-                // Delete orphaned remote images no longer referenced
-                try {
-                    const listRes = await r2Client.r2Fetch('GET', `conversations/${convoId}/images`);
-                    if (listRes.ok) {
-                        const remoteImages = await listRes.json();
-                        const orphaned = remoteImages.filter(name => !imageIds.has(name));
-                        for (const name of orphaned) {
-                            try { await r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`); } catch {}
+                // Delete orphaned remote images only if image set potentially changed
+                const syncedMatch = syncedArr.length === imageIds.size && syncedArr.every(id => imageIds.has(id));
+                if (!syncedMatch) {
+                    try {
+                        const listRes = await r2Client.r2Fetch('GET', `conversations/${convoId}/images`);
+                        if (listRes.ok) {
+                            const orphaned = (await listRes.json()).filter(name => !imageIds.has(name));
+                            await Promise.all(orphaned.map(name =>
+                                r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {})));
                         }
-                    }
-                } catch {}
+                    } catch {}
+                }
                 _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...imageIds] };
             };
             const _syncConversationToR2 = async (id) => {
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 const localFs = imageStore.getLfs();
                 if (!localFs) throw new Error('Local storage not initialized.');
-                let convoJson;
-                try { convoJson = await localFs.promises.readFile(_convoPath(id), { encoding: 'utf8' }); }
+                let convoData;
+                try { convoData = JSON.parse(await localFs.promises.readFile(_convoPath(id), { encoding: 'utf8' })); }
                 catch { throw new Error('Conversation data not found locally.'); }
-                const convoData = JSON.parse(convoJson);
                 const imageIds = _collectImageIds(convoData);
                 // Enrich with metadata for cross-browser pull
-                const meta = _.find(savedConversations.value, { id });
+                const meta = savedConversations.value.find(x => x.id === id);
                 if (meta) { convoData.title = meta.title; convoData.timestamp = meta.timestamp; }
-                await _pushConvoToR2(id, JSON.stringify(convoData), imageIds, localFs, meta ? { title: meta.title, timestamp: meta.timestamp } : null);
+                await _pushConvoToR2(id, JSON.stringify(convoData), imageIds, localFs, meta && { title: meta.title, timestamp: meta.timestamp });
             };
             let _r2SyncInProgress = false;
             let _r2SyncPromise = null;
@@ -1640,7 +1642,7 @@ const TagCountBadge={
                             } catch (e) {
                                 convoSyncStatus[id] = 'error';
                                 console.warn('Convo R2 sync failed:', e);
-                                const title = _.find(savedConversations.value, {id})?.title || id;
+                                const title = savedConversations.value.find(x => x.id === id)?.title || id;
                                 toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
                             }
                         }
@@ -1676,24 +1678,14 @@ const TagCountBadge={
                 convoSyncStatus[id] = 'pending';
                 _r2SyncDirty.add(id);
                 await _runR2Sync();
-                const deadline = Date.now() + 120000;
-                const syncWaitTimedOut = Symbol('syncWaitTimedOut');
-                while (convoSyncStatus[id] === 'pending' && Date.now() < deadline) {
-                    await new Promise(r => setTimeout(r, 500));
-                    if (_r2SyncPromise) {
-                        const remaining = deadline - Date.now();
-                        if (remaining <= 0) break;
-                        const result = await Promise.race([
-                            _r2SyncPromise,
-                            new Promise(resolve => setTimeout(() => resolve(syncWaitTimedOut), remaining))
-                        ]);
-                        if (result === syncWaitTimedOut) break;
-                    }
-                }
+                if (_r2SyncPromise) await Promise.race([
+                    _r2SyncPromise,
+                    new Promise(r => setTimeout(r, 120000))
+                ]);
                 const status = convoSyncStatus[id];
                 if (status === 'synced') toast.q('Synced to cloud');
                 else if (status === 'error') toast.err('Sync failed');
-                else if (status === 'pending') toast.warn('Sync timed out — will retry automatically');
+                else toast.warn('Sync timed out — will retry automatically');
             };
             const deleteCloudConversation = async (id) => {
                 if (!cloudConversations.value[id]) return;
@@ -1702,12 +1694,10 @@ const TagCountBadge={
                     toast.warn('Failed to delete cloud conversation', 'sync', 3000);
                     return;
                 }
-                const g = { ...cloudConversations.value };
-                delete g[id];
-                cloudConversations.value = g;
-                const s = { ..._syncedR2Images.value };
-                delete s[id];
-                _syncedR2Images.value = s;
+                const { [id]: _c, ...restCloud } = cloudConversations.value;
+                cloudConversations.value = restCloud;
+                const { [id]: _s, ...restSync } = _syncedR2Images.value;
+                _syncedR2Images.value = restSync;
                 delete convoSyncStatus[id];
             };
             return {

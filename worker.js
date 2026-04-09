@@ -60,7 +60,7 @@ async function handleR2(request, env, url) {
       cursor = list.truncated ? list.cursor : null;
     } while (cursor);
     // Fetch lightweight metadata for each conversation via head() in batches
-    const BATCH_SIZE = 20;
+    const BATCH_SIZE = 50;
     const convos = [];
     for (let i = 0; i < ids.length; i += BATCH_SIZE) {
       const batch = ids.slice(i, i + BATCH_SIZE);
