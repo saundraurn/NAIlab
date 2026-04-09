@@ -1594,7 +1594,7 @@ const TagCountBadge={
                 })();
                 return _r2SyncPromise;
             };
-            const _debouncedR2Sync = useDebounceFn(_runR2Sync, 10000);
+            const _debouncedR2Sync = useDebounceFn(_runR2Sync, 3000);
             const _autoSyncR2 = (immediate) => immediate ? _runR2Sync() : _debouncedR2Sync();
             const syncConversationNow = async (id) => {
                 if (!cloudConversations.value[id]) {
