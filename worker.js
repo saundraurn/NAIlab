@@ -64,10 +64,11 @@ async function handleR2(request, env, url) {
       try {
         const head = await env.BUCKET.head(`conversations/${id}/conversation.json`);
         const meta = head?.customMetadata || {};
-        const title = meta.title ? decodeURIComponent(meta.title) : null;
-        return { id, title: title || 'Cloud Chat', timestamp: Number(meta.timestamp) || null };
+        let title = 'Cloud Chat';
+        if (meta.title) { try { title = decodeURIComponent(meta.title); } catch { title = meta.title; } }
+        return { id, title, timestamp: Number(meta.timestamp) || Date.now() };
       } catch {
-        return { id, title: 'Cloud Chat', timestamp: null };
+        return { id, title: 'Cloud Chat', timestamp: Date.now() };
       }
     }));
     return corsJson(convos);

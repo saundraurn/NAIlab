@@ -460,13 +460,14 @@
                             let addedCount = 0;
                             for (const entry of remoteConvos) {
                                 // Support both new {id,title,timestamp} and legacy plain-ID formats
-                                const remoteId = typeof entry === 'string' ? entry : entry.id;
+                                const isObj = typeof entry === 'object';
+                                const remoteId = isObj ? entry.id : entry;
+                                const title = (isObj && entry.title) || 'Cloud Chat';
+                                const ts = (isObj && entry.timestamp) || Date.now();
                                 // Skip tombstoned conversations
                                 if (tombstoneIds.has(remoteId)) continue;
                                 localCloudMap[remoteId] = true;
                                 if (!localById[remoteId]) {
-                                    const title = (typeof entry === 'object' && entry.title) || 'Cloud Chat';
-                                    const ts = (typeof entry === 'object' && entry.timestamp) || Date.now();
                                     localById[remoteId] = { id: remoteId, title, timestamp: ts };
                                     addedCount++;
                                 }
