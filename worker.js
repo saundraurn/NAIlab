@@ -42,7 +42,7 @@ async function readIndex(env) {
     });
     for (const prefix of list.delimitedPrefixes || []) {
       const id = prefix.replace('conversations/', '').replace(/\/$/, '');
-      if (id && id !== 'index.json') ids.push(id);
+      if (id) ids.push(id);
     }
     cursor = list.truncated ? list.cursor : null;
   } while (cursor);
