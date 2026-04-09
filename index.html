@@ -300,6 +300,7 @@
                 if (!secret) throw new Error('Sync secret not configured.');
                 const headers = { 'Authorization': `Bearer ${secret}` };
                 if (options.contentType) headers['Content-Type'] = options.contentType;
+                if (options.ifNoneMatch) headers['If-None-Match'] = options.ifNoneMatch;
                 if (options.customHeaders) {
                     for (const [key, value] of Object.entries(options.customHeaders)) {
                         if (/^x-convo-/i.test(key)) headers[key] = value;
@@ -307,7 +308,7 @@
                 }
                 const res = await fetch(`${base}/r2/${path}`, { method, headers, body, cache: 'no-store' });
                 if (res.status === 401) throw new Error('Invalid sync secret.');
-                if (!res.ok && res.status !== 404) throw new Error(`R2 request failed: ${res.status}`);
+                if (!res.ok && res.status !== 404 && res.status !== 304) throw new Error(`R2 request failed: ${res.status}`);
                 return res;
             };
             return { r2Fetch, getWorkerUrl, getSecret };
@@ -386,17 +387,21 @@
                 const cutoff = Date.now() - TOMBSTONE_TTL_MS;
                 return (tombstones || []).filter(t => t.deletedAt > cutoff);
             };
+            let _configEtag = null;
             const pull = async () => {
                 const cfg = appStore.config.value;
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 syncStatus.value = 'pulling'; syncError.value = null;
                 try {
+                    const configOpts = _configEtag ? { ifNoneMatch: _configEtag } : {};
                     const [res, listRes] = await Promise.all([
-                        r2Client.r2Fetch('GET', 'config'),
+                        r2Client.r2Fetch('GET', 'config', undefined, configOpts),
                         r2Client.r2Fetch('GET', 'conversations').catch(e => { console.warn('Sync pull: failed to fetch conversations list.', e); return null; })
                     ]);
-                    const remote = await res.json();
-                    if (remote && Object.keys(remote).length) {
+                    if (res.status !== 304) {
+                        const etag = res.headers.get('ETag');
+                        if (etag) _configEtag = etag;
+                        const remote = await res.json();
                         const localMeta = cfg._syncMeta || {};
                         const remoteMeta = remote._syncMeta || {};
                         const lwwMerged = {};
@@ -530,6 +535,7 @@
                     payload._deletedConversationIds = _pruneTombstones(tombstones);
                     if (_SYNC_KEYS.some(k=>(cfg._syncMeta?.[k]?.updatedAt||0)>lastSynced) || tombstones.some(t=>t.deletedAt>lastSynced)) {
                         await r2Client.r2Fetch('PUT', 'config', JSON.stringify(payload), { contentType: 'application/json' });
+                        _configEtag = null;
                     }
                     const gemini = useGeminiAPI();
                     const localCloudMap = { ...gemini.cloudConversations.value };
