@@ -321,8 +321,8 @@
             const _queue = reactive([]);
             const _running = ref(false);
             let _timer = null;
-            const _BATCH_DELAY = 500;
-            const _MIN_INTERVAL = 2000;
+            const _BATCH_DELAY = 300;
+            const _MIN_INTERVAL = 1200;
             let _lastRunAt = 0;
             const enqueue = (key, fn) => {
                 const existing = _queue.findIndex(q => q.key === key);
@@ -1906,7 +1906,7 @@ const TagCountBadge={
                         const js = config.value.jssync;
                         if (!syncToken.value || !js.proxyUrl) return;
                         syncStore.queueSync();
-                    }, 5000);
+                    }, 2000);
                     watch(
                         () => {
                             const c = config.value;
