@@ -411,14 +411,15 @@
                             const winner = _lwwPickWinner(localMeta[key], remoteMeta[key]);
                             if (winner === 'remote') lwwMerged[key] = remote[key];
                         });
-                        if (Object.keys(lwwMerged).length) {
+                        const mergedKeys = Object.keys(lwwMerged);
+                        if (mergedKeys.length) {
                             await withSyncMerge(() => {
                                 _applySectionDict(cfg, lwwMerged);
                                 _.forOwn(lwwMerged, (_v, k) => {
                                     if (remoteMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remoteMeta[k]);
                                 });
                             });
-                            toast.ok(`Pulled ${Object.keys(lwwMerged).length} updated section(s).`, 'sync', 3000);
+                            toast.ok(`Pulled ${mergedKeys.length} updated section(s).`, 'sync', 3000);
                         }
                         // Merge tombstones from remote
                         if (remote._deletedConversationIds) {
@@ -567,7 +568,7 @@
                         t => t.deletedAt > (cfg.jssync.lastSyncedAt || 0)
                     );
                     if (hasLocalChanges || hasDirtyTombstones) {
-                        const content = JSON.stringify(payload, null, 2);
+                        const content = JSON.stringify(payload);
                         await r2Client.r2Fetch('PUT', 'config', content, { contentType: 'application/json' });
                     }
                     // Push dirty conversations individually via useGeminiAPI's sync (which has locking)
@@ -1592,11 +1593,13 @@ const TagCountBadge={
                 const syncedArr = _syncedR2Images.value[convoId] || [];
                 const syncedSet = new Set(syncedArr);
                 const newImages = [...imageIds].filter(id => !syncedSet.has(id));
-                for (const imgId of newImages) {
-                    try {
-                        const imgData = await localFs.promises.readFile('/' + imgId);
-                        await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
-                    } catch {}
+                for (let i = 0; i < newImages.length; i += 5) {
+                    await Promise.all(newImages.slice(i, i + 5).map(async (imgId) => {
+                        try {
+                            const imgData = await localFs.promises.readFile('/' + imgId);
+                            await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
+                        } catch {}
+                    }));
                 }
                 // Delete orphaned remote images only if image set potentially changed
                 const syncedMatch = syncedArr.length === imageIds.size && syncedArr.every(id => imageIds.has(id));

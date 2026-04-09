@@ -76,7 +76,7 @@ async function handleR2(request, env, url) {
           return null;
         }
       }));
-      for (const result of results) { if (result) convos.push(result); }
+      convos.push(...results.filter(Boolean));
     }
     return corsJson(convos);
   }
