@@ -515,12 +515,17 @@
                     // Push dirty conversations individually via useGeminiAPI's sync (which has locking)
                     const gemini = useGeminiAPI();
                     const lastSynced = cfg.jssync.lastSyncedAt || 0;
+                    // Batch-mark all dirty saved conversations as cloud before syncing
+                    const localCloudMap = { ...gemini.cloudConversations.value };
+                    let cloudMapDirty = false;
+                    const dirtyMetas = [];
                     for (const meta of gemini.savedConversations.value) {
                         if ((meta.timestamp || 0) <= lastSynced) continue;
-                        // Ensure all saved conversations are marked as cloud when sync is configured
-                        if (!gemini.cloudConversations.value[meta.id]) {
-                            gemini.cloudConversations.value = { ...gemini.cloudConversations.value, [meta.id]: true };
-                        }
+                        if (!localCloudMap[meta.id]) { localCloudMap[meta.id] = true; cloudMapDirty = true; }
+                        dirtyMetas.push(meta);
+                    }
+                    if (cloudMapDirty) gemini.cloudConversations.value = localCloudMap;
+                    for (const meta of dirtyMetas) {
                         try { await gemini.syncConversationToR2(meta.id); }
                         catch (e) { console.warn(`Failed to push convo ${meta.id}:`, e); }
                     }
@@ -1060,6 +1065,7 @@ const TagCountBadge={
         const useGeminiAPI = createGlobalState(() => {
             const store = useAppStore();
             const imageStore = useImageStore();
+            const _isSyncReady = () => !!(store.syncToken.value && store.config.value.jssync.proxyUrl);
             const conversationMap = reactive(new Map());
             const activeConvoId = ref(null);
             const _createConvoState = (opts = {}) => reactive({
@@ -1262,7 +1268,7 @@ const TagCountBadge={
                 if (didSucceed) {
                     const isViewingThis = activeConvoId.value === convo.id && window.location.hash.includes('/banana');
                     if (!isViewingThis) store.incrementNotification('banana');
-                    if (!convo.isTemp && store.syncToken.value) {
+                    if (!convo.isTemp && _isSyncReady()) {
                         if (!cloudConversations.value[convo.id]) cloudConversations.value = { ...cloudConversations.value, [convo.id]: true };
                         _r2SyncDirty.add(convo.id);
                         _autoSyncR2(true);
@@ -1352,7 +1358,7 @@ const TagCountBadge={
                 const idx = _.findIndex(list, {id: convo.id});
                 if (idx !== -1) list[idx] = meta; else list.unshift(meta);
                 toast.q('Chat saved');
-                if (store.syncToken.value) {
+                if (_isSyncReady()) {
                     syncConversationNow(id).catch(e => console.warn('Auto-sync to cloud failed:', e));
                 }
                 return actualTitle;
@@ -1506,7 +1512,7 @@ const TagCountBadge={
                 const convo = activeConvo.value;
                 if (convo && !convo.isTemp && !convo.generating && !convo.isHydrating) {
                     _saveConvoDirect(convo);
-                    if (store.syncToken.value) {
+                    if (_isSyncReady()) {
                         if (!cloudConversations.value[convo.id]) cloudConversations.value = { ...cloudConversations.value, [convo.id]: true };
                         if (convoSyncStatus[convo.id] !== 'syncing') convoSyncStatus[convo.id] = 'pending';
                         _r2SyncDirty.add(convo.id);
@@ -1921,10 +1927,12 @@ const TagCountBadge={
                     const imageStore = useImageStore();
                     const geminiAPI = useGeminiAPI();
                     await imageStore.init();
+                    let pullDone = Promise.resolve();
                     if (syncToken.value && jssync.proxyUrl) {
-                        syncStore.pull().catch(() => {});
+                        pullDone = syncStore.pull().catch(() => {});
                     }
                     await geminiAPI.initFromStorage();
+                    await pullDone;
                     imageStore.cleanupOrphanedImages(geminiAPI.savedConversations.value).catch(() => {});
                     const _debouncedAutoSync = useDebounceFn(() => {
                         const js = config.value.jssync;
