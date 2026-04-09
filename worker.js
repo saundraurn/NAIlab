@@ -27,9 +27,37 @@ const INDEX_KEY = 'conversations/index.json';
 async function readIndex(env) {
   try {
     const obj = await env.BUCKET.get(INDEX_KEY);
-    if (obj) return JSON.parse(await obj.text());
+    if (obj) {
+      const parsed = JSON.parse(await obj.text());
+      if (Array.isArray(parsed)) return parsed;
+    }
   } catch {}
-  return [];
+  // Index missing or corrupted — rebuild from bucket listing
+  const index = [];
+  let cursor;
+  do {
+    const list = await env.BUCKET.list({
+      prefix: 'conversations/',
+      delimiter: '/',
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const prefix of list.delimitedPrefixes || []) {
+      const id = prefix.replace('conversations/', '').replace(/\/$/, '');
+      if (!id || id === 'index.json') continue;
+      try {
+        const head = await env.BUCKET.head(`conversations/${id}/conversation.json`);
+        if (!head) continue;
+        const meta = head.customMetadata || {};
+        let title = 'Cloud Chat';
+        if (meta.title) { try { title = decodeURIComponent(meta.title); } catch { title = meta.title; } }
+        const ts = Number(meta.timestamp);
+        index.push({ id, title, timestamp: Number.isFinite(ts) ? ts : Date.now() });
+      } catch {}
+    }
+    cursor = list.truncated ? list.cursor : null;
+  } while (cursor);
+  if (index.length) await writeIndex(env, index).catch(() => {});
+  return index;
 }
 
 async function writeIndex(env, index) {
@@ -98,7 +126,8 @@ async function handleR2(request, env, url) {
       const index = await readIndex(env);
       let decodedTitle = 'Cloud Chat';
       if (title) { try { decodedTitle = decodeURIComponent(title); } catch { decodedTitle = title; } }
-      const ts = timestamp ? Number(timestamp) : Date.now();
+      const n = Number(timestamp);
+      const ts = Number.isFinite(n) ? n : Date.now();
       const idx = index.findIndex(e => e.id === convoId);
       const entry = { id: convoId, title: decodedTitle, timestamp: ts };
       if (idx !== -1) index[idx] = entry; else index.push(entry);

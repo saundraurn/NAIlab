@@ -136,7 +136,7 @@
         const MAX_SEED=9e15;
         const _batch5 = async (arr, fn) => { for (let i = 0; i < arr.length; i += 5) await Promise.all(arr.slice(i, i + 5).map(fn)); };
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
-        const _parseConvo = (json) => json ? (typeof json === 'string' ? JSON.parse(json) : json) : null;
+        const _parseConvo = (json) => { if (!json) return null; if (typeof json !== 'string') return json; try { return JSON.parse(json); } catch { return null; } };
         const _normalizeUrl = (url) => { if (!url) return ''; if (!/^https?:\/\//i.test(url)) url = 'https://' + url; return url.replace(/\/$/, ''); };
         const useAppStore = createGlobalState(() => {
             const config = useLocalStorage('nai-app-settings', {
@@ -375,20 +375,21 @@
                 const cutoff = Date.now() - TOMBSTONE_TTL_MS;
                 return (tombstones || []).filter(t => t.deletedAt > cutoff);
             };
-            let _configEtag = null;
+            const _configEtag = useLocalStorage('nai-config-etag', null);
+            watch([() => appStore.config.value.jssync.proxyUrl, appStore.syncToken], () => { _configEtag.value = null; });
             const pull = async () => {
                 const cfg = appStore.config.value;
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 syncStatus.value = 'pulling'; syncError.value = null;
                 try {
-                    const configOpts = _configEtag ? { ifNoneMatch: _configEtag } : {};
+                    const configOpts = _configEtag.value ? { ifNoneMatch: _configEtag.value } : {};
                     const [res, listRes] = await Promise.all([
                         r2Client.r2Fetch('GET', 'config', undefined, configOpts),
                         r2Client.r2Fetch('GET', 'conversations').catch(e => { console.warn('Sync pull: failed to fetch conversations list.', e); return null; })
                     ]);
                     if (res.status !== 304) {
                         const etag = res.headers.get('ETag');
-                        if (etag) _configEtag = etag;
+                        if (etag) _configEtag.value = etag;
                         const remote = await res.json();
                         const localMeta = cfg._syncMeta || {};
                         const remoteMeta = remote._syncMeta || {};
@@ -523,7 +524,7 @@
                     payload._deletedConversationIds = _pruneTombstones(tombstones);
                     if (_SYNC_KEYS.some(k=>(cfg._syncMeta?.[k]?.updatedAt||0)>lastSynced) || tombstones.some(t=>t.deletedAt>lastSynced)) {
                         await r2Client.r2Fetch('PUT', 'config', JSON.stringify(payload), { contentType: 'application/json' });
-                        _configEtag = null;
+                        _configEtag.value = null;
                     }
                     const gemini = useGeminiAPI();
                     const localCloudMap = { ...gemini.cloudConversations.value };
@@ -1527,6 +1528,7 @@ const TagCountBadge={
                     const json = await idbGet(_convoPath(id), _idb);
                     if (!json) throw new Error('not found');
                     convoData = _parseConvo(json);
+                    if (!convoData) throw new Error('not found');
                 }
                 catch { throw new Error('Conversation data not found locally.'); }
                 const imageIds = _collectImageIds(convoData);
