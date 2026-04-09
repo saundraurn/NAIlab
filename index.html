@@ -306,7 +306,11 @@
                 if (!secret) throw new Error('Sync secret not configured.');
                 const headers = { 'Authorization': `Bearer ${secret}` };
                 if (options.contentType) headers['Content-Type'] = options.contentType;
-                if (options.customHeaders) Object.assign(headers, options.customHeaders);
+                if (options.customHeaders) {
+                    for (const [key, value] of Object.entries(options.customHeaders)) {
+                        if (/^x-convo-/i.test(key)) headers[key] = value;
+                    }
+                }
                 const res = await fetch(`${base}/r2/${path}`, { method, headers, body, cache: 'no-store' });
                 if (res.status === 401) throw new Error('Invalid sync secret.');
                 if (!res.ok && res.status !== 404) throw new Error(`R2 request failed: ${res.status}`);
@@ -460,8 +464,9 @@
                             let addedCount = 0;
                             for (const entry of remoteConvos) {
                                 // Support both new {id,title,timestamp} and legacy plain-ID formats
-                                const isObj = typeof entry === 'object';
+                                const isObj = entry && typeof entry === 'object' && !Array.isArray(entry);
                                 const remoteId = isObj ? entry.id : entry;
+                                if (typeof remoteId !== 'string' || !remoteId) continue;
                                 const title = (isObj && entry.title) || 'Cloud Chat';
                                 const ts = (isObj && entry.timestamp) || Date.now();
                                 // Skip tombstoned conversations
@@ -1439,7 +1444,13 @@ const TagCountBadge={
                                 convo.title = convoData.title;
                                 if (s) s.title = convoData.title;
                             }
-                            if (convoData.timestamp && s) s.timestamp = convoData.timestamp;
+                            if (convoData.timestamp != null) {
+                                const timestamp = Number(convoData.timestamp);
+                                if (Number.isFinite(timestamp)) {
+                                    convo.timestamp = timestamp;
+                                    if (s) s.timestamp = timestamp;
+                                }
+                            }
                         }
                     }
                     if (!convoData) {
