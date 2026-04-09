@@ -134,8 +134,6 @@
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
         const _META_KEYS = ['id', 'title', 'timestamp'];
-        // Migration: API renamed from snake_case to camelCase; saved data may use either
-        const getThoughtSig = (p) => p.thoughtSignature || p.thought_signature;
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
         const useAppStore = createGlobalState(() => {
             const config = useLocalStorage('nai-app-settings', {
@@ -444,6 +442,7 @@
                                 delete localCloud[c.id];
                                 const lfs = useImageStore().getLfs();
                                 if (lfs) lfs.promises.unlink(_convoPath(c.id)).catch(() => {});
+                                gemini.conversationMap.delete(c.id);
                                 removedCount++;
                                 return false;
                             }
@@ -451,6 +450,12 @@
                         });
                         if (removedCount) {
                             gemini.cloudConversations.value = localCloud;
+                            // If active conversation was tombstoned, switch away
+                            const activeId = gemini.activeConvoId.value;
+                            if (activeId && tombstoneIds.has(activeId)) {
+                                const remaining = [...gemini.conversationMap.keys()];
+                                gemini.activeConvoId.value = remaining.length ? remaining[remaining.length - 1] : null;
+                            }
                             toast.info(`Removed ${removedCount} deleted conversation(s) from other device.`, 'sync', 3000);
                         }
                     }
@@ -461,25 +466,57 @@
                             const remoteConvos = await listRes.json();
                             const localById = _.keyBy(gemini.savedConversations.value, 'id');
                             const localCloudMap = { ...gemini.cloudConversations.value };
-                            let addedCount = 0;
+                            const remoteIdSet = new Set();
+                            let addedCount = 0, updatedCount = 0;
+                            const lfs = useImageStore().getLfs();
                             for (const entry of remoteConvos) {
-                                // Support both new {id,title,timestamp} and legacy plain-ID formats
-                                const isObj = entry && typeof entry === 'object' && !Array.isArray(entry);
-                                const remoteId = isObj ? entry.id : entry;
+                                if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+                                const remoteId = entry.id;
                                 if (typeof remoteId !== 'string' || !remoteId) continue;
-                                const title = (isObj && entry.title) || 'Cloud Chat';
-                                const ts = (isObj && entry.timestamp) || Date.now();
-                                // Skip tombstoned conversations
+                                const title = entry.title || 'Cloud Chat';
+                                const ts = entry.timestamp || Date.now();
                                 if (tombstoneIds.has(remoteId)) continue;
+                                remoteIdSet.add(remoteId);
                                 localCloudMap[remoteId] = true;
                                 if (!localById[remoteId]) {
                                     localById[remoteId] = { id: remoteId, title, timestamp: ts };
                                     addedCount++;
+                                } else if (ts > (localById[remoteId].timestamp || 0)) {
+                                    // Remote is newer — update metadata and invalidate local cache
+                                    localById[remoteId].title = title;
+                                    localById[remoteId].timestamp = ts;
+                                    if (lfs) lfs.promises.unlink(_convoPath(remoteId)).catch(() => {});
+                                    gemini.conversationMap.delete(remoteId);
+                                    updatedCount++;
+                                }
+                            }
+                            // Remove local cloud conversations that no longer exist in R2
+                            let removedCount = 0;
+                            for (const cid of Object.keys(localCloudMap)) {
+                                if (remoteIdSet.has(cid) || tombstoneIds.has(cid)) continue;
+                                delete localCloudMap[cid];
+                                if (localById[cid]) {
+                                    delete localById[cid];
+                                    if (lfs) lfs.promises.unlink(_convoPath(cid)).catch(() => {});
+                                    gemini.conversationMap.delete(cid);
+                                    removedCount++;
                                 }
                             }
                             gemini.savedConversations.value = Object.values(localById);
                             gemini.cloudConversations.value = localCloudMap;
-                            if (addedCount) toast.ok(`Pulled ${addedCount} conversation(s) from cloud.`, 'sync', 3000);
+                            // If active conversation was removed, switch away; if updated, reload it
+                            const activeId = gemini.activeConvoId.value;
+                            if (activeId && !localById[activeId]) {
+                                const remaining = [...gemini.conversationMap.keys()];
+                                gemini.activeConvoId.value = remaining.length ? remaining[remaining.length - 1] : null;
+                            } else if (activeId && !gemini.conversationMap.has(activeId) && localById[activeId]) {
+                                gemini.loadConversation(activeId).catch(() => {});
+                            }
+                            const parts = [];
+                            if (addedCount) parts.push(`${addedCount} new`);
+                            if (updatedCount) parts.push(`${updatedCount} updated`);
+                            if (removedCount) parts.push(`${removedCount} removed`);
+                            if (parts.length) toast.ok(`Conversations: ${parts.join(', ')}.`, 'sync', 3000);
                         }
                     } catch (e) { console.warn('Failed to pull conversations list:', e); }
                     cfg.jssync.lastSyncedAt = Date.now();
@@ -505,7 +542,11 @@
                         const lastSynced = cfg.jssync.lastSyncedAt || 0;
                         return localTime > lastSynced;
                     });
-                    if (hasLocalChanges) {
+                    // Also push config if there are new tombstones
+                    const hasDirtyTombstones = (cfg.jssync._deletedConversationIds || []).some(
+                        t => t.deletedAt > (cfg.jssync.lastSyncedAt || 0)
+                    );
+                    if (hasLocalChanges || hasDirtyTombstones) {
                         const content = JSON.stringify(payload, null, 2);
                         await r2Client.r2Fetch('PUT', 'config', content, { contentType: 'application/json' });
                     }
@@ -977,11 +1018,11 @@ const TagCountBadge={
                                 inlineDataCount++;
                                 const sPart = { _imageRef: imageId, _mimeType: _WP };
                                 if (part.thought) sPart.thought = true;
-                                const _sig = getThoughtSig(part); if (_sig) sPart._thoughtSignature = _sig;
+                                if (part.thoughtSignature) sPart._thoughtSignature = part.thoughtSignature;
                                 if (part.text) sPart.text = part.text;
                                 return sPart;
                             }
-                            const _sig2 = getThoughtSig(part); return { text: part.text || '', ...(part.thought ? { thought: true } : {}), ...(_sig2 ? { thoughtSignature: _sig2 } : {}) };
+                            return { text: part.text || '', ...(part.thought ? { thought: true } : {}), ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}) };
                         }));
                         const serializedImages = (v._images || []).map(img => ({
                             mimeType: img.mimeType || _WP,
@@ -1039,9 +1080,7 @@ const TagCountBadge={
                                 if (imgB64) base.inlineData = { data: imgB64, mimeType: part._mimeType || _WP };
                                 return base;
                             }
-                            const textPart = _.omit(part, ['thought_signature']);
-                            if (part.thought_signature) textPart.thoughtSignature = part.thought_signature;
-                            return textPart;
+                            return part;
                         }));
                         dV._images = await Promise.all((v._images || []).map(async (img) => {
                             if (img.imageId) return { ...img, data: await loadImageAsBase64(img.imageId) };
@@ -1098,24 +1137,6 @@ const TagCountBadge={
                 return true;
             };
             const initFromStorage = async () => {
-                // Migrate savedConversations from old config location
-                const oldConvos = store.config.value.savedConversations;
-                if (Array.isArray(oldConvos) && oldConvos.length && !savedConversations.value.length) {
-                    savedConversations.value = oldConvos.filter(c => c && typeof c === 'object').map(c => _.pick(c, _META_KEYS));
-                    delete store.config.value.savedConversations;
-                }
-                const lfs = imageStore.getLfs();
-                if (lfs) {
-                    const convos = getList() || [];
-                    for (const c of convos) {
-                        if (c?.messages) {
-                            try {
-                                await _writeConvoToLfs(lfs, c.id, c.messages);
-                                const i = convos.indexOf(c); if (i > -1) convos[i] = _.pick(c, _META_KEYS);
-                            } catch (e) { console.warn('Migration failed for convo', c.id, e); }
-                        }
-                    }
-                }
                 if (!conversationMap.size) newChat();
             };
             const createVariant = (params) => reactive({id: uid(), parts: [], _thinking: '', _text: '', _images: [], _usage: null, _error: null, _blockReason: null, _isPromptBlock: false, timestamp: null, _genTimeMs: null, _imageSize: params?.imageSize || '1K', _model: params?.bananaModel || _FM, _flexInference: !!(params?.flexInference && params?.bananaModel === _PM)});
@@ -1420,17 +1441,6 @@ const TagCountBadge={
                             convoData = JSON.parse(json);
                         } catch {}
                     }
-                    if (!convoData && meta.messages) {
-                        convoData = { messages: meta.messages };
-                        if (lfs) {
-                            try {
-                                await _writeConvoToLfs(lfs, id, convoData.messages, convo.params);
-                                const list = getList();
-                                const idx = _.findIndex(list, {id});
-                                if (idx !== -1) list[idx] = _.pick(meta, _META_KEYS);
-                            } catch {}
-                        }
-                    }
                     // Fall back to fetching from R2 cloud storage
                     if (!convoData && cloudConversations.value[id]) {
                         convoData = await _fetchConvoFromR2(id);
@@ -1487,6 +1497,8 @@ const TagCountBadge={
                 }
                 if (conversationMap.has(id)) closeConversation(id);
                 deleteCloudConversation(id).catch(() => {});
+                // Push tombstone to R2 so other devices see the deletion
+                if (_isSyncReady()) useSyncStore().push(true).catch(() => {});
                 toast.q('Removed from saved chats');
                 imageStore.cleanupOrphanedImages(savedConversations.value).catch(() => {});
             };
