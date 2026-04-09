@@ -59,7 +59,18 @@ async function handleR2(request, env, url) {
       }
       cursor = list.truncated ? list.cursor : null;
     } while (cursor);
-    return corsJson(ids);
+    // Fetch lightweight metadata for each conversation via head()
+    const convos = await Promise.all(ids.map(async (id) => {
+      try {
+        const head = await env.BUCKET.head(`conversations/${id}/conversation.json`);
+        const meta = head?.customMetadata || {};
+        const title = meta.title ? decodeURIComponent(meta.title) : null;
+        return { id, title: title || 'Cloud Chat', timestamp: Number(meta.timestamp) || null };
+      } catch {
+        return { id, title: 'Cloud Chat', timestamp: null };
+      }
+    }));
+    return corsJson(convos);
   }
 
   // ── Single conversation (JSON) ───────────────────────────────────────────
@@ -74,10 +85,15 @@ async function handleR2(request, env, url) {
       });
     }
     if (request.method === 'PUT') {
+      const customMetadata = {};
+      const title = request.headers.get('X-Convo-Title');
+      const timestamp = request.headers.get('X-Convo-Timestamp');
+      if (title) customMetadata.title = title;
+      if (timestamp) customMetadata.timestamp = timestamp;
       await env.BUCKET.put(
         `conversations/${convoId}/conversation.json`,
         request.body,
-        { httpMetadata: { contentType: 'application/json' } }
+        { httpMetadata: { contentType: 'application/json' }, customMetadata }
       );
       return corsResponse('OK');
     }
