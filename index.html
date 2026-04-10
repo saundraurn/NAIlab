@@ -106,7 +106,7 @@
         const fmtAgo = ts => !ts ? 'never' : formatTimeAgo(new Date(ts));
         const _t=(msg,type,source,duration)=>useAppStore().addToast({msg,type,source,duration});
         const toast={ok:(msg,src,dur=3000)=>_t(msg,'success',src,dur),err:(msg,src)=>_t(msg,'error',src),warn:(msg,src,dur=4000)=>_t(msg,'warning',src,dur),info:(msg,src,dur=3000)=>_t(msg,'info',src,dur),q:(msg,dur=2000)=>_t(msg,'success',undefined,dur)};
-        const splitTagString = (str) => _.compact((str || '').split(' '));
+        const splitTagString = (str) => (str || '').split(' ').filter(Boolean);
         const TAG_CATEGORIES = 'artist,copyright,character,general,meta'.split(',');
         const getPostTags = (post) => TAG_CATEGORIES.flatMap(type => splitTagString(post[`tag_string_${type}`]).map(name => ({name, type})));
         const loadImageAsBase64 = async (imageId) => { const bytes = await useImageStore().loadImage(imageId); return bytes ? uint8ArrayToBase64(bytes) : null; };
@@ -174,7 +174,7 @@
             let uniqueIdCounter = 0;
             const removeToast = (id) => { const i = toasts.value.findIndex(t => t.id === id); if (i !== -1) { clearTimeout(toasts.value[i].timerId); toasts.value.splice(i, 1); } };
             const addToast = ({id, msg, type='info', source='default', duration=5000, persistent=false}) => {
-                let item = id ? _.find(toasts.value, {id}) : (type === 'error' && _.findLast(toasts.value, {type, msg, source}));
+                let item = id ? toasts.value.find(t => t.id === id) : (type === 'error' && toasts.value.findLast(t => t.type === type && t.msg === msg && t.source === source));
                 if (!item) toasts.value.push(item = reactive({id: id || ++uniqueIdCounter, count: 0}));
                 Object.assign(item, {msg, type, source, persistent, duration, count: item.count + 1});
                 clearTimeout(item.timerId); if (!persistent) item.timerId = setTimeout(() => removeToast(item.id), duration);
@@ -220,7 +220,7 @@
                 if (isDispatcherRunning.value) return; isDispatcherRunning.value = true;
                 try {
                     while (queue.value.length > 0 && !isApiHalted.value) {
-                        const act = router?.currentRoute?.value?.meta?.genSource, idx = Math.max(0, act ? _.findIndex(queue.value, {source: act}) : -1), req = queue.value.splice(idx, 1)[0]; if (!req) continue;
+                        const act = router?.currentRoute?.value?.meta?.genSource, idx = Math.max(0, act ? queue.value.findIndex(q => q.source === act) : -1), req = queue.value.splice(idx, 1)[0]; if (!req) continue;
                         const tId = addToast({msg: 'Generating...', type: 'loading', source: req.source, persistent: true});
                         const res = await generateImage(req, tId);
                         if (act !== req.source && res.success) updateNotification(req.source, 1);
@@ -238,35 +238,39 @@
             if (!/^https?:\/\//i.test(proxyUrl)) proxyUrl = 'https://' + proxyUrl;
             return `${proxyUrl.replace(/\/$/, '')}/proxy?url=${encodeURIComponent(url)}`;
         };
-        const _convoPath = id => `convo_${id}.json`;
-        const _rmConvo = id => opfs.remove(_convoPath(id));
-        const _writeConvo = (id, messages, params) =>
-            opfs.write(_convoPath(id), JSON.stringify(params ? { messages, params } : { messages }));
-        const _collectImageIds = (d) => {
+        const _manifestPath = id => `convo_${id}_manifest.json`;
+        const _msgPath = (id, msgId) => `convo_${id}_msg_${msgId}.json`;
+        const _collectMsgImageIds = (msg) => {
             const s = new Set();
-            for (const m of d.messages || []) {
-                (m.images||[]).forEach(i => i.imageId && s.add(i.imageId));
-                for (const v of m.variants || []) {
-                    (v.parts||[]).forEach(p => p._imageRef && s.add(p._imageRef));
-                    (v._images||[]).forEach(i => i.imageId && s.add(i.imageId));
-                }
+            (msg.images||[]).forEach(i => i.imageId && s.add(i.imageId));
+            for (const v of msg.variants || []) {
+                (v.parts||[]).forEach(p => p._imageRef && s.add(p._imageRef));
+                (v._images||[]).forEach(i => i.imageId && s.add(i.imageId));
             }
             return s;
+        };
+        const _collectImageIdsFromManifest = (manifest) => new Set((manifest.messages || []).flatMap(d => d.imageIds || []));
+        const _writeJson = (path, data) => opfs.write(path, JSON.stringify(data));
+        const _readJson = async (path) => { const j = await opfs.readText(path); return j ? JSON.parse(j) : null; };
+        const _writeManifest = (convoId, title, timestamp, params, msgDescriptors) =>
+            _writeJson(_manifestPath(convoId), { title, timestamp, params: params || null, messages: msgDescriptors });
+        const _readManifest = (convoId) => _readJson(_manifestPath(convoId));
+        const _writeMsg = (convoId, msgId, serializedMsg) => _writeJson(_msgPath(convoId, msgId), serializedMsg);
+        const _readMsg = (convoId, msgId) => _readJson(_msgPath(convoId, msgId));
+        const _rmConvo = async (convoId) => {
+            const manifest = await _readManifest(convoId);
+            const msgIds = (manifest?.messages || []).map(d => d.msgId);
+            await Promise.all([
+                opfs.remove(_manifestPath(convoId)),
+                ...msgIds.map(mid => opfs.remove(_msgPath(convoId, mid)))
+            ]);
         };
         const useImageStore = createGlobalState(() => {
             const saveImage = (imageId, data) => opfs.write(imageId, data);
             const ingestImage = async (input) => {
-                let webpBytes;
-                if (input instanceof Blob) {
-                    webpBytes = await blobToWebP(input);
-                } else {
-                    if (input.mimeType === _WP) {
-                        webpBytes = Uint8Array.from(atob(input.data), c => c.charCodeAt(0));
-                    } else {
-                        const res = await fetch(`data:${input.mimeType};base64,${input.data}`);
-                        webpBytes = await blobToWebP(await res.blob());
-                    }
-                }
+                const webpBytes = await (input instanceof Blob ? blobToWebP(input)
+                    : input.mimeType === _WP ? Promise.resolve(Uint8Array.from(atob(input.data), c => c.charCodeAt(0)))
+                    : fetch(`data:${input.mimeType};base64,${input.data}`).then(r => r.blob()).then(blobToWebP));
                 const imageId = `img_${uid()}.webp`;
                 await saveImage(imageId, webpBytes);
                 return { imageId, base64: uint8ArrayToBase64(webpBytes), webpBytes };
@@ -277,8 +281,8 @@
                 await _pool(savedConvosList || [], async (meta) => {
                     if (!meta?.id) return;
                     try {
-                        const json = await opfs.readText(_convoPath(meta.id));
-                        if (json) for (const id of _collectImageIds(JSON.parse(json))) referenced.add(id);
+                        const manifest = await _readManifest(meta.id);
+                        if (manifest) for (const id of _collectImageIdsFromManifest(manifest)) referenced.add(id);
                     } catch {}
                 });
                 try {
@@ -302,14 +306,8 @@
                 const secret = getSecret();
                 if (!base) throw new Error('Worker URL not configured.');
                 if (!secret) throw new Error('Sync secret not configured.');
-                const headers = { 'Authorization': `Bearer ${secret}` };
-                if (options.contentType) headers['Content-Type'] = options.contentType;
-                if (options.customHeaders) {
-                    for (const [key, value] of Object.entries(options.customHeaders)) {
-                        if (/^x-convo-/i.test(key)) headers[key] = value;
-                    }
-                }
-                if (options.ifNoneMatch) headers['If-None-Match'] = options.ifNoneMatch;
+                const headers = { Authorization: `Bearer ${secret}`, ...(options.contentType && { 'Content-Type': options.contentType }), ...(options.ifNoneMatch && { 'If-None-Match': options.ifNoneMatch }) };
+                if (options.customHeaders) Object.entries(options.customHeaders).forEach(([k, v]) => /^x-convo-/i.test(k) && (headers[k] = v));
                 const res = await fetch(`${base}/r2/${path}`, { method, headers, body, cache: 'no-store' });
                 if (res.status === 401) throw new Error('Invalid sync secret.');
                 if (!res.ok && res.status !== 404 && res.status !== 304) throw new Error(`R2 request failed: ${res.status}`);
@@ -374,9 +372,9 @@
             const withFlag = (f, fn) => { f.value = true; return Promise.resolve().then(fn).finally(() => { f.value = false; }); };
             const withSyncMerge = (fn) => withFlag(appStore.isSyncMerging, fn);
             const _applySectionDict = (cfg, dict) => {
-                _.forOwn(dict, (val, key) => {
+                Object.entries(dict).forEach(([key, val]) => {
                     if (key === '_syncMeta') return;
-                    const merged = _.isArray(val) ? _.cloneDeep(val) : _.mergeWith({}, cfg[key], val, (_o, s) => _.isArray(s) ? _.cloneDeep(s) : undefined);
+                    const merged = Array.isArray(val) ? _.cloneDeep(val) : _.mergeWith({}, cfg[key], val, (_o, s) => Array.isArray(s) ? _.cloneDeep(s) : undefined);
                     if (_.isPlainObject(merged) && _.isPlainObject(cfg[key])) { Object.assign(cfg[key], merged); }
                     else { cfg[key] = merged; }
                 });
@@ -424,7 +422,7 @@
                         if (mergedKeys.length) {
                             await withSyncMerge(() => {
                                 _applySectionDict(cfg, lwwMerged);
-                                _.forOwn(lwwMerged, (_v, k) => {
+                                Object.entries(lwwMerged).forEach(([k]) => {
                                     if (remoteMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remoteMeta[k]);
                                 });
                             });
@@ -479,7 +477,7 @@
                             const newListEtag = listRes.headers.get('ETag');
                             if (newListEtag) _listEtag.value = newListEtag;
                             const remoteConvos = await listRes.json();
-                            const localById = _.keyBy(gemini.savedConversations.value, 'id');
+                            const localById = Object.fromEntries(gemini.savedConversations.value.map(c => [c.id, c]));
                             const localCloudMap = { ...gemini.cloudConversations.value };
                             const remoteIdSet = new Set();
                             let addedCount = 0, updatedCount = 0;
@@ -819,7 +817,7 @@ const TagCountBadge={
                 let abortController = null;
                 const {isLoading, error: err, execute} = useAsyncState(async (tags, page = 1, append = false, signal, clientFilters = []) => {
                     try {
-                        const sub = _.compact((tags || '').split('|').map(t => t.trim())); if (!sub.length) sub.push('');
+                        const sub = (tags || '').split('|').map(t => t.trim()).filter(Boolean); if (!sub.length) sub.push('');
                         const results = await Promise.all(sub.map(async t => { const res = await fetch(`https://danbooru.donmai.us/posts.json?tags=${encodeURIComponent(t)}&limit=${Math.ceil(DANBOORU_LIMIT / sub.length)}&page=${page}`, {signal}); return res.ok ? (await res.json()) || [] : []; }));
                         return {data: _.uniqBy(results.flat(), 'id'), page, append, tags, clientFilters, error: null};
                     } catch (e) {if (e.name !== 'AbortError') throw e; return {aborted: true};}
@@ -828,7 +826,7 @@ const TagCountBadge={
                     onError: (e) => !e?.name?.includes('Abort') && toast.err(`Search failed: ${e.message}`, 'danbooru'),
                     onSuccess: ({data, page, append, tags, clientFilters = [], aborted, error}) => {
                         if (aborted || error) return error && toast.err(error, 'danbooru');
-                        const bl = _.compact((blacklist.value||'').split(',').map(t => t.trim())), results = data.filter(p => p.large_file_url && !p.is_banned && p.image_width > 0 && /png|jpe?g|gif/.test(p.file_ext) && !bl.some(b => (p.tag_string||'').includes(b)) && (!clientFilters.length || clientFilters.every(f => (` ${p.tag_string||''} `).includes(` ${f} `))));
+                        const bl = (blacklist.value||'').split(',').map(t => t.trim()).filter(Boolean), results = data.filter(p => p.large_file_url && !p.is_banned && p.image_width > 0 && /png|jpe?g|gif/.test(p.file_ext) && !bl.some(b => (p.tag_string||'').includes(b)) && (!clientFilters.length || clientFilters.every(f => (` ${p.tag_string||''} `).includes(` ${f} `))));
                         results.forEach(p => TAG_CATEGORIES.forEach(t => splitTagString(p[`tag_string_${t}`]).forEach(tag => { if (tag && !naiTagKnowledge.value[tag] && !queuedTags.has(tag)) { tagQueues[t === 'artist' ? 'danbooru' : 'nai'].push(tag); queuedTags.add(tag); processQueues(); } })));
                         posts.value = append ? posts.value.concat(results) : results; hasMorePages.value = data.length >= (tags.includes('|') ? (DANBOORU_LIMIT / 2) : DANBOORU_LIMIT); pageNum.value = page; currentSearchTags.value = tags;
                         if (page === 1) toast.ok(`Found ${results.length} posts.`, 'danbooru', 2000);
@@ -842,14 +840,14 @@ const TagCountBadge={
                 });
                 const selectedImage = computed(() => {
                     if (!selectedPostId.value) return null;
-                    return _.find(posts.value, post => String(post.id) === selectedPostId.value) || null;
+                    return posts.value.find(post => String(post.id) === selectedPostId.value) || null;
                 });
-                const displayedImage = computed(() => selectedImage.value || hoveredImage.value), foldersById = computed(() => _.keyBy(danbooru.value.folders, 'id')), activeFolderId = computed(() => route.name === 'danbooru-folder' ? route.params.folderId : null);
+                const displayedImage = computed(() => selectedImage.value || hoveredImage.value), foldersById = computed(() => Object.fromEntries((danbooru.value.folders || []).map(f => [f.id, f]))), activeFolderId = computed(() => route.name === 'danbooru-folder' ? route.params.folderId : null);
                 watch(() => [isLoading.value, sortedPosts.value.length], ([loading, len]) => { if (!loading && len < 15 && hasMorePages.value && gridRoutes.includes(route.name) && _.some(ratingFilters.value)) fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []); });
                 const executeSearch = (query) => {
                     lastFetchedQuery.value = query; let effective = query || '', apiTags, clientFilters = [];
-                    if ((effective).includes('|')) apiTags = effective.split('|').map(p => _.compact(p.split(/\s*,\s*/).map(t => t.trim().replace(/\s+/g, '_'))).join(' ')).join('|');
-                    else { const tags = _.compact((effective).split(/\s*,\s*/).map(tag => tag.trim().replace(/\s+/g, '_'))); apiTags = _.take(tags, 2).join(' '); clientFilters = tags.slice(2); }
+                    if ((effective).includes('|')) apiTags = effective.split('|').map(p => p.split(/\s*,\s*/).map(t => t.trim().replace(/\s+/g, '_')).filter(Boolean).join(' ')).join('|');
+                    else { const tags = (effective).split(/\s*,\s*/).map(tag => tag.trim().replace(/\s+/g, '_')).filter(Boolean); apiTags = tags.slice(0, 2).join(' '); clientFilters = tags.slice(2); }
                     fetchPosts(apiTags, 1, false, clientFilters);
                 };
                 watch(() => route.query.q, (q) => {
@@ -877,7 +875,7 @@ const TagCountBadge={
                     save: () => {
                         const name = savedSearchName.value.trim(), prompt = searchQueryInput.value.trim();
                         if (!name) return toast.err('Name required.', 'danbooru');
-                        const existing = _.find(savedSearches.value, {name});
+                        const existing = savedSearches.value.find(s => s.name === name);
                         existing ? (existing.prompt = prompt) : savedSearches.value.push({name, prompt});
                         toast.ok(`Saved "${name}".`, 'danbooru');
                         savedSearchName.value = '';
@@ -886,9 +884,9 @@ const TagCountBadge={
                     delete: (item) => (_.pull(savedSearches.value, item), toast.info(`Deleted "${item.name}".`, 'danbooru')),
                 };
                 const savedSearchAction = (action, item) => _savedSearchActions[action]?.(item);
-                const addTagToSearch = (t) => searchQueryInput.value = _.uniq([..._.compact((searchQueryInput.value||'').split(',').map(x => x.trim())), t.replace(/_/g, ' ')]).join(', ');
+                const addTagToSearch = (t) => searchQueryInput.value = _.uniq([...(searchQueryInput.value||'').split(',').map(x => x.trim()).filter(Boolean), t.replace(/_/g, ' ')]).join(', ');
                 const searchSingleTag = (t) => (searchQueryInput.value = t.replace(/_/g, ' '), search());
-                const toggleTagInSearch = (tag, searchItem) => { const raw = tag.replace(/ /g, '_'), p = searchItem.prompt || ''; if (p.includes('|')) { searchItem.prompt = _.xorBy(_.compact(p.split('|').map(x => x.trim())), [raw], _.toLower).join(' | '); } else { const r = new RegExp(`(^|\\s)${_.escapeRegExp(raw)}($|\\s)`, 'i'); searchItem.prompt = r.test(p) ? p.replace(r, ' ').trim() : (p ? `${p} | ${raw}` : raw); } toast.ok(`Updated "${searchItem.name}"`, 'danbooru', 1000); };
+                const toggleTagInSearch = (tag, searchItem) => { const raw = tag.replace(/ /g, '_'), p = searchItem.prompt || ''; if (p.includes('|')) { searchItem.prompt = _.xorBy(p.split('|').map(x => x.trim()).filter(Boolean), [raw], _.toLower).join(' | '); } else { const r = new RegExp(`(^|\\s)${_.escapeRegExp(raw)}($|\\s)`, 'i'); searchItem.prompt = r.test(p) ? p.replace(r, ' ').trim() : (p ? `${p} | ${raw}` : raw); } toast.ok(`Updated "${searchItem.name}"`, 'danbooru', 1000); };
                 useInfiniteScroll(rightPanelRef, () => _.some(ratingFilters.value) && !isLoading.value && hasMorePages.value && gridRoutes.includes(route.name) && fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []), {distance: 1000});
                 provide('danbooruState', { posts: sortedPosts, isLoading, isLoadingMore: computed(() => isLoading.value && pageNum.value > 1), hasMorePages, statusMsg: computed(() => isLoading.value && !posts.value.length ? 'Searching...' : err.value ? `Error: ${err.value.message}` : !posts.value.length ? 'Search for images on Danbooru.' : `Showing ${posts.value.length} posts${hasMorePages.value ? ' (scroll for more)' : ''}`), hoveredImage, rightPanelRef, lastScrollPos, gridSize: toRef(danbooru.value, 'gridCols') });
                 provide('danbooruFolders', {folders: toRef(danbooru.value, 'folders'), isPostInFolder: (pid, fid) => foldersById.value[fid]?.postIds?.includes(pid), togglePostInFolder});
@@ -911,7 +909,7 @@ const TagCountBadge={
             setup() {
                 const {posts, isLoading, isLoadingMore, hasMorePages, statusMsg, hoveredImage, rightPanelRef, lastScrollPos, gridSize} = inject('danbooruState'), {folders} = inject('danbooruFolders');
                 const activeId = ref(null);
-                const isSingleView = computed(() => activeId.value !== null), currentImg = computed(() => activeId.value === null ? null : _.find(posts.value, {id: activeId.value}));
+                const isSingleView = computed(() => activeId.value !== null), currentImg = computed(() => activeId.value === null ? null : posts.value.find(p => p.id === activeId.value));
                 watch(posts, (nextPosts) => {
                     if (activeId.value !== null && !nextPosts.some(p => p.id === activeId.value)) activeId.value = null;
                 });
@@ -943,7 +941,7 @@ const TagCountBadge={
                 const displayNextPair = () => { const nextPair = displayQueue.shift(); Object.assign(currentImages, nextPair || emptyPair); if (nextPair) return actionStatusMsg.value = 'Ready for evaluation.'; const isFinished = !tagTest.value.isInfinite && totalTests.value > 0 && judgedPairsNum.value >= totalTests.value; if (isTestActive.value && isFinished && !pendingJobs.value) { isTestActive.value = false; actionStatusMsg.value = 'Testing complete!'; } else actionStatusMsg.value = isTestActive.value ? 'Waiting for next pair...' : (judgedPairsNum.value > 0 ? 'Testing complete!' : 'Ready to start testing'); };
                 const imgGenCallback = (err, {blob, context} = {}) => { if (err || context.sessionId !== currentSessionId.value) return err && (actionStatusMsg.value = `Error: ${err.message}`); generatedImageNum.value++; const {pair, imageKey} = context; pair[imageKey] = urlManager.create(blob); if (pair.imageA_url && pair.imageB_url) { const [itemA, itemB] = _.shuffle([{image: pair.imageA_url, tag: pair.tagA}, {image: pair.imageB_url, tag: pair.tagB}]); displayQueue.push({imageA: itemA.image, tagA: itemA.tag, imageB: itemB.image, tagB: itemB.tag}); if (!currentImages.imageA) displayNextPair(); } };
                 const buildAndAddReqs = () => {
-                    const {tagsToTest, isControl, iterations: iters, isInfinite, prompts: raw, unwantedContent: baseUc} = tagTest.value, tags = _.compact(tagsToTest.split('\n').map(l => l.trim())), prompts = raw.map(i => parsePrompt(i.val)).map(p => ({prompt: p.positive, uc: _.compact([p.negative, baseUc]).join(', ')})).filter(p => p.prompt);
+                    const {tagsToTest, isControl, iterations: iters, isInfinite, prompts: raw, unwantedContent: baseUc} = tagTest.value, tags = tagsToTest.split('\n').map(l => l.trim()).filter(Boolean), prompts = raw.map(i => parsePrompt(i.val)).map(p => ({prompt: p.positive, uc: [p.negative, baseUc].filter(Boolean).join(', ')})).filter(p => p.prompt);
                     if (tags.length < (isControl ? 1 : 2) || !prompts.length) return (actionStatusMsg.value = `Error: Missing resources.`) && (isTestActive.value = false);
                     const pairs = isControl ? tags.map(tag1 => ({tag1, isCtrl: true})) : tags.flatMap((tag1, i) => tags.slice(i + 1).map(tag2 => ({tag1, tag2})));
                     const reqs = _.flatMap(_.range(isInfinite ? 1 : iters), () => _.shuffle(pairs).flatMap(pair => { const {prompt, uc} = _.sample(prompts), seed = _.random(MAX_SEED), ctx = {}; return ['A', 'B'].map((lbl, i) => { const active = i ? (pair.tag2 || pair.tag1) : (pair.isCtrl ? null : pair.tag1); ctx[`tag${lbl}`] = active || 'Control'; return {source: 'tagTest', seed, genConfig: prepareGenConfig(genConfig.value), callback: imgGenCallback, onStatusUpdate: m => actionStatusMsg.value = m, prompt: active ? getTaggedString(prompt, active, false) : prompt, uc: active ? getTaggedString(uc, active, true) : uc, context: {pair: ctx, imageKey: `image${lbl}_url`, sessionId: currentSessionId.value}}; }); }));
@@ -964,109 +962,102 @@ const TagCountBadge={
             const t = v?._text || v?.parts?.find(p => p.text && !p.thought)?.text;
             return (t || msgs.find(m => m.role === 'user')?.text || '').substring(0, 60);
         };
-        const serializeConversation = async (messages) => {
+        const serializeMessage = async (msg) => {
             const imageStore = useImageStore();
-            const serializedMessages = await Promise.all(messages.map(async (msg) => {
-                if (msg.role === 'user') {
-                    const serializedImages = await Promise.all((msg.images || []).map(async (img) => {
-                        if (!img.imageId && img.data) {
-                            const ingested = await imageStore.ingestImage({data: img.data, mimeType: img.mimeType});
-                            img.imageId = ingested.imageId;
-                            if (img.mimeType !== _WP) {
-                                img.data = ingested.base64;
-                                img.mimeType = _WP;
-                            }
+            if (msg.role === 'user') {
+                const serializedImages = await Promise.all((msg.images || []).map(async (img) => {
+                    if (!img.imageId && img.data) {
+                        const ingested = await imageStore.ingestImage({data: img.data, mimeType: img.mimeType});
+                        img.imageId = ingested.imageId;
+                        if (img.mimeType !== _WP) {
+                            img.data = ingested.base64;
+                            img.mimeType = _WP;
                         }
-                        return { id: img.id, imageId: img.imageId, mimeType: _WP, name: img.name || '', hidden: !!img.hidden };
-                    }));
-                    return { id: msg.id, role: 'user', text: msg.text || '', images: serializedImages, hidden: !!msg.hidden };
-                }
-                if (msg.role === 'model') {
-                    const serializedVariants = await Promise.all((msg.variants || []).map(async (v) => {
-                        let inlineDataCount = 0;
-                        const serializedParts = await Promise.all((v.parts || []).map(async (part) => {
-                            if (part.inlineData) {
-                                let imageId = v._images?.[inlineDataCount]?.imageId;
-                                if (!imageId) {
-                                    const ingested = await imageStore.ingestImage({data: part.inlineData.data, mimeType: part.inlineData.mimeType});
-                                    imageId = ingested.imageId;
-                                    if (v._images?.[inlineDataCount]) v._images[inlineDataCount].imageId = imageId;
-                                }
-                                inlineDataCount++;
-                                const sPart = { _imageRef: imageId, _mimeType: _WP };
-                                if (part.thought) sPart.thought = true;
-                                if (part.thoughtSignature) sPart.thoughtSignature = part.thoughtSignature;
-                                if (part.text) sPart.text = part.text;
-                                return sPart;
+                    }
+                    return { id: img.id, imageId: img.imageId, mimeType: _WP, name: img.name || '', hidden: !!img.hidden };
+                }));
+                return { id: msg.id, role: 'user', text: msg.text || '', images: serializedImages, hidden: !!msg.hidden };
+            }
+            if (msg.role === 'model') {
+                const serializedVariants = await Promise.all((msg.variants || []).map(async (v) => {
+                    let inlineDataCount = 0;
+                    const serializedParts = await Promise.all((v.parts || []).map(async (part) => {
+                        if (part.inlineData) {
+                            let imageId = v._images?.[inlineDataCount]?.imageId;
+                            if (!imageId) {
+                                const ingested = await imageStore.ingestImage({data: part.inlineData.data, mimeType: part.inlineData.mimeType});
+                                imageId = ingested.imageId;
+                                if (v._images?.[inlineDataCount]) v._images[inlineDataCount].imageId = imageId;
                             }
-                            return { text: part.text || '', ...(part.thought ? { thought: true } : {}), ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}) };
-                        }));
-                        const serializedImages = (v._images || []).map(img => ({
-                            mimeType: img.mimeType || _WP,
-                            imageId: img.imageId || null
-                        }));
-                        return {
-                            id: v.id,
-                            parts: serializedParts,
-                            _text: v._text || '',
-                            _images: serializedImages,
-                            _imageSize: v._imageSize || '1K',
-                            _model: v._model || _FM,
-                            _flexInference: !!v._flexInference,
-                            _genTimeMs: v._genTimeMs || null,
-                            _usage: v._usage ? Object.assign({promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0}, v._usage.candidatesTokensDetails && {candidatesTokensDetails: v._usage.candidatesTokensDetails}, v._usage.thoughtsTokenCount && {thoughtsTokenCount: v._usage.thoughtsTokenCount}) : null,
-                            _error: v._error || null,
-                            _blockReason: v._blockReason || null,
-                            _isPromptBlock: !!v._isPromptBlock,
-                            timestamp: v.timestamp || null
-                        };
+                            inlineDataCount++;
+                            const sPart = { _imageRef: imageId, _mimeType: _WP };
+                            if (part.thought) sPart.thought = true;
+                            if (part.thoughtSignature) sPart.thoughtSignature = part.thoughtSignature;
+                            if (part.text) sPart.text = part.text;
+                            return sPart;
+                        }
+                        return { text: part.text || '', ...(part.thought ? { thought: true } : {}), ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}) };
                     }));
-                    return { id: msg.id, role: 'model', variants: serializedVariants, activeVariant: msg.activeVariant || 0, hidden: !!msg.hidden };
-                }
-                return { id: msg.id, role: msg.role, hidden: !!msg.hidden };
-            }));
-            return serializedMessages;
+                    const serializedImages = (v._images || []).map(img => ({
+                        mimeType: img.mimeType || _WP,
+                        imageId: img.imageId || null
+                    }));
+                    return {
+                        id: v.id,
+                        parts: serializedParts,
+                        _text: v._text || '',
+                        _images: serializedImages,
+                        _imageSize: v._imageSize || '1K',
+                        _model: v._model || _FM,
+                        _flexInference: !!v._flexInference,
+                        _genTimeMs: v._genTimeMs || null,
+                        _usage: v._usage ? { promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0, ...(v._usage.candidatesTokensDetails && { candidatesTokensDetails: v._usage.candidatesTokensDetails }), ...(v._usage.thoughtsTokenCount && { thoughtsTokenCount: v._usage.thoughtsTokenCount }) } : null,
+                        _error: v._error || null,
+                        _blockReason: v._blockReason || null,
+                        _isPromptBlock: !!v._isPromptBlock,
+                        timestamp: v.timestamp || null
+                    };
+                }));
+                return { id: msg.id, role: 'model', variants: serializedVariants, activeVariant: msg.activeVariant || 0, hidden: !!msg.hidden };
+            }
+            return { id: msg.id, role: msg.role, hidden: !!msg.hidden };
         };
-        const deserializeConversation = async (serializedData) => {
-            if (!serializedData) return [];
-            const _imgCache = new Map();
-            const loadCached = (id) => { if (!_imgCache.has(id)) _imgCache.set(id, loadImageAsBase64(id)); return _imgCache.get(id); };
-            const messages = await Promise.all((serializedData.messages || []).map(async (msg) => {
-                const { images: rawImages, variants: rawVariants, ...dMsg } = msg;
-                if (rawImages?.length) {
-                    dMsg.images = await Promise.all(rawImages.map(async (img) => {
-                        const dImg = { ...img };
-                        if (dImg.imageId) dImg.data = await loadCached(dImg.imageId);
-                        return dImg;
+        const deserializeMessage = async (serializedMsg, imgCache) => {
+            if (!serializedMsg) return null;
+            const loadCached = (id) => { if (!imgCache.has(id)) imgCache.set(id, loadImageAsBase64(id)); return imgCache.get(id); };
+            const { images: rawImages, variants: rawVariants, ...dMsg } = serializedMsg;
+            if (rawImages?.length) {
+                dMsg.images = await Promise.all(rawImages.map(async (img) => {
+                    const dImg = { ...img };
+                    if (dImg.imageId) dImg.data = await loadCached(dImg.imageId);
+                    return dImg;
+                }));
+            }
+            if (rawVariants?.length) {
+                dMsg.variants = await Promise.all(rawVariants.map(async (v) => {
+                    const { parts: rawParts, _images: rawVImages, ...dV } = v;
+                    dV.parts = await Promise.all((rawParts || []).map(async (part) => {
+                        if (part._imageRef) {
+                            const imgB64 = await loadCached(part._imageRef);
+                            if (!imgB64) console.warn(`Missing image data for ${part._imageRef}`);
+                            const { _imageRef, _mimeType, _thoughtSignature, thoughtSignature, ...base } = part;
+                            if (_thoughtSignature || thoughtSignature) base.thoughtSignature = _thoughtSignature || thoughtSignature;
+                            if (imgB64) base.inlineData = { data: imgB64, mimeType: _mimeType || _WP };
+                            return base;
+                        }
+                        return part;
                     }));
-                }
-                if (rawVariants?.length) {
-                    dMsg.variants = await Promise.all(rawVariants.map(async (v) => {
-                        const { parts: rawParts, _images: rawVImages, ...dV } = v;
-                        dV.parts = await Promise.all((rawParts || []).map(async (part) => {
-                            if (part._imageRef) {
-                                const imgB64 = await loadCached(part._imageRef);
-                                if (!imgB64) console.warn(`Missing image data for ${part._imageRef}`);
-                                const { _imageRef, _mimeType, _thoughtSignature, thoughtSignature, ...base } = part;
-                                if (_thoughtSignature || thoughtSignature) base.thoughtSignature = _thoughtSignature || thoughtSignature;
-                                if (imgB64) base.inlineData = { data: imgB64, mimeType: _mimeType || _WP };
-                                return base;
-                            }
-                            return part;
-                        }));
-                        dV._images = await Promise.all((rawVImages || []).map(async (img) => {
-                            if (img.imageId) return { ...img, data: await loadCached(img.imageId) };
-                            return img;
-                        }));
-                        dV._model = v._model || _FM;
-                        dV._flexInference = !!v._flexInference;
-                        dV._genTimeMs = v._genTimeMs || null;
-                        return dV;
+                    dV._images = await Promise.all((rawVImages || []).map(async (img) => {
+                        if (img.imageId) return { ...img, data: await loadCached(img.imageId) };
+                        return img;
                     }));
-                }
-                return dMsg;
-            }));
-            return messages;
+                    dV._model = v._model || _FM;
+                    dV._flexInference = !!v._flexInference;
+                    dV._genTimeMs = v._genTimeMs || null;
+                    return dV;
+                }));
+            }
+            return dMsg;
         };
         const _BLOCK_REASONS = new Set('SAFETY,IMAGE_SAFETY,IMAGE_PROHIBITED_CONTENT,PROHIBITED_CONTENT,RECITATION,IMAGE_RECITATION,OTHER,IMAGE_OTHER,NO_IMAGE,BLOCKLIST,SPII'.split(','));
         const _TERMINAL_REASONS = new Set(['LANGUAGE','MODEL_ARMOR']);
@@ -1090,8 +1081,8 @@ const TagCountBadge={
             const generatingVarIdx = computed(() => activeConvo.value?.generatingVarIdx ?? null);
             const isHydrating = computed(() => !!activeConvo.value?.isHydrating);
             const _apiBase = (model) => `https://aiplatform.googleapis.com/v1/publishers/google/models/${model || _FM}`;
-            const _findMsg = (convo, id) => _.find(convo?.messages, {id});
-            const _findMsgIdx = (convo, id) => _.findIndex(convo?.messages, {id});
+            const _findMsg = (convo, id) => convo?.messages?.find(m => m.id === id);
+            const _findMsgIdx = (convo, id) => convo?.messages?.findIndex(m => m.id === id) ?? -1;
             const isHiddenFromModel = (msgId) => !!_findMsg(activeConvo.value, msgId)?.hidden;
             const toggleHiddenFromModel = (msgId) => {
                 const msg = _findMsg(activeConvo.value, msgId);
@@ -1220,12 +1211,32 @@ const TagCountBadge={
                 setVarError(v, err.message || 'Unknown error');
                 toast.err(err.message || 'Generation failed'); return false;
             };
-            const _saveConvoDirect = async (convo) => {
+            const _dirtyMessages = new Map();
+            const _markMsgDirty = (convoId, msgId) => (_dirtyMessages.get(convoId) ?? _dirtyMessages.set(convoId, new Set()).get(convoId)).add(msgId);
+            const _saveConvoDirect = async (convo, forceMsgIds) => {
                 if (!convo || convo.isTemp || !convo.messages.length) return;
                 try {
-                    await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params);
+                    const dirtyMsgSet = forceMsgIds ? new Set(forceMsgIds) : (_dirtyMessages.get(convo.id) || new Set());
+                    const msgsToWrite = dirtyMsgSet.size ? convo.messages.filter(m => dirtyMsgSet.has(m.id)) : convo.messages;
+                    const serialized = await Promise.all(msgsToWrite.map(m => serializeMessage(m)));
+                    const now = Date.now();
+                    const serializedById = new Map();
+                    await Promise.all(serialized.map(s => (serializedById.set(s.id, s), _writeMsg(convo.id, s.id, s))));
+                    const prevManifest = await _readManifest(convo.id);
+                    const prevDescById = new Map((prevManifest?.messages || []).map(d => [d.msgId, d]));
+                    const currentMsgIds = new Set(convo.messages.map(m => m.id));
+                    const allDescriptors = convo.messages.map(m => {
+                        const s = serializedById.get(m.id);
+                        if (s) return { msgId: s.id, imageIds: [..._collectMsgImageIds(s)], updatedAt: now };
+                        const prev = prevDescById.get(m.id);
+                        return prev || { msgId: m.id, imageIds: [], updatedAt: now };
+                    });
+                    const orphanedMsgIds = [...prevDescById.keys()].filter(id => !currentMsgIds.has(id));
+                    if (orphanedMsgIds.length) await Promise.all(orphanedMsgIds.map(mid => opfs.remove(_msgPath(convo.id, mid))));
+                    await _writeManifest(convo.id, convo.title, now, convo.params, allDescriptors);
+                    _dirtyMessages.get(convo.id)?.clear();
                     const meta = _findMeta(convo.id);
-                    if (meta) { meta.timestamp = Date.now(); }
+                    if (meta) { meta.timestamp = now; }
                 } catch (e) { console.warn('Auto-save failed:', e); }
             };
             const _pruneBananaThinkingStates = (msgIds) => {
@@ -1249,7 +1260,10 @@ const TagCountBadge={
                     catch (err) { if (!await _handleStreamError(err, v, retryCount, () => { modelMsg.variants.push(createVariant(convo.params)); genVarIdx = modelMsg.variants.length - 1; convo.generatingVarIdx = genVarIdx; modelMsg.activeVariant = genVarIdx; }, convo)) break; }
                 }
                 convo.generating = false; convo.generatingMsgId = null; convo.generatingVarIdx = null; convo.abortCtrl = null;
-                if (!convo.isTemp) _saveConvoDirect(convo);
+                if (!convo.isTemp) {
+                    _markMsgDirty(convo.id, modelMsg.id);
+                    _saveConvoDirect(convo, [modelMsg.id]);
+                }
                 const genVariant = modelMsg.variants[genVarIdx];
                 const didSucceed = genVariant?._images?.length > 0;
                 convo._lastGenStatus = didSucceed ? 'success' : 'error';
@@ -1271,6 +1285,7 @@ const TagCountBadge={
                 if (convo.generating) return;
                 const userMsg = reactive({id: uid(), role: 'user', images: imgs.map(i => ({id: uid(), data: i.data, mimeType: i.mimeType, name: i.name, hidden: false})), text: text || '', hidden: false, timestamp: Date.now()});
                 convo.messages.push(userMsg);
+                _markMsgDirty(convo.id, userMsg.id);
                 const modelMsg = createModelMsg(convo.params);
                 convo.messages.push(modelMsg);
                 const contents = _getContents(convo.messages, convo.messages.indexOf(modelMsg));
@@ -1336,7 +1351,10 @@ const TagCountBadge={
                 convo.title = actualTitle; convo.isTemp = false;
                 convo.timestamp = Date.now();
                 const meta = { id: convo.id, title: actualTitle, timestamp: convo.timestamp };
-                try { await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params); }
+                try {
+                    const allMsgIds = convo.messages.map(m => m.id);
+                    await _saveConvoDirect(convo, allMsgIds);
+                }
                 catch (e) { toast.err('Failed to save conversation: ' + e.message); return; }
                 const list = savedConversations.value;
                 const idx = list.findIndex(x => x.id === convo.id);
@@ -1349,42 +1367,52 @@ const TagCountBadge={
             };
             const _fetchConvoFromR2 = async (convoId) => {
                 try {
-                    const res = await r2Client.r2Fetch('GET', `conversations/${convoId}`);
-                    if (!res.ok) return null;
-                    const data = JSON.parse(await res.text());
-                    const hTitle = res.headers.get('X-Convo-Title');
-                    if (hTitle && !data.title) try { data.title = decodeURIComponent(hTitle); } catch { data.title = hTitle; }
-                    const hTs = res.headers.get('X-Convo-Timestamp');
-                    if (hTs && data.timestamp == null) { const n = Number(hTs); if (Number.isFinite(n)) data.timestamp = n; }
-                    return data;
-                } catch { return null; }
+                    const manifestRes = await r2Client.r2Fetch('GET', `conversations/${convoId}/manifest`);
+                    if (!manifestRes.ok) return null;
+                    const manifest = await manifestRes.json();
+                    const hTitle = manifestRes.headers.get('X-Convo-Title');
+                    if (hTitle && !manifest.title) try { manifest.title = decodeURIComponent(hTitle); } catch { manifest.title = hTitle; }
+                    const hTs = manifestRes.headers.get('X-Convo-Timestamp');
+                    if (hTs && manifest.timestamp == null) { const n = Number(hTs); if (Number.isFinite(n)) manifest.timestamp = n; }
+                    const msgDescriptors = manifest.messages || [];
+                    const msgs = new Array(msgDescriptors.length);
+                    const missing = [];
+                    await _pool(msgDescriptors.map((desc, i) => ({ desc, i })), async ({ desc, i }) => {
+                        try {
+                            const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/messages/${desc.msgId}`);
+                            if (!res.ok) { missing.push(desc.msgId); return; }
+                            msgs[i] = await res.json();
+                        } catch { missing.push(desc.msgId); }
+                    });
+                    if (missing.length) throw new Error(`Missing message(s): ${missing.join(', ')}`);
+                    return { manifest, messages: msgs };
+                } catch (e) { console.warn('_fetchConvoFromR2:', e); return null; }
             };
-            const _pullMissingImagesFromR2 = async (convoData, convoId) => {
-                const imageIds = _collectImageIds(convoData);
+            const _pullMissingImagesFromR2 = async (manifest, convoId) => {
+                const imageIds = _collectImageIdsFromManifest(manifest);
                 if (!imageIds.size) return [];
-                const idArr = [...imageIds];
                 const localKeys = new Set(await opfs.keys());
-                const missing = idArr.filter(id => !localKeys.has(id));
-                if (!missing.length) return idArr;
+                const missing = [...imageIds].filter(id => !localKeys.has(id));
+                if (!missing.length) return [...imageIds];
                 try {
                     const pulled = [];
                     await _pool(missing, async (imgId) => {
                         try {
                             const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/images/${imgId}`);
                             if (res?.status !== 404) {
-                                const data = new Uint8Array(await res.arrayBuffer());
-                                await opfs.write(imgId, data);
+                                await opfs.write(imgId, new Uint8Array(await res.arrayBuffer()));
                                 pulled.push(imgId);
                             }
                         } catch {}
                     });
                     if (pulled.length) {
-                        _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...new Set([...(_syncedR2Images.value[convoId]||[]),...pulled])] };
+                        const existing = _syncedR2Images.value[convoId] || [];
+                        _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...new Set([...existing, ...pulled])] };
                     }
                 } catch (e) {
                     console.warn('Failed to pull images from R2:', e);
                 }
-                return idArr;
+                return [...imageIds];
             };
             const loadConversation = async (id) => {
                 if (conversationMap.has(id)) { activeConvoId.value = id; return; }
@@ -1395,39 +1423,40 @@ const TagCountBadge={
                 conversationMap.set(id, convo);
                 activeConvoId.value = id;
                 try {
-                    let convoData = null;
+                    let manifest = null, serializedMessages = null;
                     try {
-                        const json = await opfs.readText(_convoPath(id));
-                        if (json) convoData = JSON.parse(json);
+                        manifest = await _readManifest(id);
+                        if (manifest?.messages?.length) {
+                            const msgs = await Promise.all(manifest.messages.map(d => _readMsg(id, d.msgId)));
+                            if (msgs.every(Boolean)) serializedMessages = msgs; else manifest = null;
+                        }
                     } catch {}
-                    if (!convoData && cloudConversations.value[id]) {
-                        convoData = await _fetchConvoFromR2(id);
-                        if (convoData) {
-                            try { await _writeConvo(id, convoData.messages, convoData.params); } catch {}
-                            if (convoData.title) {
-                                convo.title = convoData.title;
-                                meta.title = convoData.title;
-                            }
-                            if (convoData.timestamp != null) {
-                                const ts = +convoData.timestamp;
-                                if (Number.isFinite(ts)) {
-                                    convo.timestamp = ts;
-                                    meta.timestamp = ts;
-                                }
-                            }
+                    if (!manifest && cloudConversations.value[id]) {
+                        const r2Data = await _fetchConvoFromR2(id);
+                        if (r2Data) {
+                            manifest = r2Data.manifest;
+                            serializedMessages = r2Data.messages;
+                            try {
+                                await Promise.all(serializedMessages.map(m => _writeMsg(id, m.id, m)));
+                                await _writeManifest(id, manifest.title, manifest.timestamp, manifest.params, manifest.messages || []);
+                            } catch {}
+                            if (manifest.title) { convo.title = manifest.title; meta.title = manifest.title; }
+                            const ts = +manifest.timestamp;
+                            if (Number.isFinite(ts)) { convo.timestamp = ts; meta.timestamp = ts; }
                         }
                     }
-                    if (!convoData) {
+                    if (!manifest || !serializedMessages) {
                         toast.warn('Conversation data not found on this device.');
                         conversationMap.delete(id);
                         if (activeConvoId.value === id) { activeConvoId.value = [...conversationMap.keys()].at(-1) ?? newChat(); }
                         return;
                     }
                     if (cloudConversations.value[id]) {
-                        await _pullMissingImagesFromR2(convoData, id);
+                        await _pullMissingImagesFromR2(manifest, id);
                     }
-                    if (convoData.params) Object.assign(convo.params, convoData.params);
-                    convo.messages = await deserializeConversation(convoData);
+                    if (manifest.params) Object.assign(convo.params, manifest.params);
+                    const _imgCache = new Map();
+                    convo.messages = await Promise.all(serializedMessages.map(m => deserializeMessage(m, _imgCache)));
                 } finally { convo.isHydrating = false; }
             };
             const deleteConversation = async (id) => {
@@ -1494,53 +1523,61 @@ const TagCountBadge={
                 }
             }, 1500);
             watch(() => { const c = activeConvo.value; return c && !c.isTemp && !c.generating ? c.messages : null; }, (msgs) => {
-                if (msgs) _autoSave();
+                if (msgs) {
+                    // Deep watcher can't pinpoint which message changed; mark all dirty.
+                    // Generation path already marks specific messages via _markMsgDirty.
+                    const convo = activeConvo.value;
+                    if (convo) convo.messages.forEach(m => _markMsgDirty(convo.id, m.id));
+                    _autoSave();
+                }
             }, { deep: true });
             const r2Client = useR2Client();
             const _pushConvoR2Locks = new Map();
-            const _pushConvoToR2 = (convoId, convoJson, imageIds, meta) => {
+            const _pushConvoToR2 = (convoId, manifestJson, msgFiles, imageIds, meta) => {
                 const prev = _pushConvoR2Locks.get(convoId) || Promise.resolve();
-                const next = prev.then(() => _doPushConvoToR2(convoId, convoJson, imageIds, meta));
+                const next = prev.then(() => _doPushConvoToR2(convoId, manifestJson, msgFiles, imageIds, meta));
                 const lock = next.catch(() => {}).finally(() => {
                     if (_pushConvoR2Locks.get(convoId) === lock) _pushConvoR2Locks.delete(convoId);
                 });
                 _pushConvoR2Locks.set(convoId, lock);
                 return next;
             };
-            const _doPushConvoToR2 = async (convoId, convoJson, imageIds, meta) => {
+            const _doPushConvoToR2 = async (convoId, manifestJson, msgFiles, imageIds, meta) => {
                 const customHeaders = {};
                 if (meta?.title) customHeaders['X-Convo-Title'] = encodeURIComponent(meta.title);
                 if (meta?.timestamp) customHeaders['X-Convo-Timestamp'] = String(meta.timestamp);
-                await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json', customHeaders });
-                const syncedArr = _syncedR2Images.value[convoId] || [];
-                const syncedSet = new Set(syncedArr);
-                const newImages = [...imageIds].filter(id => !syncedSet.has(id));
+                await r2Client.r2Fetch('PUT', `conversations/${convoId}/manifest`, manifestJson, { contentType: 'application/json', customHeaders });
+                await _pool(msgFiles, ({ msgId, data }) =>
+                    r2Client.r2Fetch('PUT', `conversations/${convoId}/messages/${msgId}`, data, { contentType: 'application/json' }).catch(() => {}));
+                const synced = new Set(_syncedR2Images.value[convoId] || []);
                 const uploaded = new Set();
-                await _pool(newImages, async (imgId) => {
+                await _pool([...imageIds].filter(id => !synced.has(id)), async (imgId) => {
                     try {
-                        const imgData = await opfs.read(imgId);
-                        if (imgData) {
-                            await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
-                            uploaded.add(imgId);
-                        }
+                        const d = await opfs.read(imgId);
+                        if (d) { await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, d, { contentType: 'image/webp' }); uploaded.add(imgId); }
                     } catch {}
                 });
-                const orphaned = syncedArr.filter(id => !imageIds.has(id));
-                await _pool(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}));
-                // Only persist IDs that are confirmed in R2: previously synced (still current) + newly uploaded
-                const nowSynced = [...imageIds].filter(id => syncedSet.has(id) || uploaded.has(id));
-                _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: nowSynced };
+                await _pool([...synced].filter(id => !imageIds.has(id)), id => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${id}`).catch(() => {}));
+                _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...imageIds].filter(id => synced.has(id) || uploaded.has(id)) };
             };
             const _syncConversationToR2 = async (id) => {
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
-                const raw = await opfs.read(_convoPath(id));
-                if (!raw) throw new Error('Conversation data not found locally.');
-                let imageIds;
-                try { imageIds = _collectImageIds(JSON.parse(new TextDecoder().decode(raw))); }
-                catch { throw new Error('Conversation data corrupted locally.'); }
+                const manifest = await _readManifest(id);
+                if (!manifest) throw new Error('Conversation data not found locally.');
+                const imageIds = _collectImageIdsFromManifest(manifest);
+                const descriptors = manifest.messages || [];
+                const msgFiles = [];
+                const missingMsgIds = [];
+                await _pool(descriptors, async (desc) => {
+                    const raw = await opfs.read(_msgPath(id, desc.msgId));
+                    if (raw) msgFiles.push({ msgId: desc.msgId, data: raw });
+                    else missingMsgIds.push(desc.msgId);
+                });
+                if (missingMsgIds.length) throw new Error(`Missing local message file(s): ${missingMsgIds.join(', ')}`);
                 const meta = _findMeta(id);
-                const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
-                await _pushConvoToR2(id, raw, imageIds, metaPick);
+                const metaPick = meta && { title: meta.title, timestamp: meta.timestamp };
+                const manifestJson = await opfs.read(_manifestPath(id));
+                await _pushConvoToR2(id, manifestJson, msgFiles, imageIds, metaPick);
             };
             let _r2SyncInProgress = false;
             let _r2SyncPromise = null;
@@ -1641,8 +1678,8 @@ const TagCountBadge={
                 const variant = computed(() => props.msg.variants?.[props.msg.activeVariant] ?? props.msg.variants?.[0] ?? null);
                 const isAwaitingContent = computed(() => isGen.value && !variant.value?._text && !variant.value?._error && !variant.value?._images?.length);
                 const isEditing = computed(() => props.editState?.msgId === props.msg.id);
-                const toggleHideImage = (imgId) => { const img = _.find(props.msg.images, {id:imgId}); if (img) { img.hidden = !img.hidden; toast.q(img.hidden ? 'Image hidden from model' : 'Image shown to model', 1500); } };
-                const deleteImage = (imgId) => { if (!props.msg.images) return; const i = _.findIndex(props.msg.images, {id:imgId}); if (i !== -1) props.msg.images.splice(i, 1); };
+                const toggleHideImage = (imgId) => { const img = props.msg.images?.find(i => i.id === imgId); if (img) { img.hidden = !img.hidden; toast.q(img.hidden ? 'Image hidden from model' : 'Image shown to model', 1500); } };
+                const deleteImage = (imgId) => { if (!props.msg.images) return; const i = props.msg.images.findIndex(x => x.id === imgId); if (i !== -1) props.msg.images.splice(i, 1); };
                 const navigateVariant = (dir) => {
                     const m = props.msg;
                     if (!props.filterNoImage) { m.activeVariant = Math.max(0, Math.min(m.variants.length - 1, m.activeVariant + dir)); return; }
@@ -1657,7 +1694,7 @@ const TagCountBadge={
                     const es = props.editState; if (!es) return;
                     const t = es.text.trim();
                     if (!t && !es.images.length) { toast.err('Message cannot be empty'); return; }
-                    await Promise.all(_.compact(es.images.map(i => i._ingestPromise)));
+                    await Promise.all(es.images.map(i => i._ingestPromise).filter(Boolean));
                     props.msg.text = t; props.msg.images = es.images;
                     emit('update:editState', null);
                     toast.q('Message edited');
@@ -1744,7 +1781,7 @@ const TagCountBadge={
                     if (!text && !pendingImages.value.length) return;
                     if (promptInputEl.value) { promptInputEl.value.value = ''; promptInputEl.value.style.height = '42px'; }
                     const imgs = [...pendingImages.value]; pendingImages.value = [];
-                    await Promise.all(_.compact(imgs.map(i => i._ingestPromise)));
+                    await Promise.all(imgs.map(i => i._ingestPromise).filter(Boolean));
                     await sendMessage(text, imgs, scrollToBottom);
                 };
                 onKeyStroke('Escape', () => { if (lightboxSrc.value) lightboxSrc.value = null; });
@@ -1896,7 +1933,7 @@ const TagCountBadge={
             template:`<div class="flex h-screen animated-bg animate-gradientShift"><nav class="z-50 p-2 glass border-r-0 flex flex-col"><ul class="menu bg-transparent rounded-box p-0 space-y-2"><li v-for="item in navItems" :key="item.path"><nav-link :to="item.path" :icon="item.icon" :label="item.label" :notification="notifications[item.source]"></nav-link></li></ul><ul class="menu bg-transparent rounded-box p-0 mt-auto pt-2 border-t border-white/10"><li><div class="indicator p-0 flex-center w-14 h-14"><span v-if="syncStatus === 'error'" class="indicator-item badge badge-error badge-xs">!</span><nav-link to="/settings" icon="settings"></nav-link></div></li></ul></nav><main class="flex-1 overflow-hidden"><router-view v-slot="{Component}"><keep-alive><component :is="Component" /></keep-alive></router-view></main><toast-container></toast-container></div>`
         };
         const app = createApp(App);
-        _.forOwn({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, ToggleBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, HoverCard, ImagePreviewCard, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ToastContainer, FolderDropdown, InlineEdit, NavLink, HiddenBadge, SpinIcon, SyncBadge, ChatMessage, ConvoListItem, NanoBanana}, (c, n) => app.component(n, c));
+        Object.entries({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, ToggleBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, HoverCard, ImagePreviewCard, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ToastContainer, FolderDropdown, InlineEdit, NavLink, HiddenBadge, SpinIcon, SyncBadge, ChatMessage, ConvoListItem, NanoBanana}).forEach(([n, c]) => app.component(n, c));
         app.use(router);
 app.mount('#app');
 window.__VUE_APP_MOUNTED__ = true;</script>
