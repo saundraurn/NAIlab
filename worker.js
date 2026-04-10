@@ -130,7 +130,7 @@ async function handleR2(request, env, url) {
         request.body,
         putOptions
       );
-      // Update conversation index
+      // Update conversation index (last-write-wins; single-user app, so concurrent writes are acceptable)
       const index = await readIndex(env);
       let title = 'Cloud Chat';
       if (titleHeader) { try { title = decodeURIComponent(titleHeader); } catch { title = titleHeader; } }
@@ -152,7 +152,7 @@ async function handleR2(request, env, url) {
         if (keys.length) await env.BUCKET.delete(keys);
         cursor = list.truncated ? list.cursor : null;
       } while (cursor);
-      // Remove from conversation index
+      // Remove from conversation index (last-write-wins; single-user app, so concurrent writes are acceptable)
       const index = await readIndex(env);
       const filtered = index.filter(e => e.id !== convoId);
       if (filtered.length !== index.length) await writeIndex(env, filtered);

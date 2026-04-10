@@ -141,6 +141,7 @@
                 write: async (n, d) => { const w = await (await gh(n, {create:true})).createWritable(); await w.write(d); await w.close(); },
                 read: async (n) => { try { return new Uint8Array(await (await (await gh(n)).getFile()).arrayBuffer()); } catch { return null; } },
                 readText: async (n) => { try { return await (await (await gh(n)).getFile()).text(); } catch { return null; } },
+                has: async (n) => { try { await gh(n); return true; } catch { return false; } },
                 remove: async (n) => { try { await (await r()).removeEntry(n); } catch {} },
                 keys: async () => { const d = await r(), a = []; for await (const k of d.keys()) a.push(k); return a; }
             };
@@ -1361,8 +1362,8 @@ const TagCountBadge={
                 const imageIds = _collectImageIds(convoData);
                 if (!imageIds.size) return [];
                 const idArr = [...imageIds];
-                const existingKeys = new Set(await opfs.keys());
-                const missing = idArr.filter(id => !existingKeys.has(id));
+                const exists = await Promise.all(idArr.map(id => opfs.has(id)));
+                const missing = idArr.filter((_, i) => !exists[i]);
                 if (!missing.length) return idArr;
                 try {
                     const pulled = [];
@@ -1514,15 +1515,21 @@ const TagCountBadge={
                 const syncedArr = _syncedR2Images.value[convoId] || [];
                 const syncedSet = new Set(syncedArr);
                 const newImages = [...imageIds].filter(id => !syncedSet.has(id));
+                const uploaded = new Set();
                 await _batch5(newImages, async (imgId) => {
                     try {
                         const imgData = await opfs.read(imgId);
-                        if (imgData) await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
+                        if (imgData) {
+                            await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
+                            uploaded.add(imgId);
+                        }
                     } catch {}
                 });
                 const orphaned = syncedArr.filter(id => !imageIds.has(id));
                 await _batch5(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}));
-                _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...imageIds] };
+                // Only persist IDs that are confirmed in R2: previously synced (still current) + newly uploaded
+                const nowSynced = [...imageIds].filter(id => syncedSet.has(id) || uploaded.has(id));
+                _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: nowSynced };
             };
             const _syncConversationToR2 = async (id) => {
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
