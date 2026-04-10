@@ -22,6 +22,57 @@ function corsResponse(body, status = 200, extra = {}) {
   return new Response(body, { status, headers: { ...CORS_HEADERS, ...extra } });
 }
 
+// ── Conversation index helpers ──────────────────────────────────────────────
+async function readIndex(env) {
+  try {
+    const obj = await env.BUCKET.get('conversations/index.json');
+    if (obj) {
+      const data = await obj.json();
+      if (Array.isArray(data)) return data;
+    }
+  } catch {}
+  // Rebuild from listing + head when index is missing or corrupt
+  const ids = [];
+  let cursor;
+  do {
+    const list = await env.BUCKET.list({
+      prefix: 'conversations/',
+      delimiter: '/',
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const prefix of list.delimitedPrefixes || []) {
+      const id = prefix.replace('conversations/', '').replace(/\/$/, '');
+      if (id) ids.push(id);
+    }
+    cursor = list.truncated ? list.cursor : null;
+  } while (cursor);
+  const BATCH_SIZE = 50;
+  const convos = [];
+  for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+    const batch = ids.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(batch.map(async (id) => {
+      try {
+        const head = await env.BUCKET.head(`conversations/${id}/conversation.json`);
+        if (!head) return null;
+        const meta = head.customMetadata || {};
+        let title = 'Cloud Chat';
+        if (meta.title) { try { title = decodeURIComponent(meta.title); } catch { title = meta.title; } }
+        const ts = Number(meta.timestamp);
+        return { id, title, timestamp: Number.isFinite(ts) ? ts : Date.now() };
+      } catch { return null; }
+    }));
+    convos.push(...results.filter(Boolean));
+  }
+  await writeIndex(env, convos);
+  return convos;
+}
+
+async function writeIndex(env, index) {
+  await env.BUCKET.put('conversations/index.json', JSON.stringify(index), {
+    httpMetadata: { contentType: 'application/json' },
+  });
+}
+
 // ── R2 Storage API ─────────────────────────────────────────────────────────
 async function handleR2(request, env, url) {
   const path = url.pathname.substring(4); // strip /r2/
@@ -31,8 +82,13 @@ async function handleR2(request, env, url) {
     if (request.method === 'GET') {
       const obj = await env.BUCKET.get('config.json');
       if (!obj) return corsJson({});
+      const etag = obj.httpEtag;
+      const ifNoneMatch = request.headers.get('If-None-Match');
+      if (etag && ifNoneMatch && etag === ifNoneMatch) {
+        return new Response(null, { status: 304, headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS } });
+      }
       const headers = { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'Content-Type': 'application/json' };
-      if (obj.httpEtag) headers['ETag'] = obj.httpEtag;
+      if (etag) headers['ETag'] = etag;
       return new Response(obj.body, { headers });
     }
     if (request.method === 'PUT') {
@@ -43,42 +99,9 @@ async function handleR2(request, env, url) {
     }
   }
 
-  // ── Conversations list ───────────────────────────────────────────────────
+  // ── Conversations list (reads from index) ────────────────────────────────
   if (path === 'conversations' && request.method === 'GET') {
-    const ids = [];
-    let cursor;
-    do {
-      const list = await env.BUCKET.list({
-        prefix: 'conversations/',
-        delimiter: '/',
-        ...(cursor ? { cursor } : {}),
-      });
-      for (const prefix of list.delimitedPrefixes || []) {
-        const id = prefix.replace('conversations/', '').replace(/\/$/, '');
-        if (id) ids.push(id);
-      }
-      cursor = list.truncated ? list.cursor : null;
-    } while (cursor);
-    // Fetch lightweight metadata for each conversation via head() in batches
-    const BATCH_SIZE = 50;
-    const convos = [];
-    for (let i = 0; i < ids.length; i += BATCH_SIZE) {
-      const batch = ids.slice(i, i + BATCH_SIZE);
-      const results = await Promise.all(batch.map(async (id) => {
-        try {
-          const head = await env.BUCKET.head(`conversations/${id}/conversation.json`);
-          if (!head) return null; // no conversation.json — skip ghost prefix
-          const meta = head.customMetadata || {};
-          let title = 'Cloud Chat';
-          if (meta.title) { try { title = decodeURIComponent(meta.title); } catch { title = meta.title; } }
-          return { id, title, timestamp: Number(meta.timestamp) || Date.now() };
-        } catch {
-          return null;
-        }
-      }));
-      convos.push(...results.filter(Boolean));
-    }
-    return corsJson(convos);
+    return corsJson(await readIndex(env));
   }
 
   // ── Single conversation (JSON) ───────────────────────────────────────────
@@ -93,13 +116,13 @@ async function handleR2(request, env, url) {
       });
     }
     if (request.method === 'PUT') {
-      const title = request.headers.get('X-Convo-Title');
-      const timestamp = request.headers.get('X-Convo-Timestamp');
+      const titleHeader = request.headers.get('X-Convo-Title');
+      const timestampHeader = request.headers.get('X-Convo-Timestamp');
       const putOptions = { httpMetadata: { contentType: 'application/json' } };
-      if (title || timestamp) {
+      if (titleHeader || timestampHeader) {
         const customMetadata = {};
-        if (title) customMetadata.title = title;
-        if (timestamp) customMetadata.timestamp = timestamp;
+        if (titleHeader) customMetadata.title = titleHeader;
+        if (timestampHeader) customMetadata.timestamp = timestampHeader;
         putOptions.customMetadata = customMetadata;
       }
       await env.BUCKET.put(
@@ -107,6 +130,15 @@ async function handleR2(request, env, url) {
         request.body,
         putOptions
       );
+      // Update conversation index (last-write-wins; single-user app, so concurrent writes are acceptable)
+      const index = await readIndex(env);
+      let title = 'Cloud Chat';
+      if (titleHeader) { try { title = decodeURIComponent(titleHeader); } catch { title = titleHeader; } }
+      const ts = Number(timestampHeader);
+      const entry = { id: convoId, title, timestamp: Number.isFinite(ts) ? ts : Date.now() };
+      const idx = index.findIndex(e => e.id === convoId);
+      if (idx !== -1) index[idx] = entry; else index.push(entry);
+      await writeIndex(env, index);
       return corsResponse('OK');
     }
     if (request.method === 'DELETE') {
@@ -120,6 +152,10 @@ async function handleR2(request, env, url) {
         if (keys.length) await env.BUCKET.delete(keys);
         cursor = list.truncated ? list.cursor : null;
       } while (cursor);
+      // Remove from conversation index (last-write-wins; single-user app, so concurrent writes are acceptable)
+      const index = await readIndex(env);
+      const filtered = index.filter(e => e.id !== convoId);
+      if (filtered.length !== index.length) await writeIndex(env, filtered);
       return corsResponse('OK');
     }
   }
@@ -146,26 +182,6 @@ async function handleR2(request, env, url) {
       await env.BUCKET.delete(key);
       return corsResponse('OK');
     }
-  }
-
-  // ── List images for a conversation ───────────────────────────────────────
-  const listImgMatch = path.match(/^conversations\/([^/]+)\/images$/);
-  if (listImgMatch && request.method === 'GET') {
-    const convoId = listImgMatch[1];
-    const images = [];
-    let cursor;
-    do {
-      const list = await env.BUCKET.list({
-        prefix: `conversations/${convoId}/img_`,
-        ...(cursor ? { cursor } : {}),
-      });
-      for (const obj of list.objects) {
-        const name = obj.key.split('/').pop();
-        if (name) images.push(name);
-      }
-      cursor = list.truncated ? list.cursor : null;
-    } while (cursor);
-    return corsJson(images);
   }
 
   // ── Storage usage ──────────────────────────────────────────────────────────
