@@ -238,21 +238,28 @@
             if (!/^https?:\/\//i.test(proxyUrl)) proxyUrl = 'https://' + proxyUrl;
             return `${proxyUrl.replace(/\/$/, '')}/proxy?url=${encodeURIComponent(url)}`;
         };
-        const _convoPath = id => `convo_${id}.json`;
-        const _rmConvo = id => opfs.remove(_convoPath(id));
-        const _writeConvo = (id, messages, params) =>
-            opfs.write(_convoPath(id), JSON.stringify(params ? { messages, params } : { messages }));
-        const _collectImageIds = (d) => {
-            const s = new Set();
-            for (const m of d.messages || []) {
-                (m.images||[]).forEach(i => i.imageId && s.add(i.imageId));
-                for (const v of m.variants || []) {
-                    (v.parts||[]).forEach(p => p._imageRef && s.add(p._imageRef));
-                    (v._images||[]).forEach(i => i.imageId && s.add(i.imageId));
-                }
-            }
-            return s;
+        const _manifestPath = id => `convo_${id}_manifest.json`;
+        const _msgPath = (id, msgId) => `convo_${id}_msg_${msgId}.json`;
+        const _writeManifest = (id, manifest) => opfs.write(_manifestPath(id), JSON.stringify(manifest));
+        const _readManifest = async (id) => { try { const j = await opfs.readText(_manifestPath(id)); return j ? JSON.parse(j) : null; } catch { return null; } };
+        const _writeMsg = (id, msgId, data) => opfs.write(_msgPath(id, msgId), JSON.stringify(data));
+        const _readMsg = async (id, msgId) => { try { const j = await opfs.readText(_msgPath(id, msgId)); return j ? JSON.parse(j) : null; } catch { return null; } };
+        const _rmConvo = async (id) => {
+            const prefix = `convo_${id}_`;
+            const keys = await opfs.keys();
+            await _pool(keys.filter(k => k.startsWith(prefix)), k => opfs.remove(k));
         };
+        const _collectMsgImageIds = (msg) => {
+            const ids = [];
+            if (msg.images) for (const i of msg.images) i.imageId && ids.push(i.imageId);
+            if (msg.variants) for (const v of msg.variants) {
+                if (v.parts) for (const p of v.parts) p._imageRef && ids.push(p._imageRef);
+                if (v._images) for (const i of v._images) i.imageId && ids.push(i.imageId);
+            }
+            return ids;
+        };
+        const _collectImageIdsFromManifest = (manifest) => (manifest?.messages || []).flatMap(d => d.imageIds || []);
+        const _collectImageIds = (d) => new Set(_collectImageIdsFromManifest(d.manifest || {messages: (d.messages || []).map(m => ({imageIds: _collectMsgImageIds(m)}))}));
         const useImageStore = createGlobalState(() => {
             const saveImage = (imageId, data) => opfs.write(imageId, data);
             const ingestImage = async (input) => {
@@ -277,8 +284,8 @@
                 await _pool(savedConvosList || [], async (meta) => {
                     if (!meta?.id) return;
                     try {
-                        const json = await opfs.readText(_convoPath(meta.id));
-                        if (json) for (const id of _collectImageIds(JSON.parse(json))) referenced.add(id);
+                        const manifest = await _readManifest(meta.id);
+                        if (manifest) for (const id of _collectImageIdsFromManifest(manifest)) referenced.add(id);
                     } catch {}
                 });
                 try {
@@ -964,109 +971,102 @@ const TagCountBadge={
             const t = v?._text || v?.parts?.find(p => p.text && !p.thought)?.text;
             return (t || msgs.find(m => m.role === 'user')?.text || '').substring(0, 60);
         };
-        const serializeConversation = async (messages) => {
+        const serializeMessage = async (msg) => {
             const imageStore = useImageStore();
-            const serializedMessages = await Promise.all(messages.map(async (msg) => {
-                if (msg.role === 'user') {
-                    const serializedImages = await Promise.all((msg.images || []).map(async (img) => {
-                        if (!img.imageId && img.data) {
-                            const ingested = await imageStore.ingestImage({data: img.data, mimeType: img.mimeType});
-                            img.imageId = ingested.imageId;
-                            if (img.mimeType !== _WP) {
-                                img.data = ingested.base64;
-                                img.mimeType = _WP;
-                            }
+            if (msg.role === 'user') {
+                const serializedImages = await Promise.all((msg.images || []).map(async (img) => {
+                    if (!img.imageId && img.data) {
+                        const ingested = await imageStore.ingestImage({data: img.data, mimeType: img.mimeType});
+                        img.imageId = ingested.imageId;
+                        if (img.mimeType !== _WP) {
+                            img.data = ingested.base64;
+                            img.mimeType = _WP;
                         }
-                        return { id: img.id, imageId: img.imageId, mimeType: _WP, name: img.name || '', hidden: !!img.hidden };
-                    }));
-                    return { id: msg.id, role: 'user', text: msg.text || '', images: serializedImages, hidden: !!msg.hidden };
-                }
-                if (msg.role === 'model') {
-                    const serializedVariants = await Promise.all((msg.variants || []).map(async (v) => {
-                        let inlineDataCount = 0;
-                        const serializedParts = await Promise.all((v.parts || []).map(async (part) => {
-                            if (part.inlineData) {
-                                let imageId = v._images?.[inlineDataCount]?.imageId;
-                                if (!imageId) {
-                                    const ingested = await imageStore.ingestImage({data: part.inlineData.data, mimeType: part.inlineData.mimeType});
-                                    imageId = ingested.imageId;
-                                    if (v._images?.[inlineDataCount]) v._images[inlineDataCount].imageId = imageId;
-                                }
-                                inlineDataCount++;
-                                const sPart = { _imageRef: imageId, _mimeType: _WP };
-                                if (part.thought) sPart.thought = true;
-                                if (part.thoughtSignature) sPart.thoughtSignature = part.thoughtSignature;
-                                if (part.text) sPart.text = part.text;
-                                return sPart;
+                    }
+                    return { id: img.id, imageId: img.imageId, mimeType: _WP, name: img.name || '', hidden: !!img.hidden };
+                }));
+                return { id: msg.id, role: 'user', text: msg.text || '', images: serializedImages, hidden: !!msg.hidden };
+            }
+            if (msg.role === 'model') {
+                const serializedVariants = await Promise.all((msg.variants || []).map(async (v) => {
+                    let inlineDataCount = 0;
+                    const serializedParts = await Promise.all((v.parts || []).map(async (part) => {
+                        if (part.inlineData) {
+                            let imageId = v._images?.[inlineDataCount]?.imageId;
+                            if (!imageId) {
+                                const ingested = await imageStore.ingestImage({data: part.inlineData.data, mimeType: part.inlineData.mimeType});
+                                imageId = ingested.imageId;
+                                if (v._images?.[inlineDataCount]) v._images[inlineDataCount].imageId = imageId;
                             }
-                            return { text: part.text || '', ...(part.thought ? { thought: true } : {}), ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}) };
-                        }));
-                        const serializedImages = (v._images || []).map(img => ({
-                            mimeType: img.mimeType || _WP,
-                            imageId: img.imageId || null
-                        }));
-                        return {
-                            id: v.id,
-                            parts: serializedParts,
-                            _text: v._text || '',
-                            _images: serializedImages,
-                            _imageSize: v._imageSize || '1K',
-                            _model: v._model || _FM,
-                            _flexInference: !!v._flexInference,
-                            _genTimeMs: v._genTimeMs || null,
-                            _usage: v._usage ? Object.assign({promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0}, v._usage.candidatesTokensDetails && {candidatesTokensDetails: v._usage.candidatesTokensDetails}, v._usage.thoughtsTokenCount && {thoughtsTokenCount: v._usage.thoughtsTokenCount}) : null,
-                            _error: v._error || null,
-                            _blockReason: v._blockReason || null,
-                            _isPromptBlock: !!v._isPromptBlock,
-                            timestamp: v.timestamp || null
-                        };
+                            inlineDataCount++;
+                            const sPart = { _imageRef: imageId, _mimeType: _WP };
+                            if (part.thought) sPart.thought = true;
+                            if (part.thoughtSignature) sPart.thoughtSignature = part.thoughtSignature;
+                            if (part.text) sPart.text = part.text;
+                            return sPart;
+                        }
+                        return { text: part.text || '', ...(part.thought ? { thought: true } : {}), ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}) };
                     }));
-                    return { id: msg.id, role: 'model', variants: serializedVariants, activeVariant: msg.activeVariant || 0, hidden: !!msg.hidden };
-                }
-                return { id: msg.id, role: msg.role, hidden: !!msg.hidden };
-            }));
-            return serializedMessages;
+                    const serializedImages = (v._images || []).map(img => ({
+                        mimeType: img.mimeType || _WP,
+                        imageId: img.imageId || null
+                    }));
+                    return {
+                        id: v.id,
+                        parts: serializedParts,
+                        _text: v._text || '',
+                        _images: serializedImages,
+                        _imageSize: v._imageSize || '1K',
+                        _model: v._model || _FM,
+                        _flexInference: !!v._flexInference,
+                        _genTimeMs: v._genTimeMs || null,
+                        _usage: v._usage ? Object.assign({promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0}, v._usage.candidatesTokensDetails && {candidatesTokensDetails: v._usage.candidatesTokensDetails}, v._usage.thoughtsTokenCount && {thoughtsTokenCount: v._usage.thoughtsTokenCount}) : null,
+                        _error: v._error || null,
+                        _blockReason: v._blockReason || null,
+                        _isPromptBlock: !!v._isPromptBlock,
+                        timestamp: v.timestamp || null
+                    };
+                }));
+                return { id: msg.id, role: 'model', variants: serializedVariants, activeVariant: msg.activeVariant || 0, hidden: !!msg.hidden };
+            }
+            return { id: msg.id, role: msg.role, hidden: !!msg.hidden };
         };
-        const deserializeConversation = async (serializedData) => {
-            if (!serializedData) return [];
-            const _imgCache = new Map();
-            const loadCached = (id) => { if (!_imgCache.has(id)) _imgCache.set(id, loadImageAsBase64(id)); return _imgCache.get(id); };
-            const messages = await Promise.all((serializedData.messages || []).map(async (msg) => {
-                const { images: rawImages, variants: rawVariants, ...dMsg } = msg;
-                if (rawImages?.length) {
-                    dMsg.images = await Promise.all(rawImages.map(async (img) => {
-                        const dImg = { ...img };
-                        if (dImg.imageId) dImg.data = await loadCached(dImg.imageId);
-                        return dImg;
+        const deserializeMessage = async (msg, imgCache) => {
+            if (!msg) return null;
+            const loadCached = (id) => { if (!imgCache.has(id)) imgCache.set(id, loadImageAsBase64(id)); return imgCache.get(id); };
+            const { images: rawImages, variants: rawVariants, ...dMsg } = msg;
+            if (rawImages?.length) {
+                dMsg.images = await Promise.all(rawImages.map(async (img) => {
+                    const dImg = { ...img };
+                    if (dImg.imageId) dImg.data = await loadCached(dImg.imageId);
+                    return dImg;
+                }));
+            }
+            if (rawVariants?.length) {
+                dMsg.variants = await Promise.all(rawVariants.map(async (v) => {
+                    const { parts: rawParts, _images: rawVImages, ...dV } = v;
+                    dV.parts = await Promise.all((rawParts || []).map(async (part) => {
+                        if (part._imageRef) {
+                            const imgB64 = await loadCached(part._imageRef);
+                            if (!imgB64) console.warn(`Missing image data for ${part._imageRef}`);
+                            const { _imageRef, _mimeType, _thoughtSignature, thoughtSignature, ...base } = part;
+                            if (_thoughtSignature || thoughtSignature) base.thoughtSignature = _thoughtSignature || thoughtSignature;
+                            if (imgB64) base.inlineData = { data: imgB64, mimeType: _mimeType || _WP };
+                            return base;
+                        }
+                        return part;
                     }));
-                }
-                if (rawVariants?.length) {
-                    dMsg.variants = await Promise.all(rawVariants.map(async (v) => {
-                        const { parts: rawParts, _images: rawVImages, ...dV } = v;
-                        dV.parts = await Promise.all((rawParts || []).map(async (part) => {
-                            if (part._imageRef) {
-                                const imgB64 = await loadCached(part._imageRef);
-                                if (!imgB64) console.warn(`Missing image data for ${part._imageRef}`);
-                                const { _imageRef, _mimeType, _thoughtSignature, thoughtSignature, ...base } = part;
-                                if (_thoughtSignature || thoughtSignature) base.thoughtSignature = _thoughtSignature || thoughtSignature;
-                                if (imgB64) base.inlineData = { data: imgB64, mimeType: _mimeType || _WP };
-                                return base;
-                            }
-                            return part;
-                        }));
-                        dV._images = await Promise.all((rawVImages || []).map(async (img) => {
-                            if (img.imageId) return { ...img, data: await loadCached(img.imageId) };
-                            return img;
-                        }));
-                        dV._model = v._model || _FM;
-                        dV._flexInference = !!v._flexInference;
-                        dV._genTimeMs = v._genTimeMs || null;
-                        return dV;
+                    dV._images = await Promise.all((rawVImages || []).map(async (img) => {
+                        if (img.imageId) return { ...img, data: await loadCached(img.imageId) };
+                        return img;
                     }));
-                }
-                return dMsg;
-            }));
-            return messages;
+                    dV._model = v._model || _FM;
+                    dV._flexInference = !!v._flexInference;
+                    dV._genTimeMs = v._genTimeMs || null;
+                    return dV;
+                }));
+            }
+            return dMsg;
         };
         const _BLOCK_REASONS = new Set('SAFETY,IMAGE_SAFETY,IMAGE_PROHIBITED_CONTENT,PROHIBITED_CONTENT,RECITATION,IMAGE_RECITATION,OTHER,IMAGE_OTHER,NO_IMAGE,BLOCKLIST,SPII'.split(','));
         const _TERMINAL_REASONS = new Set(['LANGUAGE','MODEL_ARMOR']);
@@ -1106,6 +1106,24 @@ const TagCountBadge={
             const _findMeta = id => savedConversations.value.find(x => x.id === id);
             const _markCloud = id => { if (!cloudConversations.value[id]) cloudConversations.value = { ...cloudConversations.value, [id]: true }; };
             const _unmarkCloud = id => { const c = { ...cloudConversations.value }; delete c[id]; cloudConversations.value = c; };
+            const _dirtyManifests = new Set();
+            const _dirtyMessages = new Map();
+            const _r2DirtyManifests = new Set();
+            const _r2DirtyMessages = new Map();
+            const _markMsgDirty = (convoId, msgId) => {
+                _dirtyManifests.add(convoId);
+                if (!_dirtyMessages.has(convoId)) _dirtyMessages.set(convoId, new Set());
+                _dirtyMessages.get(convoId).add(msgId);
+                _r2DirtyManifests.add(convoId);
+                if (!_r2DirtyMessages.has(convoId)) _r2DirtyMessages.set(convoId, new Set());
+                const s = _r2DirtyMessages.get(convoId);
+                if (s !== null) s.add(msgId);
+            };
+            const _markManifestDirty = (convoId) => {
+                _dirtyManifests.add(convoId);
+                _r2DirtyManifests.add(convoId);
+                if (!_r2DirtyMessages.has(convoId)) _r2DirtyMessages.set(convoId, new Set());
+            };
             const _requireGeminiKey = () => {
                 if (!store.config.value.gemini?.apiKey) { toast.err('Gemini API key required — set it in Settings'); return false; }
                 return true;
@@ -1223,9 +1241,34 @@ const TagCountBadge={
             const _saveConvoDirect = async (convo) => {
                 if (!convo || convo.isTemp || !convo.messages.length) return;
                 try {
-                    await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params);
-                    const meta = _findMeta(convo.id);
-                    if (meta) { meta.timestamp = Date.now(); }
+                    const id = convo.id;
+                    const dirtyMsgIds = _dirtyMessages.get(id);
+                    const manifest = await _readManifest(id) || { title: convo.title, timestamp: convo.timestamp, params: convo.params, messages: [] };
+                    const descMap = new Map(manifest.messages.map(d => [d.msgId, d]));
+                    if (dirtyMsgIds?.size) {
+                        await _pool([...dirtyMsgIds], async (msgId) => {
+                            const msg = convo.messages.find(m => m.id === msgId);
+                            if (!msg) return;
+                            const serialized = await serializeMessage(msg);
+                            const imageIds = _collectMsgImageIds(serialized);
+                            await _writeMsg(id, msgId, serialized);
+                            descMap.set(msgId, { msgId, imageIds, updatedAt: Date.now() });
+                        });
+                        _r2DirtyManifests.add(id);
+                        if (!_r2DirtyMessages.has(id)) _r2DirtyMessages.set(id, new Set());
+                        const r2set = _r2DirtyMessages.get(id);
+                        if (r2set !== null) for (const msgId of dirtyMsgIds) r2set.add(msgId);
+                    }
+                    manifest.title = convo.title;
+                    manifest.timestamp = Date.now();
+                    manifest.params = convo.params;
+                    manifest.messages = convo.messages.map(m => descMap.get(m.id) || { msgId: m.id, imageIds: [], updatedAt: Date.now() });
+                    await _writeManifest(id, manifest);
+                    if (_dirtyManifests.has(id)) _r2DirtyManifests.add(id);
+                    const meta = _findMeta(id);
+                    if (meta) { meta.timestamp = manifest.timestamp; }
+                    _dirtyManifests.delete(id);
+                    _dirtyMessages.delete(id);
                 } catch (e) { console.warn('Auto-save failed:', e); }
             };
             const _pruneBananaThinkingStates = (msgIds) => {
@@ -1249,7 +1292,10 @@ const TagCountBadge={
                     catch (err) { if (!await _handleStreamError(err, v, retryCount, () => { modelMsg.variants.push(createVariant(convo.params)); genVarIdx = modelMsg.variants.length - 1; convo.generatingVarIdx = genVarIdx; modelMsg.activeVariant = genVarIdx; }, convo)) break; }
                 }
                 convo.generating = false; convo.generatingMsgId = null; convo.generatingVarIdx = null; convo.abortCtrl = null;
-                if (!convo.isTemp) _saveConvoDirect(convo);
+                if (!convo.isTemp) {
+                    _markMsgDirty(convo.id, modelMsg.id);
+                    _saveConvoDirect(convo);
+                }
                 const genVariant = modelMsg.variants[genVarIdx];
                 const didSucceed = genVariant?._images?.length > 0;
                 convo._lastGenStatus = didSucceed ? 'success' : 'error';
@@ -1258,7 +1304,6 @@ const TagCountBadge={
                     if (!isViewingThis) store.incrementNotification('banana');
                     if (!convo.isTemp && _isSyncReady()) {
                         _markCloud(convo.id);
-                        _r2SyncDirty.add(convo.id);
                         _runR2Sync();
                     }
                 }
@@ -1271,6 +1316,7 @@ const TagCountBadge={
                 if (convo.generating) return;
                 const userMsg = reactive({id: uid(), role: 'user', images: imgs.map(i => ({id: uid(), data: i.data, mimeType: i.mimeType, name: i.name, hidden: false})), text: text || '', hidden: false, timestamp: Date.now()});
                 convo.messages.push(userMsg);
+                if (!convo.isTemp) _markMsgDirty(convo.id, userMsg.id);
                 const modelMsg = createModelMsg(convo.params);
                 convo.messages.push(modelMsg);
                 const contents = _getContents(convo.messages, convo.messages.indexOf(modelMsg));
@@ -1336,7 +1382,17 @@ const TagCountBadge={
                 convo.title = actualTitle; convo.isTemp = false;
                 convo.timestamp = Date.now();
                 const meta = { id: convo.id, title: actualTitle, timestamp: convo.timestamp };
-                try { await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params); }
+                try {
+                    const msgDescriptors = [];
+                    await _pool(convo.messages, async (msg) => {
+                        const serialized = await serializeMessage(msg);
+                        const imageIds = _collectMsgImageIds(serialized);
+                        await _writeMsg(id, msg.id, serialized);
+                        msgDescriptors.push({ msgId: msg.id, imageIds, updatedAt: Date.now() });
+                    });
+                    const manifest = { title: actualTitle, timestamp: convo.timestamp, params: convo.params, messages: convo.messages.map(m => msgDescriptors.find(d => d.msgId === m.id) || { msgId: m.id, imageIds: [], updatedAt: Date.now() }) };
+                    await _writeManifest(id, manifest);
+                }
                 catch (e) { toast.err('Failed to save conversation: ' + e.message); return; }
                 const list = savedConversations.value;
                 const idx = list.findIndex(x => x.id === convo.id);
@@ -1349,20 +1405,28 @@ const TagCountBadge={
             };
             const _fetchConvoFromR2 = async (convoId) => {
                 try {
-                    const res = await r2Client.r2Fetch('GET', `conversations/${convoId}`);
-                    if (!res.ok) return null;
-                    const data = JSON.parse(await res.text());
-                    const hTitle = res.headers.get('X-Convo-Title');
-                    if (hTitle && !data.title) try { data.title = decodeURIComponent(hTitle); } catch { data.title = hTitle; }
-                    const hTs = res.headers.get('X-Convo-Timestamp');
-                    if (hTs && data.timestamp == null) { const n = Number(hTs); if (Number.isFinite(n)) data.timestamp = n; }
-                    return data;
+                    const mRes = await r2Client.r2Fetch('GET', `conversations/${convoId}/manifest`);
+                    if (!mRes.ok) return null;
+                    const manifest = JSON.parse(await mRes.text());
+                    const hTitle = mRes.headers.get('X-Convo-Title');
+                    if (hTitle && !manifest.title) try { manifest.title = decodeURIComponent(hTitle); } catch { manifest.title = hTitle; }
+                    const hTs = mRes.headers.get('X-Convo-Timestamp');
+                    if (hTs && manifest.timestamp == null) { const n = Number(hTs); if (Number.isFinite(n)) manifest.timestamp = n; }
+                    const msgs = [];
+                    await _pool(manifest.messages || [], async (desc) => {
+                        try {
+                            const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/messages/${desc.msgId}`);
+                            if (res.ok) msgs.push({ msgId: desc.msgId, data: JSON.parse(await res.text()) });
+                        } catch {}
+                    });
+                    const msgMap = new Map(msgs.map(m => [m.msgId, m.data]));
+                    const orderedMsgs = (manifest.messages || []).map(d => msgMap.get(d.msgId)).filter(Boolean);
+                    return { messages: orderedMsgs, params: manifest.params, title: manifest.title, timestamp: manifest.timestamp, manifest };
                 } catch { return null; }
             };
             const _pullMissingImagesFromR2 = async (convoData, convoId) => {
-                const imageIds = _collectImageIds(convoData);
-                if (!imageIds.size) return [];
-                const idArr = [...imageIds];
+                const idArr = convoData.manifest ? _collectImageIdsFromManifest(convoData.manifest) : [..._collectImageIds(convoData)];
+                if (!idArr.length) return [];
                 const localKeys = new Set(await opfs.keys());
                 const missing = idArr.filter(id => !localKeys.has(id));
                 if (!missing.length) return idArr;
@@ -1397,13 +1461,31 @@ const TagCountBadge={
                 try {
                     let convoData = null;
                     try {
-                        const json = await opfs.readText(_convoPath(id));
-                        if (json) convoData = JSON.parse(json);
+                        const manifest = await _readManifest(id);
+                        if (manifest) {
+                            const imgCache = new Map();
+                            const msgs = await Promise.all((manifest.messages || []).map(async (desc) => {
+                                const raw = await _readMsg(id, desc.msgId);
+                                return raw ? await deserializeMessage(raw, imgCache) : null;
+                            }));
+                            if (msgs.every(Boolean)) {
+                                convoData = { messages: msgs, params: manifest.params, title: manifest.title, timestamp: manifest.timestamp, manifest };
+                            }
+                        }
                     } catch {}
                     if (!convoData && cloudConversations.value[id]) {
                         convoData = await _fetchConvoFromR2(id);
                         if (convoData) {
-                            try { await _writeConvo(id, convoData.messages, convoData.params); } catch {}
+                            try {
+                                const mDescs = [];
+                                await _pool(convoData.messages || [], async (msg) => {
+                                    await _writeMsg(id, msg.id, msg);
+                                    mDescs.push({ msgId: msg.id, imageIds: _collectMsgImageIds(msg), updatedAt: Date.now() });
+                                });
+                                const manifest = { title: convoData.title, timestamp: convoData.timestamp, params: convoData.params, messages: (convoData.messages || []).map(m => mDescs.find(d => d.msgId === m.id) || { msgId: m.id, imageIds: [], updatedAt: Date.now() }) };
+                                await _writeManifest(id, manifest);
+                                convoData.manifest = manifest;
+                            } catch {}
                             if (convoData.title) {
                                 convo.title = convoData.title;
                                 meta.title = convoData.title;
@@ -1427,7 +1509,12 @@ const TagCountBadge={
                         await _pullMissingImagesFromR2(convoData, id);
                     }
                     if (convoData.params) Object.assign(convo.params, convoData.params);
-                    convo.messages = await deserializeConversation(convoData);
+                    if (convoData.messages?.[0]?.role) {
+                        convo.messages = convoData.messages;
+                    } else {
+                        const imgCache = new Map();
+                        convo.messages = await Promise.all(convoData.messages.map(m => deserializeMessage(m, imgCache)));
+                    }
                 } finally { convo.isHydrating = false; }
             };
             const deleteConversation = async (id) => {
@@ -1457,6 +1544,7 @@ const TagCountBadge={
                 if (convo) convo.title = t;
                 const s = _findMeta(id);
                 if (s) s.title = t;
+                if (convo && !convo.isTemp) { _markManifestDirty(id); _autoSave(); }
             };
             const pruneNoImageMessages = () => withActiveConvo(convo => {
                 const genMsgId = convo.generatingMsgId;
@@ -1488,78 +1576,87 @@ const TagCountBadge={
                     if (_isSyncReady()) {
                         _markCloud(convo.id);
                         if (convoSyncStatus[convo.id] !== 'syncing') convoSyncStatus[convo.id] = 'pending';
-                        _r2SyncDirty.add(convo.id);
                         _runR2Sync();
                     }
                 }
             }, 1500);
             watch(() => { const c = activeConvo.value; return c && !c.isTemp && !c.generating ? c.messages : null; }, (msgs) => {
-                if (msgs) _autoSave();
+                if (msgs) {
+                    const convo = activeConvo.value;
+                    if (convo && !convo.isTemp) {
+                        for (const m of convo.messages) _markMsgDirty(convo.id, m.id);
+                    }
+                    _autoSave();
+                }
+            }, { deep: true });
+            watch(() => { const c = activeConvo.value; return c && !c.isTemp ? c.params : null; }, () => {
+                const convo = activeConvo.value;
+                if (convo && !convo.isTemp && !convo.isHydrating) { _markManifestDirty(convo.id); _autoSave(); }
             }, { deep: true });
             const r2Client = useR2Client();
             const _pushConvoR2Locks = new Map();
-            const _pushConvoToR2 = (convoId, convoJson, imageIds, meta) => {
-                const prev = _pushConvoR2Locks.get(convoId) || Promise.resolve();
-                const next = prev.then(() => _doPushConvoToR2(convoId, convoJson, imageIds, meta));
-                const lock = next.catch(() => {}).finally(() => {
-                    if (_pushConvoR2Locks.get(convoId) === lock) _pushConvoR2Locks.delete(convoId);
-                });
-                _pushConvoR2Locks.set(convoId, lock);
-                return next;
-            };
-            const _doPushConvoToR2 = async (convoId, convoJson, imageIds, meta) => {
+            const _syncConversationToR2 = async (id, dirtyMsgIds) => {
+                if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
+                const manifest = await _readManifest(id);
+                if (!manifest) throw new Error('Conversation data not found locally.');
+                const meta = _findMeta(id);
                 const customHeaders = {};
                 if (meta?.title) customHeaders['X-Convo-Title'] = encodeURIComponent(meta.title);
                 if (meta?.timestamp) customHeaders['X-Convo-Timestamp'] = String(meta.timestamp);
-                await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json', customHeaders });
-                const syncedArr = _syncedR2Images.value[convoId] || [];
-                const syncedSet = new Set(syncedArr);
-                const newImages = [...imageIds].filter(id => !syncedSet.has(id));
-                const uploaded = new Set();
-                await _pool(newImages, async (imgId) => {
-                    try {
-                        const imgData = await opfs.read(imgId);
-                        if (imgData) {
-                            await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
-                            uploaded.add(imgId);
-                        }
-                    } catch {}
+                const descsToSync = dirtyMsgIds == null ? (manifest.messages || []) : dirtyMsgIds.size ? (manifest.messages || []).filter(d => dirtyMsgIds.has(d.msgId)) : [];
+                const prev = _pushConvoR2Locks.get(id) || Promise.resolve();
+                const task = prev.then(async () => {
+                    await _pool(descsToSync, async (desc) => {
+                        const raw = await opfs.read(_msgPath(id, desc.msgId));
+                        if (raw) await r2Client.r2Fetch('PUT', `conversations/${id}/messages/${desc.msgId}`, raw, { contentType: 'application/json' });
+                    });
+                    const manifestRaw = await opfs.read(_manifestPath(id));
+                    if (manifestRaw) await r2Client.r2Fetch('PUT', `conversations/${id}/manifest`, manifestRaw, { contentType: 'application/json', customHeaders });
+                    const allImageIds = new Set(_collectImageIdsFromManifest(manifest));
+                    const syncedArr = _syncedR2Images.value[id] || [];
+                    const syncedSet = new Set(syncedArr);
+                    const newImages = [...allImageIds].filter(i => !syncedSet.has(i));
+                    const uploaded = new Set();
+                    await _pool(newImages, async (imgId) => {
+                        try {
+                            const imgData = await opfs.read(imgId);
+                            if (imgData) {
+                                await r2Client.r2Fetch('PUT', `conversations/${id}/images/${imgId}`, imgData, { contentType: 'image/webp' });
+                                uploaded.add(imgId);
+                            }
+                        } catch {}
+                    });
+                    const orphaned = syncedArr.filter(i => !allImageIds.has(i));
+                    await _pool(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${id}/images/${name}`).catch(() => {}));
+                    const nowSynced = [...allImageIds].filter(i => syncedSet.has(i) || uploaded.has(i));
+                    _syncedR2Images.value = { ..._syncedR2Images.value, [id]: nowSynced };
                 });
-                const orphaned = syncedArr.filter(id => !imageIds.has(id));
-                await _pool(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}));
-                // Only persist IDs that are confirmed in R2: previously synced (still current) + newly uploaded
-                const nowSynced = [...imageIds].filter(id => syncedSet.has(id) || uploaded.has(id));
-                _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: nowSynced };
-            };
-            const _syncConversationToR2 = async (id) => {
-                if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
-                const raw = await opfs.read(_convoPath(id));
-                if (!raw) throw new Error('Conversation data not found locally.');
-                let imageIds;
-                try { imageIds = _collectImageIds(JSON.parse(new TextDecoder().decode(raw))); }
-                catch { throw new Error('Conversation data corrupted locally.'); }
-                const meta = _findMeta(id);
-                const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
-                await _pushConvoToR2(id, raw, imageIds, metaPick);
+                const lock = task.catch(() => {}).finally(() => { if (_pushConvoR2Locks.get(id) === lock) _pushConvoR2Locks.delete(id); });
+                _pushConvoR2Locks.set(id, lock);
+                return task;
             };
             let _r2SyncInProgress = false;
             let _r2SyncPromise = null;
-            const _r2SyncDirty = new Set();
             const _runR2Sync = () => {
                 if (_r2SyncInProgress) return _r2SyncPromise || Promise.resolve();
                 _r2SyncInProgress = true;
                 _r2SyncPromise = (async () => {
                     try {
-                        const ids = [..._r2SyncDirty];
-                        _r2SyncDirty.clear();
+                        const snapManifests = new Set(_r2DirtyManifests);
+                        const snapMessages = new Map(_r2DirtyMessages);
+                        _r2DirtyManifests.clear();
+                        _r2DirtyMessages.clear();
+                        const ids = [...snapManifests];
                         await _pool(ids.filter(id => cloudConversations.value[id]), async (id) => {
                             convoSyncStatus[id] = 'syncing';
                             try {
-                                await _syncConversationToR2(id);
+                                await _syncConversationToR2(id, snapMessages.get(id) ?? null);
                                 convoSyncStatus[id] = 'synced';
                             } catch (e) {
                                 convoSyncStatus[id] = 'error';
                                 console.warn('Convo R2 sync failed:', e);
+                                _r2DirtyManifests.add(id);
+                                _r2DirtyMessages.set(id, null);
                                 const title = _findMeta(id)?.title || id;
                                 toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
                             }
@@ -1567,7 +1664,7 @@ const TagCountBadge={
                     } finally {
                         _r2SyncInProgress = false;
                         _r2SyncPromise = null;
-                        if (_r2SyncDirty.size) await _runR2Sync();
+                        if (_r2DirtyManifests.size) await _runR2Sync();
                     }
                 })();
                 return _r2SyncPromise;
@@ -1578,7 +1675,9 @@ const TagCountBadge={
                     convoSyncStatus[id] = 'syncing';
                     try {
                         _markCloud(id);
-                        await _syncConversationToR2(id);
+                        await _syncConversationToR2(id, null);
+                        _r2DirtyManifests.delete(id);
+                        _r2DirtyMessages.delete(id);
                         await useSyncStore().push(true);
                         convoSyncStatus[id] = 'synced';
                         toast.q('Synced to cloud');
@@ -1590,7 +1689,8 @@ const TagCountBadge={
                     return;
                 }
                 convoSyncStatus[id] = 'pending';
-                _r2SyncDirty.add(id);
+                _r2DirtyManifests.add(id);
+                _r2DirtyMessages.set(id, null);
                 await _runR2Sync();
                 if (_r2SyncPromise) await Promise.race([
                     _r2SyncPromise,
