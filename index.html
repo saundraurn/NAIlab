@@ -1535,7 +1535,9 @@ const TagCountBadge={
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 const raw = await opfs.read(_convoPath(id));
                 if (!raw) throw new Error('Conversation data not found locally.');
-                const imageIds = _collectImageIds(JSON.parse(new TextDecoder().decode(raw)));
+                let imageIds;
+                try { imageIds = _collectImageIds(JSON.parse(new TextDecoder().decode(raw))); }
+                catch { throw new Error('Conversation data corrupted locally.'); }
                 const meta = _findMeta(id);
                 const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
                 await _pushConvoToR2(id, raw, imageIds, metaPick);
