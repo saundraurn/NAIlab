@@ -106,7 +106,7 @@
         const fmtAgo = ts => !ts ? 'never' : formatTimeAgo(new Date(ts));
         const _t=(msg,type,source,duration)=>useAppStore().addToast({msg,type,source,duration});
         const toast={ok:(msg,src,dur=3000)=>_t(msg,'success',src,dur),err:(msg,src)=>_t(msg,'error',src),warn:(msg,src,dur=4000)=>_t(msg,'warning',src,dur),info:(msg,src,dur=3000)=>_t(msg,'info',src,dur),q:(msg,dur=2000)=>_t(msg,'success',undefined,dur)};
-        const splitTagString = (str) => _.compact((str || '').split(' '));
+        const splitTagString = (str) => (str || '').split(' ').filter(Boolean);
         const TAG_CATEGORIES = 'artist,copyright,character,general,meta'.split(',');
         const getPostTags = (post) => TAG_CATEGORIES.flatMap(type => splitTagString(post[`tag_string_${type}`]).map(name => ({name, type})));
         const loadImageAsBase64 = async (imageId) => { const bytes = await useImageStore().loadImage(imageId); return bytes ? uint8ArrayToBase64(bytes) : null; };
@@ -254,20 +254,13 @@
             for (const d of manifest.messages || []) (d.imageIds || []).forEach(id => s.add(id));
             return s;
         };
-        const _writeManifest = async (convoId, title, timestamp, params, msgDescriptors) => {
-            const manifest = { title, timestamp, params: params || null, messages: msgDescriptors };
-            await opfs.write(_manifestPath(convoId), JSON.stringify(manifest));
-        };
-        const _readManifest = async (convoId) => {
-            const json = await opfs.readText(_manifestPath(convoId));
-            return json ? JSON.parse(json) : null;
-        };
-        const _writeMsg = (convoId, msgId, serializedMsg) =>
-            opfs.write(_msgPath(convoId, msgId), JSON.stringify(serializedMsg));
-        const _readMsg = async (convoId, msgId) => {
-            const json = await opfs.readText(_msgPath(convoId, msgId));
-            return json ? JSON.parse(json) : null;
-        };
+        const _writeJson = (path, data) => opfs.write(path, JSON.stringify(data));
+        const _readJson = async (path) => { const j = await opfs.readText(path); return j ? JSON.parse(j) : null; };
+        const _writeManifest = (convoId, title, timestamp, params, msgDescriptors) =>
+            _writeJson(_manifestPath(convoId), { title, timestamp, params: params || null, messages: msgDescriptors });
+        const _readManifest = (convoId) => _readJson(_manifestPath(convoId));
+        const _writeMsg = (convoId, msgId, serializedMsg) => _writeJson(_msgPath(convoId, msgId), serializedMsg);
+        const _readMsg = (convoId, msgId) => _readJson(_msgPath(convoId, msgId));
         const _rmConvo = async (convoId) => {
             const manifest = await _readManifest(convoId);
             const msgIds = (manifest?.messages || []).map(d => d.msgId);
@@ -279,17 +272,9 @@
         const useImageStore = createGlobalState(() => {
             const saveImage = (imageId, data) => opfs.write(imageId, data);
             const ingestImage = async (input) => {
-                let webpBytes;
-                if (input instanceof Blob) {
-                    webpBytes = await blobToWebP(input);
-                } else {
-                    if (input.mimeType === _WP) {
-                        webpBytes = Uint8Array.from(atob(input.data), c => c.charCodeAt(0));
-                    } else {
-                        const res = await fetch(`data:${input.mimeType};base64,${input.data}`);
-                        webpBytes = await blobToWebP(await res.blob());
-                    }
-                }
+                const webpBytes = await (input instanceof Blob ? blobToWebP(input)
+                    : input.mimeType === _WP ? Promise.resolve(Uint8Array.from(atob(input.data), c => c.charCodeAt(0)))
+                    : fetch(`data:${input.mimeType};base64,${input.data}`).then(r => r.blob()).then(blobToWebP));
                 const imageId = `img_${uid()}.webp`;
                 await saveImage(imageId, webpBytes);
                 return { imageId, base64: uint8ArrayToBase64(webpBytes), webpBytes };
@@ -325,14 +310,8 @@
                 const secret = getSecret();
                 if (!base) throw new Error('Worker URL not configured.');
                 if (!secret) throw new Error('Sync secret not configured.');
-                const headers = { 'Authorization': `Bearer ${secret}` };
-                if (options.contentType) headers['Content-Type'] = options.contentType;
-                if (options.customHeaders) {
-                    for (const [key, value] of Object.entries(options.customHeaders)) {
-                        if (/^x-convo-/i.test(key)) headers[key] = value;
-                    }
-                }
-                if (options.ifNoneMatch) headers['If-None-Match'] = options.ifNoneMatch;
+                const headers = { Authorization: `Bearer ${secret}`, ...(options.contentType && { 'Content-Type': options.contentType }), ...(options.ifNoneMatch && { 'If-None-Match': options.ifNoneMatch }) };
+                if (options.customHeaders) Object.entries(options.customHeaders).forEach(([k, v]) => /^x-convo-/i.test(k) && (headers[k] = v));
                 const res = await fetch(`${base}/r2/${path}`, { method, headers, body, cache: 'no-store' });
                 if (res.status === 401) throw new Error('Invalid sync secret.');
                 if (!res.ok && res.status !== 404 && res.status !== 304) throw new Error(`R2 request failed: ${res.status}`);
@@ -842,7 +821,7 @@ const TagCountBadge={
                 let abortController = null;
                 const {isLoading, error: err, execute} = useAsyncState(async (tags, page = 1, append = false, signal, clientFilters = []) => {
                     try {
-                        const sub = _.compact((tags || '').split('|').map(t => t.trim())); if (!sub.length) sub.push('');
+                        const sub = (tags || '').split('|').map(t => t.trim()).filter(Boolean); if (!sub.length) sub.push('');
                         const results = await Promise.all(sub.map(async t => { const res = await fetch(`https://danbooru.donmai.us/posts.json?tags=${encodeURIComponent(t)}&limit=${Math.ceil(DANBOORU_LIMIT / sub.length)}&page=${page}`, {signal}); return res.ok ? (await res.json()) || [] : []; }));
                         return {data: _.uniqBy(results.flat(), 'id'), page, append, tags, clientFilters, error: null};
                     } catch (e) {if (e.name !== 'AbortError') throw e; return {aborted: true};}
@@ -851,7 +830,7 @@ const TagCountBadge={
                     onError: (e) => !e?.name?.includes('Abort') && toast.err(`Search failed: ${e.message}`, 'danbooru'),
                     onSuccess: ({data, page, append, tags, clientFilters = [], aborted, error}) => {
                         if (aborted || error) return error && toast.err(error, 'danbooru');
-                        const bl = _.compact((blacklist.value||'').split(',').map(t => t.trim())), results = data.filter(p => p.large_file_url && !p.is_banned && p.image_width > 0 && /png|jpe?g|gif/.test(p.file_ext) && !bl.some(b => (p.tag_string||'').includes(b)) && (!clientFilters.length || clientFilters.every(f => (` ${p.tag_string||''} `).includes(` ${f} `))));
+                        const bl = (blacklist.value||'').split(',').map(t => t.trim()).filter(Boolean), results = data.filter(p => p.large_file_url && !p.is_banned && p.image_width > 0 && /png|jpe?g|gif/.test(p.file_ext) && !bl.some(b => (p.tag_string||'').includes(b)) && (!clientFilters.length || clientFilters.every(f => (` ${p.tag_string||''} `).includes(` ${f} `))));
                         results.forEach(p => TAG_CATEGORIES.forEach(t => splitTagString(p[`tag_string_${t}`]).forEach(tag => { if (tag && !naiTagKnowledge.value[tag] && !queuedTags.has(tag)) { tagQueues[t === 'artist' ? 'danbooru' : 'nai'].push(tag); queuedTags.add(tag); processQueues(); } })));
                         posts.value = append ? posts.value.concat(results) : results; hasMorePages.value = data.length >= (tags.includes('|') ? (DANBOORU_LIMIT / 2) : DANBOORU_LIMIT); pageNum.value = page; currentSearchTags.value = tags;
                         if (page === 1) toast.ok(`Found ${results.length} posts.`, 'danbooru', 2000);
@@ -871,8 +850,8 @@ const TagCountBadge={
                 watch(() => [isLoading.value, sortedPosts.value.length], ([loading, len]) => { if (!loading && len < 15 && hasMorePages.value && gridRoutes.includes(route.name) && _.some(ratingFilters.value)) fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []); });
                 const executeSearch = (query) => {
                     lastFetchedQuery.value = query; let effective = query || '', apiTags, clientFilters = [];
-                    if ((effective).includes('|')) apiTags = effective.split('|').map(p => _.compact(p.split(/\s*,\s*/).map(t => t.trim().replace(/\s+/g, '_'))).join(' ')).join('|');
-                    else { const tags = _.compact((effective).split(/\s*,\s*/).map(tag => tag.trim().replace(/\s+/g, '_'))); apiTags = _.take(tags, 2).join(' '); clientFilters = tags.slice(2); }
+                    if ((effective).includes('|')) apiTags = effective.split('|').map(p => p.split(/\s*,\s*/).map(t => t.trim().replace(/\s+/g, '_')).filter(Boolean).join(' ')).join('|');
+                    else { const tags = (effective).split(/\s*,\s*/).map(tag => tag.trim().replace(/\s+/g, '_')).filter(Boolean); apiTags = tags.slice(0, 2).join(' '); clientFilters = tags.slice(2); }
                     fetchPosts(apiTags, 1, false, clientFilters);
                 };
                 watch(() => route.query.q, (q) => {
@@ -909,9 +888,9 @@ const TagCountBadge={
                     delete: (item) => (_.pull(savedSearches.value, item), toast.info(`Deleted "${item.name}".`, 'danbooru')),
                 };
                 const savedSearchAction = (action, item) => _savedSearchActions[action]?.(item);
-                const addTagToSearch = (t) => searchQueryInput.value = _.uniq([..._.compact((searchQueryInput.value||'').split(',').map(x => x.trim())), t.replace(/_/g, ' ')]).join(', ');
+                const addTagToSearch = (t) => searchQueryInput.value = _.uniq([...(searchQueryInput.value||'').split(',').map(x => x.trim()).filter(Boolean), t.replace(/_/g, ' ')]).join(', ');
                 const searchSingleTag = (t) => (searchQueryInput.value = t.replace(/_/g, ' '), search());
-                const toggleTagInSearch = (tag, searchItem) => { const raw = tag.replace(/ /g, '_'), p = searchItem.prompt || ''; if (p.includes('|')) { searchItem.prompt = _.xorBy(_.compact(p.split('|').map(x => x.trim())), [raw], _.toLower).join(' | '); } else { const r = new RegExp(`(^|\\s)${_.escapeRegExp(raw)}($|\\s)`, 'i'); searchItem.prompt = r.test(p) ? p.replace(r, ' ').trim() : (p ? `${p} | ${raw}` : raw); } toast.ok(`Updated "${searchItem.name}"`, 'danbooru', 1000); };
+                const toggleTagInSearch = (tag, searchItem) => { const raw = tag.replace(/ /g, '_'), p = searchItem.prompt || ''; if (p.includes('|')) { searchItem.prompt = _.xorBy(p.split('|').map(x => x.trim()).filter(Boolean), [raw], _.toLower).join(' | '); } else { const r = new RegExp(`(^|\\s)${_.escapeRegExp(raw)}($|\\s)`, 'i'); searchItem.prompt = r.test(p) ? p.replace(r, ' ').trim() : (p ? `${p} | ${raw}` : raw); } toast.ok(`Updated "${searchItem.name}"`, 'danbooru', 1000); };
                 useInfiniteScroll(rightPanelRef, () => _.some(ratingFilters.value) && !isLoading.value && hasMorePages.value && gridRoutes.includes(route.name) && fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []), {distance: 1000});
                 provide('danbooruState', { posts: sortedPosts, isLoading, isLoadingMore: computed(() => isLoading.value && pageNum.value > 1), hasMorePages, statusMsg: computed(() => isLoading.value && !posts.value.length ? 'Searching...' : err.value ? `Error: ${err.value.message}` : !posts.value.length ? 'Search for images on Danbooru.' : `Showing ${posts.value.length} posts${hasMorePages.value ? ' (scroll for more)' : ''}`), hoveredImage, rightPanelRef, lastScrollPos, gridSize: toRef(danbooru.value, 'gridCols') });
                 provide('danbooruFolders', {folders: toRef(danbooru.value, 'folders'), isPostInFolder: (pid, fid) => foldersById.value[fid]?.postIds?.includes(pid), togglePostInFolder});
@@ -966,7 +945,7 @@ const TagCountBadge={
                 const displayNextPair = () => { const nextPair = displayQueue.shift(); Object.assign(currentImages, nextPair || emptyPair); if (nextPair) return actionStatusMsg.value = 'Ready for evaluation.'; const isFinished = !tagTest.value.isInfinite && totalTests.value > 0 && judgedPairsNum.value >= totalTests.value; if (isTestActive.value && isFinished && !pendingJobs.value) { isTestActive.value = false; actionStatusMsg.value = 'Testing complete!'; } else actionStatusMsg.value = isTestActive.value ? 'Waiting for next pair...' : (judgedPairsNum.value > 0 ? 'Testing complete!' : 'Ready to start testing'); };
                 const imgGenCallback = (err, {blob, context} = {}) => { if (err || context.sessionId !== currentSessionId.value) return err && (actionStatusMsg.value = `Error: ${err.message}`); generatedImageNum.value++; const {pair, imageKey} = context; pair[imageKey] = urlManager.create(blob); if (pair.imageA_url && pair.imageB_url) { const [itemA, itemB] = _.shuffle([{image: pair.imageA_url, tag: pair.tagA}, {image: pair.imageB_url, tag: pair.tagB}]); displayQueue.push({imageA: itemA.image, tagA: itemA.tag, imageB: itemB.image, tagB: itemB.tag}); if (!currentImages.imageA) displayNextPair(); } };
                 const buildAndAddReqs = () => {
-                    const {tagsToTest, isControl, iterations: iters, isInfinite, prompts: raw, unwantedContent: baseUc} = tagTest.value, tags = _.compact(tagsToTest.split('\n').map(l => l.trim())), prompts = raw.map(i => parsePrompt(i.val)).map(p => ({prompt: p.positive, uc: _.compact([p.negative, baseUc]).join(', ')})).filter(p => p.prompt);
+                    const {tagsToTest, isControl, iterations: iters, isInfinite, prompts: raw, unwantedContent: baseUc} = tagTest.value, tags = tagsToTest.split('\n').map(l => l.trim()).filter(Boolean), prompts = raw.map(i => parsePrompt(i.val)).map(p => ({prompt: p.positive, uc: [p.negative, baseUc].filter(Boolean).join(', ')})).filter(p => p.prompt);
                     if (tags.length < (isControl ? 1 : 2) || !prompts.length) return (actionStatusMsg.value = `Error: Missing resources.`) && (isTestActive.value = false);
                     const pairs = isControl ? tags.map(tag1 => ({tag1, isCtrl: true})) : tags.flatMap((tag1, i) => tags.slice(i + 1).map(tag2 => ({tag1, tag2})));
                     const reqs = _.flatMap(_.range(isInfinite ? 1 : iters), () => _.shuffle(pairs).flatMap(pair => { const {prompt, uc} = _.sample(prompts), seed = _.random(MAX_SEED), ctx = {}; return ['A', 'B'].map((lbl, i) => { const active = i ? (pair.tag2 || pair.tag1) : (pair.isCtrl ? null : pair.tag1); ctx[`tag${lbl}`] = active || 'Control'; return {source: 'tagTest', seed, genConfig: prepareGenConfig(genConfig.value), callback: imgGenCallback, onStatusUpdate: m => actionStatusMsg.value = m, prompt: active ? getTaggedString(prompt, active, false) : prompt, uc: active ? getTaggedString(uc, active, true) : uc, context: {pair: ctx, imageKey: `image${lbl}_url`, sessionId: currentSessionId.value}}; }); }));
@@ -1036,7 +1015,7 @@ const TagCountBadge={
                         _model: v._model || _FM,
                         _flexInference: !!v._flexInference,
                         _genTimeMs: v._genTimeMs || null,
-                        _usage: v._usage ? Object.assign({promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0}, v._usage.candidatesTokensDetails && {candidatesTokensDetails: v._usage.candidatesTokensDetails}, v._usage.thoughtsTokenCount && {thoughtsTokenCount: v._usage.thoughtsTokenCount}) : null,
+                        _usage: v._usage ? { promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0, ...(v._usage.candidatesTokensDetails && { candidatesTokensDetails: v._usage.candidatesTokensDetails }), ...(v._usage.thoughtsTokenCount && { thoughtsTokenCount: v._usage.thoughtsTokenCount }) } : null,
                         _error: v._error || null,
                         _blockReason: v._blockReason || null,
                         _isPromptBlock: !!v._isPromptBlock,
@@ -1587,28 +1566,18 @@ const TagCountBadge={
                 if (meta?.title) customHeaders['X-Convo-Title'] = encodeURIComponent(meta.title);
                 if (meta?.timestamp) customHeaders['X-Convo-Timestamp'] = String(meta.timestamp);
                 await r2Client.r2Fetch('PUT', `conversations/${convoId}/manifest`, manifestJson, { contentType: 'application/json', customHeaders });
-                await _pool(msgFiles, async ({ msgId, data }) => {
-                    try {
-                        await r2Client.r2Fetch('PUT', `conversations/${convoId}/messages/${msgId}`, data, { contentType: 'application/json' });
-                    } catch {}
-                });
-                const syncedArr = _syncedR2Images.value[convoId] || [];
-                const syncedSet = new Set(syncedArr);
-                const newImages = [...imageIds].filter(id => !syncedSet.has(id));
+                await _pool(msgFiles, ({ msgId, data }) =>
+                    r2Client.r2Fetch('PUT', `conversations/${convoId}/messages/${msgId}`, data, { contentType: 'application/json' }).catch(() => {}));
+                const synced = new Set(_syncedR2Images.value[convoId] || []);
                 const uploaded = new Set();
-                await _pool(newImages, async (imgId) => {
+                await _pool([...imageIds].filter(id => !synced.has(id)), async (imgId) => {
                     try {
-                        const imgData = await opfs.read(imgId);
-                        if (imgData) {
-                            await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
-                            uploaded.add(imgId);
-                        }
+                        const d = await opfs.read(imgId);
+                        if (d) { await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, d, { contentType: 'image/webp' }); uploaded.add(imgId); }
                     } catch {}
                 });
-                const orphaned = syncedArr.filter(id => !imageIds.has(id));
-                await _pool(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}));
-                const nowSynced = [...imageIds].filter(id => syncedSet.has(id) || uploaded.has(id));
-                _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: nowSynced };
+                await _pool([...synced].filter(id => !imageIds.has(id)), id => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${id}`).catch(() => {}));
+                _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...imageIds].filter(id => synced.has(id) || uploaded.has(id)) };
             };
             const _syncConversationToR2 = async (id) => {
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
@@ -1625,7 +1594,7 @@ const TagCountBadge={
                 });
                 if (missingMsgIds.length) throw new Error(`Missing local message file(s): ${missingMsgIds.join(', ')}`);
                 const meta = _findMeta(id);
-                const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
+                const metaPick = meta && { title: meta.title, timestamp: meta.timestamp };
                 const manifestJson = await opfs.read(_manifestPath(id));
                 await _pushConvoToR2(id, manifestJson, msgFiles, imageIds, metaPick);
             };
@@ -1744,7 +1713,7 @@ const TagCountBadge={
                     const es = props.editState; if (!es) return;
                     const t = es.text.trim();
                     if (!t && !es.images.length) { toast.err('Message cannot be empty'); return; }
-                    await Promise.all(_.compact(es.images.map(i => i._ingestPromise)));
+                    await Promise.all(es.images.map(i => i._ingestPromise).filter(Boolean));
                     props.msg.text = t; props.msg.images = es.images;
                     emit('update:editState', null);
                     toast.q('Message edited');
