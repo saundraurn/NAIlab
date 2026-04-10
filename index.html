@@ -990,7 +990,7 @@ const TagCountBadge={
                                 inlineDataCount++;
                                 const sPart = { _imageRef: imageId, _mimeType: _WP };
                                 if (part.thought) sPart.thought = true;
-                                if (part.thoughtSignature) sPart._thoughtSignature = part.thoughtSignature;
+                                if (part.thoughtSignature) sPart.thoughtSignature = part.thoughtSignature;
                                 if (part.text) sPart.text = part.text;
                                 return sPart;
                             }
@@ -1004,18 +1004,12 @@ const TagCountBadge={
                             id: v.id,
                             parts: serializedParts,
                             _text: v._text || '',
-                            _thinking: '',
                             _images: serializedImages,
                             _imageSize: v._imageSize || '1K',
                             _model: v._model || _FM,
                             _flexInference: !!v._flexInference,
                             _genTimeMs: v._genTimeMs || null,
-                            _usage: v._usage ? _.omitBy({
-                                promptTokenCount: v._usage.promptTokenCount || 0,
-                                candidatesTokenCount: v._usage.candidatesTokenCount || 0,
-                                candidatesTokensDetails: v._usage.candidatesTokensDetails,
-                                thoughtsTokenCount: v._usage.thoughtsTokenCount
-                            }, _.isNil) : null,
+                            _usage: v._usage ? Object.assign({promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0}, v._usage.candidatesTokensDetails && {candidatesTokensDetails: v._usage.candidatesTokensDetails}, v._usage.thoughtsTokenCount && {thoughtsTokenCount: v._usage.thoughtsTokenCount}) : null,
                             _error: v._error || null,
                             _blockReason: v._blockReason || null,
                             _isPromptBlock: !!v._isPromptBlock,
@@ -1026,36 +1020,36 @@ const TagCountBadge={
                 }
                 return { id: msg.id, role: msg.role, hidden: !!msg.hidden };
             }));
-            return { messages: serializedMessages };
+            return serializedMessages;
         };
         const deserializeConversation = async (serializedData) => {
-            if (!serializedData) return { messages: [] };
+            if (!serializedData) return [];
             const _imgCache = new Map();
             const loadCached = (id) => { if (!_imgCache.has(id)) _imgCache.set(id, loadImageAsBase64(id)); return _imgCache.get(id); };
             const messages = await Promise.all((serializedData.messages || []).map(async (msg) => {
-                const dMsg = { ...msg };
-                if (dMsg.images && dMsg.images.length > 0) {
-                    dMsg.images = await Promise.all(dMsg.images.map(async (img) => {
+                const { images: rawImages, variants: rawVariants, ...dMsg } = msg;
+                if (rawImages?.length) {
+                    dMsg.images = await Promise.all(rawImages.map(async (img) => {
                         const dImg = { ...img };
                         if (dImg.imageId) dImg.data = await loadCached(dImg.imageId);
                         return dImg;
                     }));
                 }
-                if (dMsg.variants && dMsg.variants.length > 0) {
-                    dMsg.variants = await Promise.all(dMsg.variants.map(async (v) => {
-                        const dV = { ...v };
-                        dV.parts = await Promise.all(v.parts.map(async (part) => {
+                if (rawVariants?.length) {
+                    dMsg.variants = await Promise.all(rawVariants.map(async (v) => {
+                        const { parts: rawParts, _images: rawVImages, ...dV } = v;
+                        dV.parts = await Promise.all((rawParts || []).map(async (part) => {
                             if (part._imageRef) {
                                 const imgB64 = await loadCached(part._imageRef);
                                 if (!imgB64) console.warn(`Missing image data for ${part._imageRef}`);
-                                const base = _.omit(part, ['_imageRef', '_mimeType', '_thoughtSignature']);
-                                if (part._thoughtSignature) base.thoughtSignature = part._thoughtSignature;
-                                if (imgB64) base.inlineData = { data: imgB64, mimeType: part._mimeType || _WP };
+                                const { _imageRef, _mimeType, _thoughtSignature, thoughtSignature, ...base } = part;
+                                if (_thoughtSignature || thoughtSignature) base.thoughtSignature = _thoughtSignature || thoughtSignature;
+                                if (imgB64) base.inlineData = { data: imgB64, mimeType: _mimeType || _WP };
                                 return base;
                             }
                             return part;
                         }));
-                        dV._images = await Promise.all((v._images || []).map(async (img) => {
+                        dV._images = await Promise.all((rawVImages || []).map(async (img) => {
                             if (img.imageId) return { ...img, data: await loadCached(img.imageId) };
                             return img;
                         }));
@@ -1067,7 +1061,7 @@ const TagCountBadge={
                 }
                 return dMsg;
             }));
-            return { messages };
+            return messages;
         };
         const _BLOCK_REASONS = new Set('SAFETY,IMAGE_SAFETY,IMAGE_PROHIBITED_CONTENT,PROHIBITED_CONTENT,RECITATION,IMAGE_RECITATION,OTHER,IMAGE_OTHER,NO_IMAGE,BLOCKLIST,SPII'.split(','));
         const _TERMINAL_REASONS = new Set(['LANGUAGE','MODEL_ARMOR']);
@@ -1224,8 +1218,7 @@ const TagCountBadge={
             const _saveConvoDirect = async (convo) => {
                 if (!convo || convo.isTemp || !convo.messages.length) return;
                 try {
-                    const serialized = await serializeConversation(convo.messages);
-                    await _writeConvo(convo.id, serialized.messages, convo.params);
+                    await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params);
                     const meta = _findMeta(convo.id);
                     if (meta) { meta.timestamp = Date.now(); }
                 } catch (e) { console.warn('Auto-save failed:', e); }
@@ -1338,8 +1331,7 @@ const TagCountBadge={
                 convo.title = actualTitle; convo.isTemp = false;
                 convo.timestamp = Date.now();
                 const meta = { id: convo.id, title: actualTitle, timestamp: convo.timestamp };
-                const serialized = await serializeConversation(convo.messages);
-                try { await _writeConvo(convo.id, serialized.messages, convo.params); }
+                try { await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params); }
                 catch (e) { toast.err('Failed to save conversation: ' + e.message); return; }
                 const list = savedConversations.value;
                 const idx = list.findIndex(x => x.id === convo.id);
@@ -1404,13 +1396,13 @@ const TagCountBadge={
                             try { await _writeConvo(id, convoData.messages, convoData.params); } catch {}
                             if (convoData.title) {
                                 convo.title = convoData.title;
-                                if (meta) meta.title = convoData.title;
+                                meta.title = convoData.title;
                             }
                             if (convoData.timestamp != null) {
                                 const ts = +convoData.timestamp;
                                 if (Number.isFinite(ts)) {
                                     convo.timestamp = ts;
-                                    if (meta) meta.timestamp = ts;
+                                    meta.timestamp = ts;
                                 }
                             }
                         }
@@ -1425,8 +1417,7 @@ const TagCountBadge={
                         await _pullMissingImagesFromR2(convoData, id);
                     }
                     if (convoData.params) Object.assign(convo.params, convoData.params);
-                    const deserialized = await deserializeConversation(convoData);
-                    convo.messages = deserialized.messages;
+                    convo.messages = await deserializeConversation(convoData);
                 } finally { convo.isHydrating = false; }
             };
             const deleteConversation = async (id) => {
