@@ -86,7 +86,7 @@ async function handleR2(request, env, url) {
       if (obj.httpEtag) headers['ETag'] = obj.httpEtag;
       const ifNoneMatch = request.headers.get('If-None-Match');
       if (ifNoneMatch && obj.httpEtag && ifNoneMatch === obj.httpEtag) {
-        return corsResponse(null, 304);
+        return new Response(null, { status: 304, headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'ETag': obj.httpEtag } });
       }
       return new Response(obj.body, { headers });
     }

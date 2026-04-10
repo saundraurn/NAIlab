@@ -142,6 +142,7 @@
                 read: async (n) => { try { return new Uint8Array(await (await (await r()).getFileHandle(n)).getFile().then(f => f.arrayBuffer())); } catch { return null; } },
                 readText: async (n) => { try { return await (await (await r()).getFileHandle(n)).getFile().then(f => f.text()); } catch { return null; } },
                 remove: async (n) => { try { await (await r()).removeEntry(n); } catch {} },
+                exists: async (n) => { try { await (await r()).getFileHandle(n); return true; } catch { return false; } },
                 keys: async () => { const a = []; for await (const k of (await r()).keys()) a.push(k); return a; }
             };
         })();
@@ -265,9 +266,8 @@
                     } catch {}
                 }
                 const files = await opfs.keys();
-                for (const f of files) {
-                    if (f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f)) opfs.remove(f);
-                }
+                const orphans = files.filter(f => f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f));
+                await Promise.all(orphans.map(f => opfs.remove(f)));
             };
             return { saveImage, loadImage, ingestImage, cleanupOrphanedImages };
         });
@@ -1303,8 +1303,7 @@ const TagCountBadge={
                 const imageIds = _collectImageIds(convoData);
                 if (!imageIds.size) return [];
                 const idArr = [...imageIds];
-                const localKeys = new Set(await opfs.keys());
-                const missing = idArr.filter(id => !localKeys.has(id));
+                const missing = (await Promise.all(idArr.map(async id => (await opfs.exists(id)) ? null : id))).filter(Boolean);
                 if (!missing.length) return idArr;
                 try {
                     const pulled = [];
