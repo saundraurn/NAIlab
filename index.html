@@ -24,7 +24,7 @@
     <script src="https://unpkg.com/fflate/umd/index.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js"></script>
     <script src="https://unpkg.com/textarea-caret@3.1.0/index.js"></script>
-    <script src="https://unpkg.com/@isomorphic-git/lightning-fs@4.6.2"></script>
+
     <link href="https://fonts.googleapis.com/css2?family=Raleway:wght@400;500;600;700&family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
     <style>[data-theme="ritrotheme"]{color-scheme:dark;--p:0.65 0.15 254;--pc:95% 0.05 205;--s:70% 0.25 280;--sc:0.94 0.0114 203;--a:65% 0.35 60;--ac:20% 0.1 60;--n:30% 0.05 240;--nc:90% 0.02 240;--b1:18% 0.04 240;--b2:25% 0.05 240;--b3:0.69 0.05 240;--bc:90% 0.02 240;--in:55% 0.15 220;--inc:95% 0.05 220;--su:60% 0.2 130;--suc:20% 0.1 130;--wa:70% 0.25 75;--wac:25% 0.1 75;--er:55% 0.28 10;--erc:90% 0.05 10;--radius-selector:0.5rem;--radius-field:2rem;--radius-box:0.5rem;--size-selector:0.25rem;--size-field:0.1875rem;--border:0.5px;--depth:1;--noise:0}</style>
     <style type="text/tailwindcss">
@@ -134,6 +134,18 @@
         const MAX_SEED=9e15;
         const _batch5 = async (arr, fn) => { for (let i = 0; i < arr.length; i += 5) await Promise.all(arr.slice(i, i + 5).map(fn)); };
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
+        const opfs = (() => {
+            let _r;
+            const r = async () => _r || (_r = await navigator.storage.getDirectory());
+            return {
+                write: async (n, d) => { const h = await (await r()).getFileHandle(n, {create:true}), w = await h.createWritable(); await w.write(typeof d === 'string' ? new TextEncoder().encode(d) : d); await w.close(); },
+                read: async (n) => { try { return new Uint8Array(await (await (await r()).getFileHandle(n)).getFile().then(f => f.arrayBuffer())); } catch { return null; } },
+                readText: async (n) => { try { return await (await (await r()).getFileHandle(n)).getFile().then(f => f.text()); } catch { return null; } },
+                remove: async (n) => { try { await (await r()).removeEntry(n); } catch {} },
+                exists: async (n) => { try { await (await r()).getFileHandle(n); return true; } catch { return false; } },
+                keys: async () => { const a = []; for await (const k of (await r()).keys()) a.push(k); return a; }
+            };
+        })();
         const useAppStore = createGlobalState(() => {
             const config = useLocalStorage('nai-app-settings', {
                 tagTest: {iterations:1, isInfinite:false, isControl:true, prompts:[{id:1, val:'1girl, solo, wearing casual clothes'}], nextPromptId:2, unwantedContent:'multiple views, monochrome, black and white, looking at viewer, pov', tagsToTest:'sunset lighting\nwarm colors\nnight scene\nfog\nrain', tagPos:'beginning', tagTarget:'prompt', tagStrength:1.0, hasExtendedRange:false, areTagsVisible:false, shouldFilterMiddleResults:false},
@@ -226,15 +238,7 @@
             return `${proxyUrl.replace(/\/$/, '')}/proxy?url=${encodeURIComponent(url)}`;
         };
         const useImageStore = createGlobalState(() => {
-            const store = useAppStore();
-            let localLfs = null;
-            const init = async () => {
-                localLfs = new LightningFS('nailab-git');
-                try { await localLfs.promises.unlink('/conversations.json'); } catch {}
-            };
-            const saveImage = async (imageId, uint8Array) => {
-                await localLfs.promises.writeFile('/' + imageId, uint8Array);
-            };
+            const saveImage = (imageId, uint8Array) => opfs.write(imageId, uint8Array);
             const ingestImage = async (input) => {
                 let webpBytes;
                 if (input instanceof Blob) {
@@ -251,41 +255,21 @@
                 await saveImage(imageId, webpBytes);
                 return { imageId, base64: uint8ArrayToBase64(webpBytes), webpBytes };
             };
-            const loadImage = async (imageId) => {
-                try { return await localLfs.promises.readFile('/' + imageId) || null; } catch { return null; }
-            };
+            const loadImage = (imageId) => opfs.read(imageId);
             const cleanupOrphanedImages = async (savedConvosList) => {
-                const lp = localLfs.promises;
-                const metas = savedConvosList || [];
                 const referenced = new Set();
-                for (const meta of metas) {
-                    if (!meta || !meta.id) continue;
+                for (const meta of savedConvosList || []) {
+                    if (!meta?.id) continue;
                     try {
-                        const json = await lp.readFile(_convoPath(meta.id), { encoding: 'utf8' });
-                        const convo = JSON.parse(json);
-                        for (const msg of convo.messages || []) {
-                            for (const img of msg.images || []) { if (img.imageId) referenced.add(img.imageId); }
-                            for (const v of msg.variants || []) {
-                                for (const part of v.parts || []) { if (part._imageRef) referenced.add(part._imageRef); }
-                                for (const img of v._images || []) { if (img.imageId) referenced.add(img.imageId); }
-                            }
-                        }
+                        const convo = JSON.parse(await opfs.readText(_convoPath(meta.id)));
+                        _collectImageIds(convo).forEach(id => referenced.add(id));
                     } catch {}
                 }
-                try {
-                    const files = await lp.readdir('/');
-                    for (const f of files) {
-                        if (f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f)) {
-                            lp.unlink('/' + f).catch(() => {});
-                        }
-                    }
-                } catch {}
+                const files = await opfs.keys();
+                const orphans = files.filter(f => f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f));
+                await Promise.all(orphans.map(f => opfs.remove(f)));
             };
-            const getLfs = () => localLfs;
-            return {
-                init, saveImage, loadImage, ingestImage,
-                cleanupOrphanedImages, getLfs
-            };
+            return { saveImage, loadImage, ingestImage, cleanupOrphanedImages };
         });
         const useR2Client = createGlobalState(() => {
             const appStore = useAppStore();
@@ -305,58 +289,15 @@
                 if (options.contentType) headers['Content-Type'] = options.contentType;
                 if (options.customHeaders) {
                     for (const [key, value] of Object.entries(options.customHeaders)) {
-                        if (/^x-convo-/i.test(key)) headers[key] = value;
+                        if (/^(x-convo-|if-none-match$)/i.test(key)) headers[key] = value;
                     }
                 }
                 const res = await fetch(`${base}/r2/${path}`, { method, headers, body, cache: 'no-store' });
                 if (res.status === 401) throw new Error('Invalid sync secret.');
-                if (!res.ok && res.status !== 404) throw new Error(`R2 request failed: ${res.status}`);
+                if (!res.ok && res.status !== 404 && res.status !== 304) throw new Error(`R2 request failed: ${res.status}`);
                 return res;
             };
             return { r2Fetch, getWorkerUrl, getSecret };
-        });
-        const useSyncQueue = createGlobalState(() => {
-            const _queue = reactive([]);
-            const _running = ref(false);
-            let _timer = null;
-            const _BATCH_DELAY = 300;
-            const _MIN_INTERVAL = 1200;
-            let _lastRunAt = 0;
-            const enqueue = (key, fn) => {
-                const existing = _queue.findIndex(q => q.key === key);
-                if (existing !== -1) _queue[existing].fn = fn;
-                else _queue.push({ key, fn });
-                _scheduleRun();
-            };
-            const _scheduleRun = () => {
-                if (_running.value || _timer) return;
-                const elapsed = Date.now() - _lastRunAt;
-                const wait = Math.max(_BATCH_DELAY, _MIN_INTERVAL - elapsed);
-                _timer = setTimeout(_processQueue, wait);
-            };
-            const _processQueue = async () => {
-                _timer = null;
-                if (_running.value || !_queue.length) return;
-                _running.value = true;
-                try {
-                    while (_queue.length) {
-                        const batch = _queue.splice(0);
-                        const errors = [];
-                        for (const item of batch) {
-                            try { await item.fn(); }
-                            catch (e) { errors.push({ key: item.key, error: e }); console.warn(`Sync queue error [${item.key}]:`, e); }
-                        }
-                        _lastRunAt = Date.now();
-                        if (errors.length) {
-                            const failed = errors.map(e => e.key).join(', ');
-                            toast.warn(`Sync failed for: ${failed}`, 'sync', 4000);
-                        }
-                    }
-                } finally { _running.value = false; if (_queue.length) _scheduleRun(); }
-            };
-            const isRunning = computed(() => _running.value);
-            const pending = computed(() => _queue.length);
-            return { enqueue, isRunning, pending };
         });
         const useSyncStore = createGlobalState(() => {
             const isSyncing = ref(false);
@@ -364,27 +305,20 @@
             const syncStatus = ref('idle');
             const appStore = useAppStore();
             const r2Client = useR2Client();
-            const syncQueue = useSyncQueue();
             const TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-            const _finalizePush = (cfg) => {
-                cfg.jssync.lastSyncedAt = Date.now();
-            };
             const withFlag = (f, fn) => { f.value = true; return Promise.resolve().then(fn).finally(() => { f.value = false; }); };
             const withSyncMerge = (fn) => withFlag(appStore.isSyncMerging, fn);
             const _applySectionDict = (cfg, dict) => {
                 _.forOwn(dict, (val, key) => {
                     if (key === '_syncMeta') return;
-                    const merged = _.isArray(val) ? _.cloneDeep(val) : _.mergeWith({}, cfg[key], val, (_o, s) => _.isArray(s) ? _.cloneDeep(s) : undefined);
+                    const merged = _.isArray(val) ? structuredClone(val) : _.mergeWith({}, cfg[key], val, (_o, s) => _.isArray(s) ? structuredClone(s) : undefined);
                     if (_.isPlainObject(merged) && _.isPlainObject(cfg[key])) { Object.assign(cfg[key], merged); }
                     else { cfg[key] = merged; }
                 });
             };
             const _setSyncError = (e) => { syncError.value = e.message; syncStatus.value = 'error'; };
-            const extractSyncPayload = (fullConfig) => {
-                const snap = _.cloneDeep(_.pick(fullConfig, [..._SYNC_KEYS,'_syncMeta']));
-                if (snap.app) delete snap.app.apiKey;
-                return snap;
-            };
+            const _configEtag = useLocalStorage('nai-config-etag', null);
+            watch(() => [appStore.config.value.jssync.proxyUrl, appStore.syncToken.value], () => { _configEtag.value = null; });
             const _pruneTombstones = (tombstones) => {
                 const cutoff = Date.now() - TOMBSTONE_TTL_MS;
                 return (tombstones || []).filter(t => t.deletedAt > cutoff);
@@ -394,10 +328,15 @@
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 syncStatus.value = 'pulling'; syncError.value = null;
                 try {
+                    const configHeaders = {};
+                    if (_configEtag.value) configHeaders['If-None-Match'] = _configEtag.value;
                     const [res, listRes] = await Promise.all([
-                        r2Client.r2Fetch('GET', 'config'),
+                        r2Client.r2Fetch('GET', 'config', null, { customHeaders: configHeaders }),
                         r2Client.r2Fetch('GET', 'conversations').catch(e => { console.warn('Sync pull: failed to fetch conversations list.', e); return null; })
                     ]);
+                    if (res.status !== 304) {
+                    const etag = res.headers.get('ETag');
+                    if (etag) _configEtag.value = etag;
                     const remote = await res.json();
                     if (remote && Object.keys(remote).length) {
                         const localMeta = cfg._syncMeta || {};
@@ -415,7 +354,7 @@
                             await withSyncMerge(() => {
                                 _applySectionDict(cfg, lwwMerged);
                                 _.forOwn(lwwMerged, (_v, k) => {
-                                    if (remoteMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remoteMeta[k]);
+                                    if (remoteMeta[k]) cfg._syncMeta[k] = structuredClone(remoteMeta[k]);
                                 });
                             });
                             toast.ok(`Pulled ${mergedKeys.length} updated section(s).`, 'sync', 3000);
@@ -430,7 +369,7 @@
                             }
                             cfg.jssync._deletedConversationIds = _pruneTombstones([...merged.values()]);
                         }
-                    }
+                    } // end if (res.status !== 304)
                     const gemini = useGeminiAPI();
                     const tombstoneIds = new Set((cfg.jssync._deletedConversationIds || []).map(t => t.id));
                     if (tombstoneIds.size) {
@@ -440,8 +379,7 @@
                         gemini.savedConversations.value = gemini.savedConversations.value.filter(c => {
                             if (tombstoneIds.has(c.id)) {
                                 delete localCloud[c.id];
-                                const lfs = useImageStore().getLfs();
-                                if (lfs) lfs.promises.unlink(_convoPath(c.id)).catch(() => {});
+                                _rmConvo(c.id);
                                 if (gemini.conversationMap.has(c.id) && !activeWasTombstoned) {
                                     gemini.closeConversation(c.id);
                                 } else if (gemini.conversationMap.has(c.id)) {
@@ -471,7 +409,6 @@
                             const localCloudMap = { ...gemini.cloudConversations.value };
                             const remoteIdSet = new Set();
                             let addedCount = 0, updatedCount = 0;
-                            const lfs = useImageStore().getLfs();
                             for (const entry of remoteConvos) {
                                 if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
                                 const remoteId = entry.id;
@@ -487,7 +424,7 @@
                                 } else if (ts > (localById[remoteId].timestamp || 0)) {
                                     localById[remoteId].title = title;
                                     localById[remoteId].timestamp = ts;
-                                    if (lfs) lfs.promises.unlink(_convoPath(remoteId)).catch(() => {});
+                                    _rmConvo(remoteId);
                                     if (gemini.conversationMap.has(remoteId)) gemini.closeConversation(remoteId);
                                     updatedCount++;
                                 }
@@ -498,7 +435,7 @@
                                 delete localCloudMap[cid];
                                 if (localById[cid]) {
                                     delete localById[cid];
-                                    if (lfs) lfs.promises.unlink(_convoPath(cid)).catch(() => {});
+                                    _rmConvo(cid);
                                     if (gemini.conversationMap.has(cid)) gemini.closeConversation(cid);
                                     removedCount++;
                                 }
@@ -531,10 +468,12 @@
                 try {
                     const tombstones = cfg.jssync._deletedConversationIds || [];
                     const lastSynced = cfg.jssync.lastSyncedAt || 0;
-                    const payload = extractSyncPayload(cfg);
+                    const payload = structuredClone(_.pick(cfg, [..._SYNC_KEYS,'_syncMeta']));
+                    if (payload.app) delete payload.app.apiKey;
                     payload._deletedConversationIds = _pruneTombstones(tombstones);
                     if (_SYNC_KEYS.some(k=>(cfg._syncMeta?.[k]?.updatedAt||0)>lastSynced) || tombstones.some(t=>t.deletedAt>lastSynced)) {
                         await r2Client.r2Fetch('PUT', 'config', JSON.stringify(payload), { contentType: 'application/json' });
+                        _configEtag.value = null;
                     }
                     const gemini = useGeminiAPI();
                     const localCloudMap = { ...gemini.cloudConversations.value };
@@ -552,7 +491,7 @@
                     });
                     const tombstonesToDelete = tombstones.filter(t => t.deletedAt > lastSynced);
                     await _batch5(tombstonesToDelete, t => r2Client.r2Fetch('DELETE', `conversations/${t.id}`).catch(() => {}));
-                    _finalizePush(cfg);
+                    cfg.jssync.lastSyncedAt = Date.now();
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config synced to cloud.', 'sync', 2500);
                 } catch (e) {
@@ -567,9 +506,7 @@
                     if (syncStatus.value === 'idle') await push(true);
                 });
             };
-            const queueSync = () => {
-                syncQueue.enqueue('config', syncNow);
-            };
+            const queueSync = useDebounceFn(() => syncNow().catch(() => {}), 1200);
             return { isSyncing, syncStatus, syncError, pull, push, syncNow, queueSync };
         });
         const TAG_COLORS={artist:['badge-warning','bg-warning/20'],character:['badge-success','bg-success/20'],copyright:['badge-accent','bg-accent/20'],meta:['badge-info','bg-info/20'],default:['badge-primary','bg-primary/20']};
@@ -725,13 +662,12 @@ const TagCountBadge={
             setup:(p)=>({updateList:(inc)=>updateItemNum(p.items,p.idRef,inc)}),
             template:`<collapsible-panel :title="title" :storage-key="storageKey"><template #actions><counter :count="items.length" :on-update="updateList"><template #icon><material-icon :icon="icon" size="16"/></template></counter></template><transition-group tag="div" name="list" class="space-y-3 pt-2"><autocomplete-field v-for="(p,i) in items" :key="p.id" :label="'#'+(i+1)" v-model:model-val="p.val" class="!min-h-[3.5rem] py-2" rows="1" :placeholder="placeholder"></autocomplete-field></transition-group><slot name="footer"></slot></collapsible-panel>`
         };
-        const _TOAST_CONFIG = {loading: 'alert-info', success: 'alert-success', error: 'alert-error', warning: 'alert-warning'};
         const ToastContainer = {
             setup() {
                 const {toasts, removeToast} = useAppStore();
-                return {toasts, removeToast, toastConfig: _TOAST_CONFIG};
+                return {toasts, removeToast, tc: t => 'alert-' + (t === 'loading' ? 'info' : t)};
             },
-            template: `<div class="toast toast-bottom toast-end z-[1000] p-4 pointer-events-none"><transition-group name="list" tag="div" class="flex flex-col items-end space-y-2"><div v-for="toast in toasts" :key="toast.id" class="alert shadow-lg w-fit max-w-md cursor-pointer flex border border-white/10 text-white pointer-events-auto" :class="[toastConfig[toast.type] || '', 'bg-opacity-80 backdrop-blur-md']" @click="removeToast(toast.id)"><span> {{toast.msg}} <span v-if="toast.count > 1" class="font-bold text-sm"> (x{{toast.count}})</span><span v-if="toast.source && toast.source !== 'default'" class="text-xs opacity-75 ml-1">(from {{toast.source}})</span></span></div></transition-group></div>`
+            template: `<div class="toast toast-bottom toast-end z-[1000] p-4 pointer-events-none"><transition-group name="list" tag="div" class="flex flex-col items-end space-y-2"><div v-for="toast in toasts" :key="toast.id" class="alert shadow-lg w-fit max-w-md cursor-pointer flex border border-white/10 text-white pointer-events-auto" :class="[tc(toast.type), 'bg-opacity-80 backdrop-blur-md']" @click="removeToast(toast.id)"><span> {{toast.msg}} <span v-if="toast.count > 1" class="font-bold text-sm"> (x{{toast.count}})</span><span v-if="toast.source && toast.source !== 'default'" class="text-xs opacity-75 ml-1">(from {{toast.source}})</span></span></div></transition-group></div>`
         };
         const _GEN_SAMPLERS = 'k_euler_ancestral,k_euler,k_dpmpp_2s_ancestral,k_dpmpp_2m_sde,k_dpmpp_2m,k_dpmpp_sde,ddim_v3,ddim'.split(',');
         const _GEN_SCHEDULERS = ['karras','exponential','polyexponential'].map(v=>({val:v,text:v[0].toUpperCase()+v.slice(1)}));
@@ -783,7 +719,6 @@ const TagCountBadge={
         const DanbooruBrowser = {
             setup() {
                 const store = useAppStore(), {config} = store, {danbooru, app} = toRefs(config.value);
-                _.defaultsDeep(danbooru.value, {savedSearches: [{name: 'Trending', prompt: 'order:rank'}], blacklist: '', sortOrder: 'id', ratingFilters: {g: true, s: true, q: true, e: true}});
                 const route = useRoute(), router = useRouter(), gridRoutes = ['danbooru-grid', 'danbooru-folder'], ratingMeta = _DANBOORU_RATING_META;
                 const naiTagKnowledge = useSessionStorage('danbooru-tag-knowledge', {}), tagQueues = {nai: [], danbooru: []}, activeReqs = {nai: 0, danbooru: 0}, queuedTags = new Set();
                 let isDisposed = false, _pqTimeout = null;
@@ -952,9 +887,9 @@ const TagCountBadge={
             const t = v?._text || v?.parts?.find(p => p.text && !p.thought)?.text;
             return (t || msgs.find(m => m.role === 'user')?.text || '').substring(0, 60);
         };
-        const _convoPath = id => `/convo_${id}.json`;
-        const _writeConvoToLfs = (lfs, id, messages, params) =>
-            lfs.promises.writeFile(_convoPath(id), JSON.stringify({ messages, ...(params ? { params } : {}) }));
+        const _convoPath = id => `convo_${id}.json`;
+        const _writeConvo = (id, messages, params) =>
+            opfs.write(_convoPath(id), JSON.stringify({ messages, ...(params ? { params } : {}) }));
         const _collectImageIds = (convoData) => {
             const ids = new Set();
             for (const msg of convoData.messages || []) {
@@ -1111,6 +1046,9 @@ const TagCountBadge={
             const _syncedR2Images = useLocalStorage('nai-r2-synced-images', {});
             const convoSyncStatus = reactive({});
             const getList = () => savedConversations.value;
+            const _findMeta = id => savedConversations.value.find(x => x.id === id);
+            const _markCloud = id => { if (!cloudConversations.value[id]) cloudConversations.value = { ...cloudConversations.value, [id]: true }; };
+            const _rmConvo = id => opfs.remove(_convoPath(id));
             const _requireGeminiKey = () => {
                 if (!store.config.value.gemini?.apiKey) { toast.err('Gemini API key required — set it in Settings'); return false; }
                 return true;
@@ -1227,13 +1165,10 @@ const TagCountBadge={
             };
             const _saveConvoDirect = async (convo) => {
                 if (!convo || convo.isTemp || !convo.messages.length) return;
-                const lfs = imageStore.getLfs();
-                if (!lfs) return;
                 try {
                     const serialized = await serializeConversation(convo.messages);
-                    await _writeConvoToLfs(lfs, convo.id, serialized.messages, convo.params);
-                    const list = getList();
-                    const meta = list.find(x => x.id === convo.id);
+                    await _writeConvo(convo.id, serialized.messages, convo.params);
+                    const meta = getList().find(x => x.id === convo.id);
                     if (meta) { meta.timestamp = Date.now(); }
                 } catch (e) { console.warn('Auto-save failed:', e); }
             };
@@ -1266,7 +1201,7 @@ const TagCountBadge={
                     const isViewingThis = activeConvoId.value === convo.id && window.location.hash.includes('/banana');
                     if (!isViewingThis) store.incrementNotification('banana');
                     if (!convo.isTemp && _isSyncReady()) {
-                        if (!cloudConversations.value[convo.id]) cloudConversations.value = { ...cloudConversations.value, [convo.id]: true };
+                        _markCloud(convo.id);
                         _r2SyncDirty.add(convo.id);
                         _runR2Sync();
                     }
@@ -1346,11 +1281,8 @@ const TagCountBadge={
                 convo.timestamp = Date.now();
                 const meta = { id: convo.id, title: actualTitle, timestamp: convo.timestamp };
                 const serialized = await serializeConversation(convo.messages);
-                const lfs = imageStore.getLfs();
-                if (lfs) {
-                    try { await _writeConvoToLfs(lfs, convo.id, serialized.messages, convo.params); }
-                    catch (e) { toast.err('Failed to save conversation: ' + e.message); return; }
-                }
+                try { await _writeConvo(convo.id, serialized.messages, convo.params); }
+                catch (e) { toast.err('Failed to save conversation: ' + e.message); return; }
                 const list = getList();
                 const idx = list.findIndex(x => x.id === convo.id);
                 if (idx !== -1) list[idx] = meta; else list.unshift(meta);
@@ -1367,12 +1299,11 @@ const TagCountBadge={
                     return JSON.parse(await res.text());
                 } catch { return null; }
             };
-            const _pullMissingImagesFromR2 = async (convoData, convoId, localFs) => {
+            const _pullMissingImagesFromR2 = async (convoData, convoId) => {
                 const imageIds = _collectImageIds(convoData);
                 if (!imageIds.size) return [];
                 const idArr = [...imageIds];
-                const results = await Promise.allSettled(idArr.map(id => localFs.promises.stat('/' + id)));
-                const missing = idArr.filter((_, i) => results[i].status === 'rejected');
+                const missing = (await Promise.all(idArr.map(async id => (await opfs.exists(id)) ? null : id))).filter(Boolean);
                 if (!missing.length) return idArr;
                 try {
                     const pulled = [];
@@ -1381,7 +1312,7 @@ const TagCountBadge={
                             const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/images/${imgId}`);
                             if (res?.status !== 404) {
                                 const data = new Uint8Array(await res.arrayBuffer());
-                                await localFs.promises.writeFile('/' + imgId, data);
+                                await opfs.write(imgId, data);
                                 pulled.push(imgId);
                             }
                         } catch {}
@@ -1396,7 +1327,7 @@ const TagCountBadge={
             };
             const loadConversation = async (id) => {
                 if (conversationMap.has(id)) { activeConvoId.value = id; return; }
-                const meta = savedConversations.value.find(x => x.id === id);
+                const meta = _findMeta(id);
                 if (!meta) return;
                 const convo = _createConvoState({ id, title: meta.title, isTemp: false, timestamp: meta.timestamp });
                 convo.isHydrating = true;
@@ -1404,19 +1335,14 @@ const TagCountBadge={
                 activeConvoId.value = id;
                 try {
                     let convoData = null;
-                    const lfs = imageStore.getLfs();
-                    if (lfs) {
-                        try {
-                            const json = await lfs.promises.readFile(_convoPath(id), { encoding: 'utf8' });
-                            convoData = JSON.parse(json);
-                        } catch {}
-                    }
+                    try {
+                        const json = await opfs.readText(_convoPath(id));
+                        if (json) convoData = JSON.parse(json);
+                    } catch {}
                     if (!convoData && cloudConversations.value[id]) {
                         convoData = await _fetchConvoFromR2(id);
                         if (convoData) {
-                            if (lfs) {
-                                try { await _writeConvoToLfs(lfs, id, convoData.messages, convoData.params); } catch {}
-                            }
+                            try { await _writeConvo(id, convoData.messages, convoData.params); } catch {}
                             if (convoData.title) {
                                 convo.title = convoData.title;
                                 if (meta) meta.title = convoData.title;
@@ -1436,8 +1362,8 @@ const TagCountBadge={
                         if (activeConvoId.value === id) { activeConvoId.value = [...conversationMap.keys()].at(-1) ?? newChat(); }
                         return;
                     }
-                    if (cloudConversations.value[id] && lfs) {
-                        await _pullMissingImagesFromR2(convoData, id, lfs);
+                    if (cloudConversations.value[id]) {
+                        await _pullMissingImagesFromR2(convoData, id);
                     }
                     if (convoData.params) Object.assign(convo.params, convoData.params);
                     const deserialized = await deserializeConversation(convoData);
@@ -1449,8 +1375,7 @@ const TagCountBadge={
                 const idx = list.findIndex(x => x.id === id);
                 if (idx !== -1) {
                     list.splice(idx, 1);
-                    const lfs = imageStore.getLfs();
-                    if (lfs) { lfs.promises.unlink(_convoPath(id)).catch(() => {}); }
+                    _rmConvo(id);
                 }
                 if (cloudConversations.value[id]) {
                     const cfg = store.config.value;
@@ -1470,7 +1395,7 @@ const TagCountBadge={
                 const t = newTitle?.trim(); if (!t) return;
                 const convo = conversationMap.get(id);
                 if (convo) convo.title = t;
-                const s = savedConversations.value.find(x => x.id === id);
+                const s = _findMeta(id);
                 if (s) s.title = t;
             };
             const pruneNoImageMessages = () => withActiveConvo(convo => {
@@ -1501,7 +1426,7 @@ const TagCountBadge={
                 if (convo && !convo.isTemp && !convo.generating && !convo.isHydrating) {
                     _saveConvoDirect(convo);
                     if (_isSyncReady()) {
-                        if (!cloudConversations.value[convo.id]) cloudConversations.value = { ...cloudConversations.value, [convo.id]: true };
+                        _markCloud(convo.id);
                         if (convoSyncStatus[convo.id] !== 'syncing') convoSyncStatus[convo.id] = 'pending';
                         _r2SyncDirty.add(convo.id);
                         _runR2Sync();
@@ -1513,16 +1438,16 @@ const TagCountBadge={
             }, { deep: true });
             const r2Client = useR2Client();
             const _pushConvoR2Locks = new Map();
-            const _pushConvoToR2 = (convoId, convoJson, imageIds, localFs, meta) => {
+            const _pushConvoToR2 = (convoId, convoJson, imageIds, meta) => {
                 const prev = _pushConvoR2Locks.get(convoId) || Promise.resolve();
-                const next = prev.then(() => _doPushConvoToR2(convoId, convoJson, imageIds, localFs, meta));
+                const next = prev.then(() => _doPushConvoToR2(convoId, convoJson, imageIds, meta));
                 const lock = next.catch(() => {}).finally(() => {
                     if (_pushConvoR2Locks.get(convoId) === lock) _pushConvoR2Locks.delete(convoId);
                 });
                 _pushConvoR2Locks.set(convoId, lock);
                 return next;
             };
-            const _doPushConvoToR2 = async (convoId, convoJson, imageIds, localFs, meta) => {
+            const _doPushConvoToR2 = async (convoId, convoJson, imageIds, meta) => {
                 const customHeaders = {};
                 if (meta?.title) customHeaders['X-Convo-Title'] = encodeURIComponent(meta.title);
                 if (meta?.timestamp) customHeaders['X-Convo-Timestamp'] = String(meta.timestamp);
@@ -1532,34 +1457,28 @@ const TagCountBadge={
                 const newImages = [...imageIds].filter(id => !syncedSet.has(id));
                 await _batch5(newImages, async (imgId) => {
                     try {
-                        const imgData = await localFs.promises.readFile('/' + imgId);
-                        await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
+                        const imgData = await opfs.read(imgId);
+                        if (imgData) await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
                     } catch {}
                 });
-                const syncedMatch = syncedArr.length === imageIds.size && syncedArr.every(id => imageIds.has(id));
-                if (!syncedMatch) {
-                    try {
-                        const listRes = await r2Client.r2Fetch('GET', `conversations/${convoId}/images`);
-                        if (listRes.ok) {
-                            const orphaned = (await listRes.json()).filter(name => !imageIds.has(name));
-                            await _batch5(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}));
-                        }
-                    } catch {}
+                const orphaned = syncedArr.filter(id => !imageIds.has(id));
+                if (orphaned.length) {
+                    await _batch5(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}));
                 }
                 _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...imageIds] };
             };
             const _syncConversationToR2 = async (id) => {
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
-                const localFs = imageStore.getLfs();
-                if (!localFs) throw new Error('Local storage not initialized.');
                 let convoData;
-                try { convoData = JSON.parse(await localFs.promises.readFile(_convoPath(id), { encoding: 'utf8' })); }
+                const json = await opfs.readText(_convoPath(id));
+                if (!json) throw new Error('Conversation data not found locally.');
+                try { convoData = JSON.parse(json); }
                 catch { throw new Error('Conversation data not found locally.'); }
                 const imageIds = _collectImageIds(convoData);
-                const meta = savedConversations.value.find(x => x.id === id);
+                const meta = _findMeta(id);
                 const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
                 if (metaPick) Object.assign(convoData, metaPick);
-                await _pushConvoToR2(id, JSON.stringify(convoData), imageIds, localFs, metaPick);
+                await _pushConvoToR2(id, JSON.stringify(convoData), imageIds, metaPick);
             };
             let _r2SyncInProgress = false;
             let _r2SyncPromise = null;
@@ -1580,7 +1499,7 @@ const TagCountBadge={
                             } catch (e) {
                                 convoSyncStatus[id] = 'error';
                                 console.warn('Convo R2 sync failed:', e);
-                                const title = savedConversations.value.find(x => x.id === id)?.title || id;
+                                const title = _findMeta(id)?.title || id;
                                 toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
                             }
                         }
@@ -1597,7 +1516,7 @@ const TagCountBadge={
                 if (!cloudConversations.value[id]) {
                     convoSyncStatus[id] = 'syncing';
                     try {
-                        cloudConversations.value = { ...cloudConversations.value, [id]: true };
+                        _markCloud(id);
                         await _syncConversationToR2(id);
                         await useSyncStore().push(true);
                         convoSyncStatus[id] = 'synced';
@@ -1816,7 +1735,6 @@ const TagCountBadge={
             },
             template: `<split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #header><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0 w-28"><setting-input v-model="convoParams.aspectRatio" label="Aspect Ratio" type="select" :options="aspectRatios"></setting-input></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></template><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><convo-list-item v-for="convo in openConversations" :key="convo.id" :convo="convo" :is-active="activeConvoId===convo.id" is-open :cloud-linked="!convo.isTemp&&!!conversationGists[convo.id]" :sync-status="convoSyncStatus[convo.id]" @click="switchConversation(convo.id)" @rename="handleRename(convo,$event)"><template v-if="convo.messages.length" #preview><span class="truncate flex-1">{{getConvoPreview(convo.messages)}}</span><span class="shrink-0 text-neutral-600 tabular-nums">· {{convo.messages.length}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn v-if="convo.isTemp&&convo.messages.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/><icon-btn icon="close" @click.stop="closeConversation(convo.id)" title="Close" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item><template v-if="closedSavedConversations.length"><div class="divider text-xs text-neutral-600 my-2 select-none">Saved ({{ closedSavedConversations.length }})</div><convo-list-item v-for="convo in closedSavedConversations" :key="convo.id" :convo="convo" :cloud-linked="!!conversationGists[convo.id]" @click="loadConversation(convo.id)" @rename="handleRename(convo,$event)"><template #preview><span class="shrink-0 text-neutral-600 tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn icon="delete" @click.stop="deleteConversation(convo.id)" title="Delete" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item></template><div v-if="!openConversations.length && !closedSavedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()"></chat-message></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><image-preview-card v-for="(img, idx) in pendingImages" :key="idx" :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport>`
         };
-        /* ConflictResolutionModal removed — sync now uses last-write-wins */
         const Settings = {
             setup() {
                 const appStore = useAppStore();
@@ -1890,16 +1808,14 @@ const TagCountBadge={
                 });
                 onMounted(async () => {
                     const jssync = config.value.jssync;
-                    const imageStore = useImageStore();
                     const geminiAPI = useGeminiAPI();
-                    await imageStore.init();
                     let pullDone = Promise.resolve();
                     if (syncToken.value && jssync.proxyUrl) {
                         pullDone = syncStore.pull().catch(() => {});
                     }
                     await geminiAPI.initFromStorage();
                     await pullDone;
-                    imageStore.cleanupOrphanedImages(geminiAPI.savedConversations.value).catch(() => {});
+                    useImageStore().cleanupOrphanedImages(geminiAPI.savedConversations.value).catch(() => {});
                     const _debouncedAutoSync = useDebounceFn(() => {
                         const js = config.value.jssync;
                         if (!syncToken.value || !js.proxyUrl) return;
