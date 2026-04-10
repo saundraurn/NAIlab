@@ -154,7 +154,7 @@
                 gemini: {apiKey:''},
                 danbooru: {folders:[], nextFolderId:1, gridCols:4, lastPath:'/danbooru', blacklist:'', sortOrder:'id', ratingFilters:{g:true, s:true, q:true, e:true}, savedSearches:[{name:'Trending', prompt:'order:rank'}]},
                 genState: {prompt:'1girl, solo, wearing casual clothes', uc:'multiple views, monochrome, black and white, looking at viewer, pov', charPrompts:[{id:1, val:''}], nextCharPromptId:2},
-                jssync: {proxyUrl:'', autoSync:true, lastSyncedAt:null},
+                jssync: {proxyUrl:'', lastSyncedAt:null},
                 _syncMeta: {tagTest:{updatedAt:0,rev:0}, genConfig:{updatedAt:0,rev:0}, genState:{updatedAt:0,rev:0}, app:{updatedAt:0,rev:0}, danbooru:{updatedAt:0,rev:0}}
             }, {mergeDefaults: true});
 
@@ -236,6 +236,21 @@
             if (!/^https?:\/\//i.test(proxyUrl)) proxyUrl = 'https://' + proxyUrl;
             return `${proxyUrl.replace(/\/$/, '')}/proxy?url=${encodeURIComponent(url)}`;
         };
+        const _convoPath = id => `convo_${id}.json`;
+        const _rmConvo = id => opfs.remove(_convoPath(id)).catch(() => {});
+        const _writeConvo = (id, messages, params) =>
+            opfs.write(_convoPath(id), JSON.stringify({ messages, ...(params ? { params } : {}) }));
+        const _collectImageIds = (convoData) => {
+            const ids = new Set();
+            for (const msg of convoData.messages || []) {
+                for (const img of msg.images || []) { if (img.imageId) ids.add(img.imageId); }
+                for (const v of msg.variants || []) {
+                    for (const part of v.parts || []) { if (part._imageRef) ids.add(part._imageRef); }
+                    for (const img of v._images || []) { if (img.imageId) ids.add(img.imageId); }
+                }
+            }
+            return ids;
+        };
         const useImageStore = createGlobalState(() => {
             const saveImage = async (imageId, uint8Array) => {
                 await opfs.write(imageId, uint8Array);
@@ -258,29 +273,17 @@
             };
             const loadImage = async (imageId) => opfs.read(imageId);
             const cleanupOrphanedImages = async (savedConvosList) => {
-                const metas = savedConvosList || [];
                 const referenced = new Set();
-                for (const meta of metas) {
-                    if (!meta || !meta.id) continue;
+                for (const meta of savedConvosList || []) {
+                    if (!meta?.id) continue;
                     try {
                         const json = await opfs.readText(_convoPath(meta.id));
-                        if (!json) continue;
-                        const convo = JSON.parse(json);
-                        for (const msg of convo.messages || []) {
-                            for (const img of msg.images || []) { if (img.imageId) referenced.add(img.imageId); }
-                            for (const v of msg.variants || []) {
-                                for (const part of v.parts || []) { if (part._imageRef) referenced.add(part._imageRef); }
-                                for (const img of v._images || []) { if (img.imageId) referenced.add(img.imageId); }
-                            }
-                        }
+                        if (json) _collectImageIds(JSON.parse(json)).forEach(id => referenced.add(id));
                     } catch {}
                 }
                 try {
-                    const files = await opfs.keys();
-                    for (const f of files) {
-                        if (f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f)) {
-                            opfs.remove(f).catch(() => {});
-                        }
+                    for (const f of await opfs.keys()) {
+                        if (f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f)) opfs.remove(f).catch(() => {});
                     }
                 } catch {}
             };
@@ -447,7 +450,7 @@
                         gemini.savedConversations.value = gemini.savedConversations.value.filter(c => {
                             if (tombstoneIds.has(c.id)) {
                                 delete localCloud[c.id];
-                                opfs.remove(_convoPath(c.id)).catch(() => {});
+                                _rmConvo(c.id);
                                 if (gemini.conversationMap.has(c.id) && !activeWasTombstoned) {
                                     gemini.closeConversation(c.id);
                                 } else if (gemini.conversationMap.has(c.id)) {
@@ -492,7 +495,7 @@
                                 } else if (ts > (localById[remoteId].timestamp || 0)) {
                                     localById[remoteId].title = title;
                                     localById[remoteId].timestamp = ts;
-                                    opfs.remove(_convoPath(remoteId)).catch(() => {});
+                                    _rmConvo(remoteId);
                                     if (gemini.conversationMap.has(remoteId)) gemini.closeConversation(remoteId);
                                     updatedCount++;
                                 }
@@ -503,7 +506,7 @@
                                 delete localCloudMap[cid];
                                 if (localById[cid]) {
                                     delete localById[cid];
-                                    opfs.remove(_convoPath(cid)).catch(() => {});
+                                    _rmConvo(cid);
                                     if (gemini.conversationMap.has(cid)) gemini.closeConversation(cid);
                                     removedCount++;
                                 }
@@ -789,7 +792,6 @@ const TagCountBadge={
         const DanbooruBrowser = {
             setup() {
                 const store = useAppStore(), {config} = store, {danbooru, app} = toRefs(config.value);
-                _.defaultsDeep(danbooru.value, {savedSearches: [{name: 'Trending', prompt: 'order:rank'}], blacklist: '', sortOrder: 'id', ratingFilters: {g: true, s: true, q: true, e: true}});
                 const route = useRoute(), router = useRouter(), gridRoutes = ['danbooru-grid', 'danbooru-folder'], ratingMeta = _DANBOORU_RATING_META;
                 const naiTagKnowledge = useSessionStorage('danbooru-tag-knowledge', {}), tagQueues = {nai: [], danbooru: []}, activeReqs = {nai: 0, danbooru: 0}, queuedTags = new Set();
                 let isDisposed = false, _pqTimeout = null;
@@ -958,20 +960,6 @@ const TagCountBadge={
             const t = v?._text || v?.parts?.find(p => p.text && !p.thought)?.text;
             return (t || msgs.find(m => m.role === 'user')?.text || '').substring(0, 60);
         };
-        const _convoPath = id => `convo_${id}.json`;
-        const _writeConvo = (id, messages, params) =>
-            opfs.write(_convoPath(id), JSON.stringify({ messages, ...(params ? { params } : {}) }));
-        const _collectImageIds = (convoData) => {
-            const ids = new Set();
-            for (const msg of convoData.messages || []) {
-                for (const img of msg.images || []) { if (img.imageId) ids.add(img.imageId); }
-                for (const v of msg.variants || []) {
-                    for (const part of v.parts || []) { if (part._imageRef) ids.add(part._imageRef); }
-                    for (const img of v._images || []) { if (img.imageId) ids.add(img.imageId); }
-                }
-            }
-            return ids;
-        };
         const serializeConversation = async (messages) => {
             const imageStore = useImageStore();
             const serializedMessages = await Promise.all(messages.map(async (msg) => {
@@ -1116,7 +1104,9 @@ const TagCountBadge={
             const cloudConversations = useLocalStorage('nai-cloud-conversations', {});
             const _syncedR2Images = useLocalStorage('nai-r2-synced-images', {});
             const convoSyncStatus = reactive({});
-            const getList = () => savedConversations.value;
+            const _findMeta = id => savedConversations.value.find(x => x.id === id);
+            const _markCloud = id => { if (!cloudConversations.value[id]) cloudConversations.value = { ...cloudConversations.value, [id]: true }; };
+            const _unmarkCloud = id => { const c = { ...cloudConversations.value }; delete c[id]; cloudConversations.value = c; };
             const _requireGeminiKey = () => {
                 if (!store.config.value.gemini?.apiKey) { toast.err('Gemini API key required — set it in Settings'); return false; }
                 return true;
@@ -1236,8 +1226,7 @@ const TagCountBadge={
                 try {
                     const serialized = await serializeConversation(convo.messages);
                     await _writeConvo(convo.id, serialized.messages, convo.params);
-                    const list = getList();
-                    const meta = list.find(x => x.id === convo.id);
+                    const meta = _findMeta(convo.id);
                     if (meta) { meta.timestamp = Date.now(); }
                 } catch (e) { console.warn('Auto-save failed:', e); }
             };
@@ -1270,7 +1259,7 @@ const TagCountBadge={
                     const isViewingThis = activeConvoId.value === convo.id && window.location.hash.includes('/banana');
                     if (!isViewingThis) store.incrementNotification('banana');
                     if (!convo.isTemp && _isSyncReady()) {
-                        if (!cloudConversations.value[convo.id]) cloudConversations.value = { ...cloudConversations.value, [convo.id]: true };
+                        _markCloud(convo.id);
                         _r2SyncDirty.add(convo.id);
                         _runR2Sync();
                     }
@@ -1352,7 +1341,7 @@ const TagCountBadge={
                 const serialized = await serializeConversation(convo.messages);
                 try { await _writeConvo(convo.id, serialized.messages, convo.params); }
                 catch (e) { toast.err('Failed to save conversation: ' + e.message); return; }
-                const list = getList();
+                const list = savedConversations.value;
                 const idx = list.findIndex(x => x.id === convo.id);
                 if (idx !== -1) list[idx] = meta; else list.unshift(meta);
                 toast.q('Chat saved');
@@ -1397,7 +1386,7 @@ const TagCountBadge={
             };
             const loadConversation = async (id) => {
                 if (conversationMap.has(id)) { activeConvoId.value = id; return; }
-                const meta = savedConversations.value.find(x => x.id === id);
+                const meta = _findMeta(id);
                 if (!meta) return;
                 const convo = _createConvoState({ id, title: meta.title, isTemp: false, timestamp: meta.timestamp });
                 convo.isHydrating = true;
@@ -1441,11 +1430,11 @@ const TagCountBadge={
                 } finally { convo.isHydrating = false; }
             };
             const deleteConversation = async (id) => {
-                const list = getList();
+                const list = savedConversations.value;
                 const idx = list.findIndex(x => x.id === id);
                 if (idx !== -1) {
                     list.splice(idx, 1);
-                    opfs.remove(_convoPath(id)).catch(() => {});
+                    _rmConvo(id);
                 }
                 if (cloudConversations.value[id]) {
                     const cfg = store.config.value;
@@ -1465,7 +1454,7 @@ const TagCountBadge={
                 const t = newTitle?.trim(); if (!t) return;
                 const convo = conversationMap.get(id);
                 if (convo) convo.title = t;
-                const s = savedConversations.value.find(x => x.id === id);
+                const s = _findMeta(id);
                 if (s) s.title = t;
             };
             const pruneNoImageMessages = () => withActiveConvo(convo => {
@@ -1496,7 +1485,7 @@ const TagCountBadge={
                 if (convo && !convo.isTemp && !convo.generating && !convo.isHydrating) {
                     _saveConvoDirect(convo);
                     if (_isSyncReady()) {
-                        if (!cloudConversations.value[convo.id]) cloudConversations.value = { ...cloudConversations.value, [convo.id]: true };
+                        _markCloud(convo.id);
                         if (convoSyncStatus[convo.id] !== 'syncing') convoSyncStatus[convo.id] = 'pending';
                         _r2SyncDirty.add(convo.id);
                         _runR2Sync();
@@ -1545,7 +1534,7 @@ const TagCountBadge={
                 }
                 catch { throw new Error('Conversation data not found locally.'); }
                 const imageIds = _collectImageIds(convoData);
-                const meta = savedConversations.value.find(x => x.id === id);
+                const meta = _findMeta(id);
                 const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
                 if (metaPick) Object.assign(convoData, metaPick);
                 await _pushConvoToR2(id, JSON.stringify(convoData), imageIds, metaPick);
@@ -1569,7 +1558,7 @@ const TagCountBadge={
                             } catch (e) {
                                 convoSyncStatus[id] = 'error';
                                 console.warn('Convo R2 sync failed:', e);
-                                const title = savedConversations.value.find(x => x.id === id)?.title || id;
+                                const title = _findMeta(id)?.title || id;
                                 toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
                             }
                         }
@@ -1586,15 +1575,13 @@ const TagCountBadge={
                 if (!cloudConversations.value[id]) {
                     convoSyncStatus[id] = 'syncing';
                     try {
-                        cloudConversations.value = { ...cloudConversations.value, [id]: true };
+                        _markCloud(id);
                         await _syncConversationToR2(id);
                         await useSyncStore().push(true);
                         convoSyncStatus[id] = 'synced';
                         toast.q('Synced to cloud');
                     } catch (e) {
-                        const g = { ...cloudConversations.value };
-                        delete g[id];
-                        cloudConversations.value = g;
+                        _unmarkCloud(id);
                         convoSyncStatus[id] = 'error';
                         toast.err('Sync failed: ' + e.message);
                     }
@@ -1619,9 +1606,7 @@ const TagCountBadge={
                     toast.warn('Failed to delete cloud conversation', 'sync', 3000);
                     return;
                 }
-                const restCloud = { ...cloudConversations.value };
-                delete restCloud[id];
-                cloudConversations.value = restCloud;
+                _unmarkCloud(id);
                 const restSync = { ..._syncedR2Images.value };
                 delete restSync[id];
                 _syncedR2Images.value = restSync;
@@ -1805,7 +1790,6 @@ const TagCountBadge={
             },
             template: `<split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #header><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0 w-28"><setting-input v-model="convoParams.aspectRatio" label="Aspect Ratio" type="select" :options="aspectRatios"></setting-input></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></template><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><convo-list-item v-for="convo in openConversations" :key="convo.id" :convo="convo" :is-active="activeConvoId===convo.id" is-open :cloud-linked="!convo.isTemp&&!!conversationGists[convo.id]" :sync-status="convoSyncStatus[convo.id]" @click="switchConversation(convo.id)" @rename="handleRename(convo,$event)"><template v-if="convo.messages.length" #preview><span class="truncate flex-1">{{getConvoPreview(convo.messages)}}</span><span class="shrink-0 text-neutral-600 tabular-nums">· {{convo.messages.length}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn v-if="convo.isTemp&&convo.messages.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/><icon-btn icon="close" @click.stop="closeConversation(convo.id)" title="Close" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item><template v-if="closedSavedConversations.length"><div class="divider text-xs text-neutral-600 my-2 select-none">Saved ({{ closedSavedConversations.length }})</div><convo-list-item v-for="convo in closedSavedConversations" :key="convo.id" :convo="convo" :cloud-linked="!!conversationGists[convo.id]" @click="loadConversation(convo.id)" @rename="handleRename(convo,$event)"><template #preview><span class="shrink-0 text-neutral-600 tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn icon="delete" @click.stop="deleteConversation(convo.id)" title="Delete" color="btn-ghost text-neutral-500 hover:text-error" size="btn-xs"/></template></convo-list-item></template><div v-if="!openConversations.length && !closedSavedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()"></chat-message></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><image-preview-card v-for="(img, idx) in pendingImages" :key="idx" :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport>`
         };
-        /* ConflictResolutionModal removed — sync now uses last-write-wins */
         const Settings = {
             setup() {
                 const appStore = useAppStore();
