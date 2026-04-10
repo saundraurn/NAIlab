@@ -52,7 +52,7 @@ async function readIndex(env) {
     const batch = ids.slice(i, i + BATCH_SIZE);
     const results = await Promise.all(batch.map(async (id) => {
       try {
-        const head = await env.BUCKET.head(`conversations/${id}/conversation.json`);
+        const head = await env.BUCKET.head(`conversations/${id}/manifest.json`);
         if (!head) return null;
         const meta = head.customMetadata || {};
         let title = 'Cloud Chat';
@@ -120,12 +120,12 @@ async function handleR2(request, env, url) {
     return corsJson(data);
   }
 
-  // ── Single conversation (JSON) ───────────────────────────────────────────
-  const convoMatch = path.match(/^conversations\/([^/]+)$/);
-  if (convoMatch) {
-    const convoId = convoMatch[1];
+  // ── Conversation manifest ────────────────────────────────────────────────
+  const manifestMatch = path.match(/^conversations\/([^/]+)\/manifest$/);
+  if (manifestMatch) {
+    const convoId = manifestMatch[1];
     if (request.method === 'GET') {
-      const obj = await env.BUCKET.get(`conversations/${convoId}/conversation.json`);
+      const obj = await env.BUCKET.get(`conversations/${convoId}/manifest.json`);
       if (!obj) return corsResponse('Not found', 404);
       const etag = obj.httpEtag;
       const ifNoneMatch = request.headers.get('If-None-Match');
@@ -150,11 +150,10 @@ async function handleR2(request, env, url) {
         putOptions.customMetadata = customMetadata;
       }
       const putResult = await env.BUCKET.put(
-        `conversations/${convoId}/conversation.json`,
+        `conversations/${convoId}/manifest.json`,
         request.body,
         putOptions
       );
-      // Update conversation index (last-write-wins; single-user app, so concurrent writes are acceptable)
       const index = await readIndex(env);
       let title = 'Cloud Chat';
       if (titleHeader) { try { title = decodeURIComponent(titleHeader); } catch { title = titleHeader; } }
@@ -167,23 +166,50 @@ async function handleR2(request, env, url) {
       if (putResult?.httpEtag) putExtra['ETag'] = putResult.httpEtag;
       return corsResponse('OK', 200, putExtra);
     }
-    if (request.method === 'DELETE') {
-      let cursor;
-      do {
-        const list = await env.BUCKET.list({
-          prefix: `conversations/${convoId}/`,
-          ...(cursor ? { cursor } : {}),
-        });
-        const keys = list.objects.map(o => o.key);
-        if (keys.length) await env.BUCKET.delete(keys);
-        cursor = list.truncated ? list.cursor : null;
-      } while (cursor);
-      // Remove from conversation index (last-write-wins; single-user app, so concurrent writes are acceptable)
-      const index = await readIndex(env);
-      const filtered = index.filter(e => e.id !== convoId);
-      if (filtered.length !== index.length) await writeIndex(env, filtered);
+  }
+
+  // ── Per-message files ────────────────────────────────────────────────────
+  const msgMatch = path.match(/^conversations\/([^/]+)\/messages\/([^/]+)$/);
+  if (msgMatch) {
+    const [, convoId, msgId] = msgMatch;
+    const key = `conversations/${convoId}/messages/${msgId}.json`;
+    if (request.method === 'GET') {
+      const obj = await env.BUCKET.get(key);
+      if (!obj) return corsResponse('Not found', 404);
+      return new Response(obj.body, {
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'Content-Type': 'application/json' },
+      });
+    }
+    if (request.method === 'PUT') {
+      await env.BUCKET.put(key, request.body, {
+        httpMetadata: { contentType: 'application/json' },
+      });
       return corsResponse('OK');
     }
+    if (request.method === 'DELETE') {
+      await env.BUCKET.delete(key);
+      return corsResponse('OK');
+    }
+  }
+
+  // ── Delete entire conversation (all objects under prefix) ────────────────
+  const convoDeleteMatch = path.match(/^conversations\/([^/]+)$/);
+  if (convoDeleteMatch && request.method === 'DELETE') {
+    const convoId = convoDeleteMatch[1];
+    let cursor;
+    do {
+      const list = await env.BUCKET.list({
+        prefix: `conversations/${convoId}/`,
+        ...(cursor ? { cursor } : {}),
+      });
+      const keys = list.objects.map(o => o.key);
+      if (keys.length) await env.BUCKET.delete(keys);
+      cursor = list.truncated ? list.cursor : null;
+    } while (cursor);
+    const index = await readIndex(env);
+    const filtered = index.filter(e => e.id !== convoId);
+    if (filtered.length !== index.length) await writeIndex(env, filtered);
+    return corsResponse('OK');
   }
 
   // ── Conversation images ──────────────────────────────────────────────────
