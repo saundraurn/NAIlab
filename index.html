@@ -131,7 +131,7 @@
         const _RETRY_CODES = new Set([429, 500, 502, 503, 504]);
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
-        const _batch5 = async (arr, fn) => { for (let i = 0; i < arr.length; i += 5) await Promise.all(arr.slice(i, i + 5).map(fn)); };
+        const _pool = async (arr, fn, n = 5) => { let i = 0; const w = async () => { while (i < arr.length) await fn(arr[i++]); }; await Promise.all(Array.from({length: Math.min(n, arr.length)}, w)); };
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
         const opfs = (() => {
             let _r;
@@ -274,7 +274,7 @@
             const loadImage = async (imageId) => opfs.read(imageId);
             const cleanupOrphanedImages = async (savedConvosList) => {
                 const referenced = new Set();
-                await _batch5(savedConvosList || [], async (meta) => {
+                await _pool(savedConvosList || [], async (meta) => {
                     if (!meta?.id) return;
                     try {
                         const json = await opfs.readText(_convoPath(meta.id));
@@ -283,7 +283,7 @@
                 });
                 try {
                     const orphaned = (await opfs.keys()).filter(f => f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f));
-                    await _batch5(orphaned, f => opfs.remove(f));
+                    await _pool(orphaned, f => opfs.remove(f));
                 } catch {}
             };
             return { saveImage, loadImage, ingestImage, cleanupOrphanedImages };
@@ -392,16 +392,18 @@
                 return (tombstones || []).filter(t => t.deletedAt > cutoff);
             };
             const _configEtag = useLocalStorage('nai-config-etag', null);
-            watch([() => appStore.config.value.jssync.proxyUrl, () => appStore.syncToken.value], () => { _configEtag.value = null; });
+            const _listEtag = useLocalStorage('nai-list-etag', null);
+            watch([() => appStore.config.value.jssync.proxyUrl, () => appStore.syncToken.value], () => { _configEtag.value = null; _listEtag.value = null; });
             const pull = async () => {
                 const cfg = appStore.config.value;
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 syncStatus.value = 'pulling'; syncError.value = null;
                 try {
                     const configOpts = _configEtag.value ? { ifNoneMatch: _configEtag.value } : {};
+                    const listOpts = _listEtag.value ? { ifNoneMatch: _listEtag.value } : {};
                     const [res, listRes] = await Promise.all([
                         r2Client.r2Fetch('GET', 'config', null, configOpts),
-                        r2Client.r2Fetch('GET', 'conversations').catch(e => { console.warn('Sync pull: failed to fetch conversations list.', e); return null; })
+                        r2Client.r2Fetch('GET', 'conversations', null, listOpts).catch(e => { console.warn('Sync pull: failed to fetch conversations list.', e); return null; })
                     ]);
                     if (res.status !== 304) {
                     const newEtag = res.headers.get('ETag');
@@ -473,7 +475,9 @@
                         }
                     }
                     try {
-                        if (listRes?.ok) {
+                        if (listRes && listRes.status !== 304 && listRes.ok) {
+                            const newListEtag = listRes.headers.get('ETag');
+                            if (newListEtag) _listEtag.value = newListEtag;
                             const remoteConvos = await listRes.json();
                             const localById = _.keyBy(gemini.savedConversations.value, 'id');
                             const localCloudMap = { ...gemini.cloudConversations.value };
@@ -554,12 +558,13 @@
                         dirtyMetas.push(meta);
                     }
                     if (cloudMapDirty) gemini.cloudConversations.value = localCloudMap;
-                    await _batch5(dirtyMetas, async meta => {
+                    await _pool(dirtyMetas, async meta => {
                         try { await gemini.syncConversationToR2(meta.id); }
                         catch (e) { console.warn(`Failed to push convo ${meta.id}:`, e); }
                     });
                     const tombstonesToDelete = tombstones.filter(t => t.deletedAt > lastSynced);
-                    await _batch5(tombstonesToDelete, t => r2Client.r2Fetch('DELETE', `conversations/${t.id}`).catch(() => {}));
+                    await _pool(tombstonesToDelete, t => r2Client.r2Fetch('DELETE', `conversations/${t.id}`).catch(() => {}));
+                    if (dirtyMetas.length || tombstonesToDelete.length) _listEtag.value = null;
                     _finalizePush(cfg);
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config synced to cloud.', 'sync', 2500);
@@ -1346,19 +1351,24 @@ const TagCountBadge={
                 try {
                     const res = await r2Client.r2Fetch('GET', `conversations/${convoId}`);
                     if (!res.ok) return null;
-                    return JSON.parse(await res.text());
+                    const data = JSON.parse(await res.text());
+                    const hTitle = res.headers.get('X-Convo-Title');
+                    if (hTitle && !data.title) try { data.title = decodeURIComponent(hTitle); } catch { data.title = hTitle; }
+                    const hTs = res.headers.get('X-Convo-Timestamp');
+                    if (hTs && data.timestamp == null) { const n = Number(hTs); if (Number.isFinite(n)) data.timestamp = n; }
+                    return data;
                 } catch { return null; }
             };
             const _pullMissingImagesFromR2 = async (convoData, convoId) => {
                 const imageIds = _collectImageIds(convoData);
                 if (!imageIds.size) return [];
                 const idArr = [...imageIds];
-                const exists = await Promise.all(idArr.map(id => opfs.has(id)));
-                const missing = idArr.filter((_, i) => !exists[i]);
+                const localKeys = new Set(await opfs.keys());
+                const missing = idArr.filter(id => !localKeys.has(id));
                 if (!missing.length) return idArr;
                 try {
                     const pulled = [];
-                    await _batch5(missing, async (imgId) => {
+                    await _pool(missing, async (imgId) => {
                         try {
                             const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/images/${imgId}`);
                             if (res?.status !== 404) {
@@ -1506,7 +1516,7 @@ const TagCountBadge={
                 const syncedSet = new Set(syncedArr);
                 const newImages = [...imageIds].filter(id => !syncedSet.has(id));
                 const uploaded = new Set();
-                await _batch5(newImages, async (imgId) => {
+                await _pool(newImages, async (imgId) => {
                     try {
                         const imgData = await opfs.read(imgId);
                         if (imgData) {
@@ -1516,25 +1526,19 @@ const TagCountBadge={
                     } catch {}
                 });
                 const orphaned = syncedArr.filter(id => !imageIds.has(id));
-                await _batch5(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}));
+                await _pool(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}));
                 // Only persist IDs that are confirmed in R2: previously synced (still current) + newly uploaded
                 const nowSynced = [...imageIds].filter(id => syncedSet.has(id) || uploaded.has(id));
                 _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: nowSynced };
             };
             const _syncConversationToR2 = async (id) => {
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
-                let convoData;
-                try {
-                    const json = await opfs.readText(_convoPath(id));
-                    if (!json) throw new Error('not found');
-                    convoData = JSON.parse(json);
-                }
-                catch { throw new Error('Conversation data not found locally.'); }
-                const imageIds = _collectImageIds(convoData);
+                const raw = await opfs.read(_convoPath(id));
+                if (!raw) throw new Error('Conversation data not found locally.');
+                const imageIds = _collectImageIds(JSON.parse(new TextDecoder().decode(raw)));
                 const meta = _findMeta(id);
                 const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
-                if (metaPick) Object.assign(convoData, metaPick);
-                await _pushConvoToR2(id, JSON.stringify(convoData), imageIds, metaPick);
+                await _pushConvoToR2(id, raw, imageIds, metaPick);
             };
             let _r2SyncInProgress = false;
             let _r2SyncPromise = null;
@@ -1546,8 +1550,7 @@ const TagCountBadge={
                     try {
                         const ids = [..._r2SyncDirty];
                         _r2SyncDirty.clear();
-                        for (const id of ids) {
-                            if (!cloudConversations.value[id]) continue;
+                        await _pool(ids.filter(id => cloudConversations.value[id]), async (id) => {
                             convoSyncStatus[id] = 'syncing';
                             try {
                                 await _syncConversationToR2(id);
@@ -1558,7 +1561,7 @@ const TagCountBadge={
                                 const title = _findMeta(id)?.title || id;
                                 toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
                             }
-                        }
+                        });
                     } finally {
                         _r2SyncInProgress = false;
                         _r2SyncPromise = null;
