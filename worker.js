@@ -99,8 +99,24 @@ async function handleR2(request, env, url) {
     }
   }
 
-  // ── Conversations list (reads from index) ────────────────────────────────
+  // ── Conversations list (reads from index, supports ETag) ──────────────────
   if (path === 'conversations' && request.method === 'GET') {
+    const obj = await env.BUCKET.get('conversations/index.json');
+    if (obj) {
+      const etag = obj.httpEtag;
+      const ifNoneMatch = request.headers.get('If-None-Match');
+      if (etag && ifNoneMatch && etag === ifNoneMatch) {
+        return new Response(null, { status: 304, headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS } });
+      }
+      const text = await obj.text();
+      try {
+        if (Array.isArray(JSON.parse(text))) {
+          const headers = { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'Content-Type': 'application/json' };
+          if (etag) headers['ETag'] = etag;
+          return new Response(text, { headers });
+        }
+      } catch {}
+    }
     return corsJson(await readIndex(env));
   }
 
@@ -111,9 +127,14 @@ async function handleR2(request, env, url) {
     if (request.method === 'GET') {
       const obj = await env.BUCKET.get(`conversations/${convoId}/conversation.json`);
       if (!obj) return corsResponse('Not found', 404);
-      return new Response(obj.body, {
-        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'Content-Type': 'application/json' },
-      });
+      const etag = obj.httpEtag;
+      const ifNoneMatch = request.headers.get('If-None-Match');
+      if (etag && ifNoneMatch && etag === ifNoneMatch) {
+        return new Response(null, { status: 304, headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS } });
+      }
+      const headers = { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'Content-Type': 'application/json' };
+      if (etag) headers['ETag'] = etag;
+      return new Response(obj.body, { headers });
     }
     if (request.method === 'PUT') {
       const titleHeader = request.headers.get('X-Convo-Title');
@@ -125,7 +146,7 @@ async function handleR2(request, env, url) {
         if (timestampHeader) customMetadata.timestamp = timestampHeader;
         putOptions.customMetadata = customMetadata;
       }
-      await env.BUCKET.put(
+      const result = await env.BUCKET.put(
         `conversations/${convoId}/conversation.json`,
         request.body,
         putOptions
@@ -139,7 +160,9 @@ async function handleR2(request, env, url) {
       const idx = index.findIndex(e => e.id === convoId);
       if (idx !== -1) index[idx] = entry; else index.push(entry);
       await writeIndex(env, index);
-      return corsResponse('OK');
+      const extra = {};
+      if (result?.httpEtag) extra['ETag'] = result.httpEtag;
+      return corsResponse('OK', 200, extra);
     }
     if (request.method === 'DELETE') {
       let cursor;

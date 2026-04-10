@@ -131,7 +131,7 @@
         const _RETRY_CODES = new Set([429, 500, 502, 503, 504]);
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
-        const _batch5 = async (arr, fn) => { for (let i = 0; i < arr.length; i += 5) await Promise.all(arr.slice(i, i + 5).map(fn)); };
+        const _pool = async (arr, fn, n = 5) => { let i = 0; const w = async () => { while (i < arr.length) await fn(arr[i++]); }; await Promise.all(Array.from({length: Math.min(n, arr.length)}, w)); };
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
         const opfs = (() => {
             let _r;
@@ -274,7 +274,7 @@
             const loadImage = async (imageId) => opfs.read(imageId);
             const cleanupOrphanedImages = async (savedConvosList) => {
                 const referenced = new Set();
-                await _batch5(savedConvosList || [], async (meta) => {
+                await _pool(savedConvosList || [], async (meta) => {
                     if (!meta?.id) return;
                     try {
                         const json = await opfs.readText(_convoPath(meta.id));
@@ -283,7 +283,7 @@
                 });
                 try {
                     const orphaned = (await opfs.keys()).filter(f => f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f));
-                    await _batch5(orphaned, f => opfs.remove(f));
+                    await _pool(orphaned, f => opfs.remove(f));
                 } catch {}
             };
             return { saveImage, loadImage, ingestImage, cleanupOrphanedImages };
@@ -392,16 +392,18 @@
                 return (tombstones || []).filter(t => t.deletedAt > cutoff);
             };
             const _configEtag = useLocalStorage('nai-config-etag', null);
-            watch([() => appStore.config.value.jssync.proxyUrl, () => appStore.syncToken.value], () => { _configEtag.value = null; });
+            const _listEtag = useLocalStorage('nai-convo-list-etag', null);
+            watch([() => appStore.config.value.jssync.proxyUrl, () => appStore.syncToken.value], () => { _configEtag.value = null; _listEtag.value = null; });
             const pull = async () => {
                 const cfg = appStore.config.value;
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 syncStatus.value = 'pulling'; syncError.value = null;
                 try {
                     const configOpts = _configEtag.value ? { ifNoneMatch: _configEtag.value } : {};
+                    const listOpts = _listEtag.value ? { ifNoneMatch: _listEtag.value } : {};
                     const [res, listRes] = await Promise.all([
                         r2Client.r2Fetch('GET', 'config', null, configOpts),
-                        r2Client.r2Fetch('GET', 'conversations').catch(e => { console.warn('Sync pull: failed to fetch conversations list.', e); return null; })
+                        r2Client.r2Fetch('GET', 'conversations', null, listOpts).catch(e => { console.warn('Sync pull: failed to fetch conversations list.', e); return null; })
                     ]);
                     if (res.status !== 304) {
                     const newEtag = res.headers.get('ETag');
@@ -474,6 +476,8 @@
                     }
                     try {
                         if (listRes?.ok) {
+                            const newListEtag = listRes.headers.get('ETag');
+                            if (newListEtag) _listEtag.value = newListEtag;
                             const remoteConvos = await listRes.json();
                             const localById = _.keyBy(gemini.savedConversations.value, 'id');
                             const localCloudMap = { ...gemini.cloudConversations.value };
@@ -554,12 +558,13 @@
                         dirtyMetas.push(meta);
                     }
                     if (cloudMapDirty) gemini.cloudConversations.value = localCloudMap;
-                    await _batch5(dirtyMetas, async meta => {
+                    await _pool(dirtyMetas, async meta => {
                         try { await gemini.syncConversationToR2(meta.id); }
                         catch (e) { console.warn(`Failed to push convo ${meta.id}:`, e); }
                     });
                     const tombstonesToDelete = tombstones.filter(t => t.deletedAt > lastSynced);
-                    await _batch5(tombstonesToDelete, t => r2Client.r2Fetch('DELETE', `conversations/${t.id}`).catch(() => {}));
+                    await _pool(tombstonesToDelete, t => r2Client.r2Fetch('DELETE', `conversations/${t.id}`).catch(() => {}));
+                    if (dirtyMetas.length || tombstonesToDelete.length) _listEtag.value = null;
                     _finalizePush(cfg);
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config synced to cloud.', 'sync', 2500);
@@ -1097,6 +1102,7 @@ const TagCountBadge={
             const savedConversations = useLocalStorage('nai-saved-conversations', []);
             const cloudConversations = useLocalStorage('nai-cloud-conversations', {});
             const _syncedR2Images = useLocalStorage('nai-r2-synced-images', {});
+            const _convoEtags = useLocalStorage('nai-convo-etags', {});
             const convoSyncStatus = reactive({});
             const _findMeta = id => savedConversations.value.find(x => x.id === id);
             const _markCloud = id => { if (!cloudConversations.value[id]) cloudConversations.value = { ...cloudConversations.value, [id]: true }; };
@@ -1353,12 +1359,12 @@ const TagCountBadge={
                 const imageIds = _collectImageIds(convoData);
                 if (!imageIds.size) return [];
                 const idArr = [...imageIds];
-                const exists = await Promise.all(idArr.map(id => opfs.has(id)));
-                const missing = idArr.filter((_, i) => !exists[i]);
+                const localKeys = new Set(await opfs.keys());
+                const missing = idArr.filter(id => !localKeys.has(id));
                 if (!missing.length) return idArr;
                 try {
                     const pulled = [];
-                    await _batch5(missing, async (imgId) => {
+                    await _pool(missing, async (imgId) => {
                         try {
                             const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/images/${imgId}`);
                             if (res?.status !== 404) {
@@ -1497,16 +1503,18 @@ const TagCountBadge={
                 _pushConvoR2Locks.set(convoId, lock);
                 return next;
             };
-            const _doPushConvoToR2 = async (convoId, convoJson, imageIds, meta) => {
+            const _doPushConvoToR2 = async (convoId, rawBody, imageIds, meta) => {
                 const customHeaders = {};
                 if (meta?.title) customHeaders['X-Convo-Title'] = encodeURIComponent(meta.title);
                 if (meta?.timestamp) customHeaders['X-Convo-Timestamp'] = String(meta.timestamp);
-                await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json', customHeaders });
+                const res = await r2Client.r2Fetch('PUT', `conversations/${convoId}`, rawBody, { contentType: 'application/json', customHeaders });
+                const etag = res.headers.get('ETag');
+                if (etag) _convoEtags.value = { ..._convoEtags.value, [convoId]: etag };
                 const syncedArr = _syncedR2Images.value[convoId] || [];
                 const syncedSet = new Set(syncedArr);
                 const newImages = [...imageIds].filter(id => !syncedSet.has(id));
                 const uploaded = new Set();
-                await _batch5(newImages, async (imgId) => {
+                await _pool(newImages, async (imgId) => {
                     try {
                         const imgData = await opfs.read(imgId);
                         if (imgData) {
@@ -1516,25 +1524,19 @@ const TagCountBadge={
                     } catch {}
                 });
                 const orphaned = syncedArr.filter(id => !imageIds.has(id));
-                await _batch5(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}));
+                await _pool(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}));
                 // Only persist IDs that are confirmed in R2: previously synced (still current) + newly uploaded
                 const nowSynced = [...imageIds].filter(id => syncedSet.has(id) || uploaded.has(id));
                 _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: nowSynced };
             };
             const _syncConversationToR2 = async (id) => {
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
-                let convoData;
-                try {
-                    const json = await opfs.readText(_convoPath(id));
-                    if (!json) throw new Error('not found');
-                    convoData = JSON.parse(json);
-                }
-                catch { throw new Error('Conversation data not found locally.'); }
-                const imageIds = _collectImageIds(convoData);
+                const rawBytes = await opfs.read(_convoPath(id));
+                if (!rawBytes) throw new Error('Conversation data not found locally.');
+                const imageIds = _collectImageIds(JSON.parse(new TextDecoder().decode(rawBytes)));
                 const meta = _findMeta(id);
                 const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
-                if (metaPick) Object.assign(convoData, metaPick);
-                await _pushConvoToR2(id, JSON.stringify(convoData), imageIds, metaPick);
+                await _pushConvoToR2(id, rawBytes, imageIds, metaPick);
             };
             let _r2SyncInProgress = false;
             let _r2SyncPromise = null;
@@ -1607,6 +1609,9 @@ const TagCountBadge={
                 const restSync = { ..._syncedR2Images.value };
                 delete restSync[id];
                 _syncedR2Images.value = restSync;
+                const restEtags = { ..._convoEtags.value };
+                delete restEtags[id];
+                _convoEtags.value = restEtags;
                 delete convoSyncStatus[id];
             };
             return {
