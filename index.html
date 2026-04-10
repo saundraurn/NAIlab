@@ -1428,7 +1428,7 @@ const TagCountBadge={
                         manifest = await _readManifest(id);
                         if (manifest?.messages?.length) {
                             const msgs = await Promise.all(manifest.messages.map(d => _readMsg(id, d.msgId)));
-                            if (!msgs.some(m => !m)) serializedMessages = msgs; else manifest = null;
+                            if (msgs.every(Boolean)) serializedMessages = msgs; else manifest = null;
                         }
                     } catch {}
                     if (!manifest && cloudConversations.value[id]) {
