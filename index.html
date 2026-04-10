@@ -174,7 +174,7 @@
             let uniqueIdCounter = 0;
             const removeToast = (id) => { const i = toasts.value.findIndex(t => t.id === id); if (i !== -1) { clearTimeout(toasts.value[i].timerId); toasts.value.splice(i, 1); } };
             const addToast = ({id, msg, type='info', source='default', duration=5000, persistent=false}) => {
-                let item = id ? _.find(toasts.value, {id}) : (type === 'error' && _.findLast(toasts.value, {type, msg, source}));
+                let item = id ? toasts.value.find(t => t.id === id) : (type === 'error' && toasts.value.findLast(t => t.type === type && t.msg === msg && t.source === source));
                 if (!item) toasts.value.push(item = reactive({id: id || ++uniqueIdCounter, count: 0}));
                 Object.assign(item, {msg, type, source, persistent, duration, count: item.count + 1});
                 clearTimeout(item.timerId); if (!persistent) item.timerId = setTimeout(() => removeToast(item.id), duration);
@@ -220,7 +220,7 @@
                 if (isDispatcherRunning.value) return; isDispatcherRunning.value = true;
                 try {
                     while (queue.value.length > 0 && !isApiHalted.value) {
-                        const act = router?.currentRoute?.value?.meta?.genSource, idx = Math.max(0, act ? _.findIndex(queue.value, {source: act}) : -1), req = queue.value.splice(idx, 1)[0]; if (!req) continue;
+                        const act = router?.currentRoute?.value?.meta?.genSource, idx = Math.max(0, act ? queue.value.findIndex(q => q.source === act) : -1), req = queue.value.splice(idx, 1)[0]; if (!req) continue;
                         const tId = addToast({msg: 'Generating...', type: 'loading', source: req.source, persistent: true});
                         const res = await generateImage(req, tId);
                         if (act !== req.source && res.success) updateNotification(req.source, 1);
@@ -249,11 +249,7 @@
             }
             return s;
         };
-        const _collectImageIdsFromManifest = (manifest) => {
-            const s = new Set();
-            for (const d of manifest.messages || []) (d.imageIds || []).forEach(id => s.add(id));
-            return s;
-        };
+        const _collectImageIdsFromManifest = (manifest) => new Set((manifest.messages || []).flatMap(d => d.imageIds || []));
         const _writeJson = (path, data) => opfs.write(path, JSON.stringify(data));
         const _readJson = async (path) => { const j = await opfs.readText(path); return j ? JSON.parse(j) : null; };
         const _writeManifest = (convoId, title, timestamp, params, msgDescriptors) =>
@@ -376,9 +372,9 @@
             const withFlag = (f, fn) => { f.value = true; return Promise.resolve().then(fn).finally(() => { f.value = false; }); };
             const withSyncMerge = (fn) => withFlag(appStore.isSyncMerging, fn);
             const _applySectionDict = (cfg, dict) => {
-                _.forOwn(dict, (val, key) => {
+                Object.entries(dict).forEach(([key, val]) => {
                     if (key === '_syncMeta') return;
-                    const merged = _.isArray(val) ? _.cloneDeep(val) : _.mergeWith({}, cfg[key], val, (_o, s) => _.isArray(s) ? _.cloneDeep(s) : undefined);
+                    const merged = Array.isArray(val) ? _.cloneDeep(val) : _.mergeWith({}, cfg[key], val, (_o, s) => Array.isArray(s) ? _.cloneDeep(s) : undefined);
                     if (_.isPlainObject(merged) && _.isPlainObject(cfg[key])) { Object.assign(cfg[key], merged); }
                     else { cfg[key] = merged; }
                 });
@@ -426,7 +422,7 @@
                         if (mergedKeys.length) {
                             await withSyncMerge(() => {
                                 _applySectionDict(cfg, lwwMerged);
-                                _.forOwn(lwwMerged, (_v, k) => {
+                                Object.entries(lwwMerged).forEach(([k]) => {
                                     if (remoteMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remoteMeta[k]);
                                 });
                             });
@@ -481,7 +477,7 @@
                             const newListEtag = listRes.headers.get('ETag');
                             if (newListEtag) _listEtag.value = newListEtag;
                             const remoteConvos = await listRes.json();
-                            const localById = _.keyBy(gemini.savedConversations.value, 'id');
+                            const localById = Object.fromEntries(gemini.savedConversations.value.map(c => [c.id, c]));
                             const localCloudMap = { ...gemini.cloudConversations.value };
                             const remoteIdSet = new Set();
                             let addedCount = 0, updatedCount = 0;
@@ -844,9 +840,9 @@ const TagCountBadge={
                 });
                 const selectedImage = computed(() => {
                     if (!selectedPostId.value) return null;
-                    return _.find(posts.value, post => String(post.id) === selectedPostId.value) || null;
+                    return posts.value.find(post => String(post.id) === selectedPostId.value) || null;
                 });
-                const displayedImage = computed(() => selectedImage.value || hoveredImage.value), foldersById = computed(() => _.keyBy(danbooru.value.folders, 'id')), activeFolderId = computed(() => route.name === 'danbooru-folder' ? route.params.folderId : null);
+                const displayedImage = computed(() => selectedImage.value || hoveredImage.value), foldersById = computed(() => Object.fromEntries((danbooru.value.folders || []).map(f => [f.id, f]))), activeFolderId = computed(() => route.name === 'danbooru-folder' ? route.params.folderId : null);
                 watch(() => [isLoading.value, sortedPosts.value.length], ([loading, len]) => { if (!loading && len < 15 && hasMorePages.value && gridRoutes.includes(route.name) && _.some(ratingFilters.value)) fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []); });
                 const executeSearch = (query) => {
                     lastFetchedQuery.value = query; let effective = query || '', apiTags, clientFilters = [];
@@ -879,7 +875,7 @@ const TagCountBadge={
                     save: () => {
                         const name = savedSearchName.value.trim(), prompt = searchQueryInput.value.trim();
                         if (!name) return toast.err('Name required.', 'danbooru');
-                        const existing = _.find(savedSearches.value, {name});
+                        const existing = savedSearches.value.find(s => s.name === name);
                         existing ? (existing.prompt = prompt) : savedSearches.value.push({name, prompt});
                         toast.ok(`Saved "${name}".`, 'danbooru');
                         savedSearchName.value = '';
@@ -913,7 +909,7 @@ const TagCountBadge={
             setup() {
                 const {posts, isLoading, isLoadingMore, hasMorePages, statusMsg, hoveredImage, rightPanelRef, lastScrollPos, gridSize} = inject('danbooruState'), {folders} = inject('danbooruFolders');
                 const activeId = ref(null);
-                const isSingleView = computed(() => activeId.value !== null), currentImg = computed(() => activeId.value === null ? null : _.find(posts.value, {id: activeId.value}));
+                const isSingleView = computed(() => activeId.value !== null), currentImg = computed(() => activeId.value === null ? null : posts.value.find(p => p.id === activeId.value));
                 watch(posts, (nextPosts) => {
                     if (activeId.value !== null && !nextPosts.some(p => p.id === activeId.value)) activeId.value = null;
                 });
@@ -1085,8 +1081,8 @@ const TagCountBadge={
             const generatingVarIdx = computed(() => activeConvo.value?.generatingVarIdx ?? null);
             const isHydrating = computed(() => !!activeConvo.value?.isHydrating);
             const _apiBase = (model) => `https://aiplatform.googleapis.com/v1/publishers/google/models/${model || _FM}`;
-            const _findMsg = (convo, id) => _.find(convo?.messages, {id});
-            const _findMsgIdx = (convo, id) => _.findIndex(convo?.messages, {id});
+            const _findMsg = (convo, id) => convo?.messages?.find(m => m.id === id);
+            const _findMsgIdx = (convo, id) => convo?.messages?.findIndex(m => m.id === id) ?? -1;
             const isHiddenFromModel = (msgId) => !!_findMsg(activeConvo.value, msgId)?.hidden;
             const toggleHiddenFromModel = (msgId) => {
                 const msg = _findMsg(activeConvo.value, msgId);
@@ -1216,19 +1212,16 @@ const TagCountBadge={
                 toast.err(err.message || 'Generation failed'); return false;
             };
             const _dirtyMessages = new Map();
-            const _markMsgDirty = (convoId, msgId) => {
-                if (!_dirtyMessages.has(convoId)) _dirtyMessages.set(convoId, new Set());
-                _dirtyMessages.get(convoId).add(msgId);
-            };
+            const _markMsgDirty = (convoId, msgId) => (_dirtyMessages.get(convoId) ?? _dirtyMessages.set(convoId, new Set()).get(convoId)).add(msgId);
             const _saveConvoDirect = async (convo, forceMsgIds) => {
                 if (!convo || convo.isTemp || !convo.messages.length) return;
                 try {
                     const dirtyMsgSet = forceMsgIds ? new Set(forceMsgIds) : (_dirtyMessages.get(convo.id) || new Set());
                     const msgsToWrite = dirtyMsgSet.size ? convo.messages.filter(m => dirtyMsgSet.has(m.id)) : convo.messages;
                     const serialized = await Promise.all(msgsToWrite.map(m => serializeMessage(m)));
-                    await Promise.all(serialized.map(s => _writeMsg(convo.id, s.id, s)));
                     const now = Date.now();
-                    const serializedById = new Map(serialized.map(s => [s.id, s]));
+                    const serializedById = new Map();
+                    await Promise.all(serialized.map(s => (serializedById.set(s.id, s), _writeMsg(convo.id, s.id, s))));
                     const prevManifest = await _readManifest(convo.id);
                     const prevDescById = new Map((prevManifest?.messages || []).map(d => [d.msgId, d]));
                     const currentMsgIds = new Set(convo.messages.map(m => m.id));
@@ -1241,7 +1234,7 @@ const TagCountBadge={
                     const orphanedMsgIds = [...prevDescById.keys()].filter(id => !currentMsgIds.has(id));
                     if (orphanedMsgIds.length) await Promise.all(orphanedMsgIds.map(mid => opfs.remove(_msgPath(convo.id, mid))));
                     await _writeManifest(convo.id, convo.title, now, convo.params, allDescriptors);
-                    if (_dirtyMessages.has(convo.id)) _dirtyMessages.get(convo.id).clear();
+                    _dirtyMessages.get(convo.id)?.clear();
                     const meta = _findMeta(convo.id);
                     if (meta) { meta.timestamp = now; }
                 } catch (e) { console.warn('Auto-save failed:', e); }
@@ -1376,7 +1369,7 @@ const TagCountBadge={
                 try {
                     const manifestRes = await r2Client.r2Fetch('GET', `conversations/${convoId}/manifest`);
                     if (!manifestRes.ok) return null;
-                    const manifest = JSON.parse(await manifestRes.text());
+                    const manifest = await manifestRes.json();
                     const hTitle = manifestRes.headers.get('X-Convo-Title');
                     if (hTitle && !manifest.title) try { manifest.title = decodeURIComponent(hTitle); } catch { manifest.title = hTitle; }
                     const hTs = manifestRes.headers.get('X-Convo-Timestamp');
@@ -1388,7 +1381,7 @@ const TagCountBadge={
                         try {
                             const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/messages/${desc.msgId}`);
                             if (!res.ok) { missing.push(desc.msgId); return; }
-                            msgs[i] = JSON.parse(await res.text());
+                            msgs[i] = await res.json();
                         } catch { missing.push(desc.msgId); }
                     });
                     if (missing.length) throw new Error(`Missing message(s): ${missing.join(', ')}`);
@@ -1398,29 +1391,28 @@ const TagCountBadge={
             const _pullMissingImagesFromR2 = async (manifest, convoId) => {
                 const imageIds = _collectImageIdsFromManifest(manifest);
                 if (!imageIds.size) return [];
-                const idArr = [...imageIds];
                 const localKeys = new Set(await opfs.keys());
-                const missing = idArr.filter(id => !localKeys.has(id));
-                if (!missing.length) return idArr;
+                const missing = [...imageIds].filter(id => !localKeys.has(id));
+                if (!missing.length) return [...imageIds];
                 try {
                     const pulled = [];
                     await _pool(missing, async (imgId) => {
                         try {
                             const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/images/${imgId}`);
                             if (res?.status !== 404) {
-                                const data = new Uint8Array(await res.arrayBuffer());
-                                await opfs.write(imgId, data);
+                                await opfs.write(imgId, new Uint8Array(await res.arrayBuffer()));
                                 pulled.push(imgId);
                             }
                         } catch {}
                     });
                     if (pulled.length) {
-                        _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...new Set([...(_syncedR2Images.value[convoId]||[]),...pulled])] };
+                        const existing = _syncedR2Images.value[convoId] || [];
+                        _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...new Set([...existing, ...pulled])] };
                     }
                 } catch (e) {
                     console.warn('Failed to pull images from R2:', e);
                 }
-                return idArr;
+                return [...imageIds];
             };
             const loadConversation = async (id) => {
                 if (conversationMap.has(id)) { activeConvoId.value = id; return; }
@@ -1431,15 +1423,12 @@ const TagCountBadge={
                 conversationMap.set(id, convo);
                 activeConvoId.value = id;
                 try {
-                    let manifest = null;
-                    let serializedMessages = null;
+                    let manifest = null, serializedMessages = null;
                     try {
                         manifest = await _readManifest(id);
-                        if (manifest) {
-                            const descriptors = manifest.messages || [];
-                            const msgs = await Promise.all(descriptors.map(d => _readMsg(id, d.msgId)));
-                            if (msgs.some(m => !m)) { manifest = null; serializedMessages = null; }
-                            else serializedMessages = msgs;
+                        if (manifest?.messages?.length) {
+                            const msgs = await Promise.all(manifest.messages.map(d => _readMsg(id, d.msgId)));
+                            if (!msgs.some(m => !m)) serializedMessages = msgs; else manifest = null;
                         }
                     } catch {}
                     if (!manifest && cloudConversations.value[id]) {
@@ -1451,17 +1440,9 @@ const TagCountBadge={
                                 await Promise.all(serializedMessages.map(m => _writeMsg(id, m.id, m)));
                                 await _writeManifest(id, manifest.title, manifest.timestamp, manifest.params, manifest.messages || []);
                             } catch {}
-                            if (manifest.title) {
-                                convo.title = manifest.title;
-                                meta.title = manifest.title;
-                            }
-                            if (manifest.timestamp != null) {
-                                const ts = +manifest.timestamp;
-                                if (Number.isFinite(ts)) {
-                                    convo.timestamp = ts;
-                                    meta.timestamp = ts;
-                                }
-                            }
+                            if (manifest.title) { convo.title = manifest.title; meta.title = manifest.title; }
+                            const ts = +manifest.timestamp;
+                            if (Number.isFinite(ts)) { convo.timestamp = ts; meta.timestamp = ts; }
                         }
                     }
                     if (!manifest || !serializedMessages) {
@@ -1697,8 +1678,8 @@ const TagCountBadge={
                 const variant = computed(() => props.msg.variants?.[props.msg.activeVariant] ?? props.msg.variants?.[0] ?? null);
                 const isAwaitingContent = computed(() => isGen.value && !variant.value?._text && !variant.value?._error && !variant.value?._images?.length);
                 const isEditing = computed(() => props.editState?.msgId === props.msg.id);
-                const toggleHideImage = (imgId) => { const img = _.find(props.msg.images, {id:imgId}); if (img) { img.hidden = !img.hidden; toast.q(img.hidden ? 'Image hidden from model' : 'Image shown to model', 1500); } };
-                const deleteImage = (imgId) => { if (!props.msg.images) return; const i = _.findIndex(props.msg.images, {id:imgId}); if (i !== -1) props.msg.images.splice(i, 1); };
+                const toggleHideImage = (imgId) => { const img = props.msg.images?.find(i => i.id === imgId); if (img) { img.hidden = !img.hidden; toast.q(img.hidden ? 'Image hidden from model' : 'Image shown to model', 1500); } };
+                const deleteImage = (imgId) => { if (!props.msg.images) return; const i = props.msg.images.findIndex(x => x.id === imgId); if (i !== -1) props.msg.images.splice(i, 1); };
                 const navigateVariant = (dir) => {
                     const m = props.msg;
                     if (!props.filterNoImage) { m.activeVariant = Math.max(0, Math.min(m.variants.length - 1, m.activeVariant + dir)); return; }
@@ -1800,7 +1781,7 @@ const TagCountBadge={
                     if (!text && !pendingImages.value.length) return;
                     if (promptInputEl.value) { promptInputEl.value.value = ''; promptInputEl.value.style.height = '42px'; }
                     const imgs = [...pendingImages.value]; pendingImages.value = [];
-                    await Promise.all(_.compact(imgs.map(i => i._ingestPromise)));
+                    await Promise.all(imgs.map(i => i._ingestPromise).filter(Boolean));
                     await sendMessage(text, imgs, scrollToBottom);
                 };
                 onKeyStroke('Escape', () => { if (lightboxSrc.value) lightboxSrc.value = null; });
@@ -1952,7 +1933,7 @@ const TagCountBadge={
             template:`<div class="flex h-screen animated-bg animate-gradientShift"><nav class="z-50 p-2 glass border-r-0 flex flex-col"><ul class="menu bg-transparent rounded-box p-0 space-y-2"><li v-for="item in navItems" :key="item.path"><nav-link :to="item.path" :icon="item.icon" :label="item.label" :notification="notifications[item.source]"></nav-link></li></ul><ul class="menu bg-transparent rounded-box p-0 mt-auto pt-2 border-t border-white/10"><li><div class="indicator p-0 flex-center w-14 h-14"><span v-if="syncStatus === 'error'" class="indicator-item badge badge-error badge-xs">!</span><nav-link to="/settings" icon="settings"></nav-link></div></li></ul></nav><main class="flex-1 overflow-hidden"><router-view v-slot="{Component}"><keep-alive><component :is="Component" /></keep-alive></router-view></main><toast-container></toast-container></div>`
         };
         const app = createApp(App);
-        _.forOwn({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, ToggleBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, HoverCard, ImagePreviewCard, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ToastContainer, FolderDropdown, InlineEdit, NavLink, HiddenBadge, SpinIcon, SyncBadge, ChatMessage, ConvoListItem, NanoBanana}, (c, n) => app.component(n, c));
+        Object.entries({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, ToggleBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, HoverCard, ImagePreviewCard, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ToastContainer, FolderDropdown, InlineEdit, NavLink, HiddenBadge, SpinIcon, SyncBadge, ChatMessage, ConvoListItem, NanoBanana}).forEach(([n, c]) => app.component(n, c));
         app.use(router);
 app.mount('#app');
 window.__VUE_APP_MOUNTED__ = true;</script>
