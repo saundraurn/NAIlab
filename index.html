@@ -1262,7 +1262,12 @@ const TagCountBadge={
                     manifest.title = convo.title;
                     manifest.timestamp = Date.now();
                     manifest.params = convo.params;
-                    manifest.messages = convo.messages.map(m => descMap.get(m.id) || { msgId: m.id, imageIds: [], updatedAt: Date.now() });
+                    manifest.messages = convo.messages.map(m => {
+                        const existing = descMap.get(m.id);
+                        if (existing) return existing;
+                        const imageIds = _collectMsgImageIds(m);
+                        return { msgId: m.id, imageIds, updatedAt: Date.now() };
+                    });
                     await _writeManifest(id, manifest);
                     if (_dirtyManifests.has(id)) _r2DirtyManifests.add(id);
                     const meta = _findMeta(id);
@@ -1469,7 +1474,7 @@ const TagCountBadge={
                                 return raw ? await deserializeMessage(raw, imgCache) : null;
                             }));
                             if (msgs.every(Boolean)) {
-                                convoData = { messages: msgs, params: manifest.params, title: manifest.title, timestamp: manifest.timestamp, manifest };
+                                convoData = { messages: msgs, params: manifest.params, title: manifest.title, timestamp: manifest.timestamp, manifest, _deserialized: true };
                             }
                         }
                     } catch {}
@@ -1509,7 +1514,7 @@ const TagCountBadge={
                         await _pullMissingImagesFromR2(convoData, id);
                     }
                     if (convoData.params) Object.assign(convo.params, convoData.params);
-                    if (convoData.messages?.[0]?.role) {
+                    if (convoData._deserialized) {
                         convo.messages = convoData.messages;
                     } else {
                         const imgCache = new Map();
