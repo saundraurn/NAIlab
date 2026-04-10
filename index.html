@@ -1211,17 +1211,31 @@ const TagCountBadge={
                 setVarError(v, err.message || 'Unknown error');
                 toast.err(err.message || 'Generation failed'); return false;
             };
+            const _dirtyManifests = new Set();
             const _dirtyMessages = new Map();
-            const _markMsgDirty = (convoId, msgId) => (_dirtyMessages.get(convoId) ?? _dirtyMessages.set(convoId, new Set()).get(convoId)).add(msgId);
+            const _markManifestDirty = (convoId) => _dirtyManifests.add(convoId);
+            const _markMsgDirty = (convoId, msgId) => { _dirtyManifests.add(convoId); (_dirtyMessages.get(convoId) ?? _dirtyMessages.set(convoId, new Set()).get(convoId)).add(msgId); };
+            const _r2DirtyManifests = new Set();
+            const _r2DirtyMessages = new Map();
+            const _markR2Dirty = (convoId, msgIds) => {
+                _r2DirtyManifests.add(convoId);
+                if (!msgIds?.length) return;
+                const cur = _r2DirtyMessages.get(convoId);
+                if (cur === null) return;
+                const set = cur ?? (_r2DirtyMessages.set(convoId, new Set()), _r2DirtyMessages.get(convoId));
+                for (const id of msgIds) set.add(id);
+            };
             const _saveConvoDirect = async (convo, forceMsgIds) => {
                 if (!convo || convo.isTemp || !convo.messages.length) return;
                 try {
                     const dirtyMsgSet = forceMsgIds ? new Set(forceMsgIds) : (_dirtyMessages.get(convo.id) || new Set());
-                    const msgsToWrite = dirtyMsgSet.size ? convo.messages.filter(m => dirtyMsgSet.has(m.id)) : convo.messages;
-                    const serialized = await Promise.all(msgsToWrite.map(m => serializeMessage(m)));
+                    const hasDirty = _dirtyManifests.has(convo.id) || dirtyMsgSet.size > 0 || !!forceMsgIds;
+                    if (!hasDirty) return;
+                    const msgsToWrite = dirtyMsgSet.size ? convo.messages.filter(m => dirtyMsgSet.has(m.id)) : [];
+                    const serialized = msgsToWrite.length ? await Promise.all(msgsToWrite.map(m => serializeMessage(m))) : [];
                     const now = Date.now();
                     const serializedById = new Map();
-                    await Promise.all(serialized.map(s => (serializedById.set(s.id, s), _writeMsg(convo.id, s.id, s))));
+                    if (serialized.length) await Promise.all(serialized.map(s => (serializedById.set(s.id, s), _writeMsg(convo.id, s.id, s))));
                     const prevManifest = await _readManifest(convo.id);
                     const prevDescById = new Map((prevManifest?.messages || []).map(d => [d.msgId, d]));
                     const currentMsgIds = new Set(convo.messages.map(m => m.id));
@@ -1234,7 +1248,10 @@ const TagCountBadge={
                     const orphanedMsgIds = [...prevDescById.keys()].filter(id => !currentMsgIds.has(id));
                     if (orphanedMsgIds.length) await Promise.all(orphanedMsgIds.map(mid => opfs.remove(_msgPath(convo.id, mid))));
                     await _writeManifest(convo.id, convo.title, now, convo.params, allDescriptors);
+                    const writtenIds = serialized.map(s => s.id);
+                    _markR2Dirty(convo.id, writtenIds);
                     _dirtyMessages.get(convo.id)?.clear();
+                    _dirtyManifests.delete(convo.id);
                     const meta = _findMeta(convo.id);
                     if (meta) { meta.timestamp = now; }
                 } catch (e) { console.warn('Auto-save failed:', e); }
@@ -1272,7 +1289,6 @@ const TagCountBadge={
                     if (!isViewingThis) store.incrementNotification('banana');
                     if (!convo.isTemp && _isSyncReady()) {
                         _markCloud(convo.id);
-                        _r2SyncDirty.add(convo.id);
                         _runR2Sync();
                     }
                 }
@@ -1486,6 +1502,7 @@ const TagCountBadge={
                 if (convo) convo.title = t;
                 const s = _findMeta(id);
                 if (s) s.title = t;
+                if (convo && !convo.isTemp) { _markManifestDirty(id); _autoSave(); }
             };
             const pruneNoImageMessages = () => withActiveConvo(convo => {
                 const genMsgId = convo.generatingMsgId;
@@ -1517,7 +1534,6 @@ const TagCountBadge={
                     if (_isSyncReady()) {
                         _markCloud(convo.id);
                         if (convoSyncStatus[convo.id] !== 'syncing') convoSyncStatus[convo.id] = 'pending';
-                        _r2SyncDirty.add(convo.id);
                         _runR2Sync();
                     }
                 }
@@ -1530,6 +1546,10 @@ const TagCountBadge={
                     if (convo) convo.messages.forEach(m => _markMsgDirty(convo.id, m.id));
                     _autoSave();
                 }
+            }, { deep: true });
+            watch(() => { const c = activeConvo.value; return c && !c.isTemp && !c.isHydrating ? c.params : null; }, () => {
+                const convo = activeConvo.value;
+                if (convo && !convo.isTemp) { _markManifestDirty(convo.id); _autoSave(); }
             }, { deep: true });
             const r2Client = useR2Client();
             const _pushConvoR2Locks = new Map();
@@ -1560,15 +1580,16 @@ const TagCountBadge={
                 await _pool([...synced].filter(id => !imageIds.has(id)), id => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${id}`).catch(() => {}));
                 _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...imageIds].filter(id => synced.has(id) || uploaded.has(id)) };
             };
-            const _syncConversationToR2 = async (id) => {
+            const _syncConversationToR2 = async (id, dirtyMsgIds) => {
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 const manifest = await _readManifest(id);
                 if (!manifest) throw new Error('Conversation data not found locally.');
                 const imageIds = _collectImageIdsFromManifest(manifest);
                 const descriptors = manifest.messages || [];
+                const msgsToSync = !dirtyMsgIds ? descriptors : descriptors.filter(d => dirtyMsgIds.has(d.msgId));
                 const msgFiles = [];
                 const missingMsgIds = [];
-                await _pool(descriptors, async (desc) => {
+                await _pool(msgsToSync, async (desc) => {
                     const raw = await opfs.read(_msgPath(id, desc.msgId));
                     if (raw) msgFiles.push({ msgId: desc.msgId, data: raw });
                     else missingMsgIds.push(desc.msgId);
@@ -1581,20 +1602,26 @@ const TagCountBadge={
             };
             let _r2SyncInProgress = false;
             let _r2SyncPromise = null;
-            const _r2SyncDirty = new Set();
             const _runR2Sync = () => {
                 if (_r2SyncInProgress) return _r2SyncPromise || Promise.resolve();
                 _r2SyncInProgress = true;
                 _r2SyncPromise = (async () => {
                     try {
-                        const ids = [..._r2SyncDirty];
-                        _r2SyncDirty.clear();
-                        await _pool(ids.filter(id => cloudConversations.value[id]), async (id) => {
+                        const mfSnap = new Set(_r2DirtyManifests);
+                        _r2DirtyManifests.clear();
+                        const msgSnap = new Map();
+                        for (const [id, set] of _r2DirtyMessages) msgSnap.set(id, set ? new Set(set) : null);
+                        _r2DirtyMessages.clear();
+                        const allIds = new Set([...mfSnap, ...msgSnap.keys()]);
+                        await _pool([...allIds].filter(id => cloudConversations.value[id]), async (id) => {
                             convoSyncStatus[id] = 'syncing';
                             try {
-                                await _syncConversationToR2(id);
+                                const dirty = msgSnap.has(id) ? msgSnap.get(id) : new Set();
+                                await _syncConversationToR2(id, dirty);
                                 convoSyncStatus[id] = 'synced';
                             } catch (e) {
+                                _r2DirtyManifests.add(id);
+                                _r2DirtyMessages.set(id, null);
                                 convoSyncStatus[id] = 'error';
                                 console.warn('Convo R2 sync failed:', e);
                                 const title = _findMeta(id)?.title || id;
@@ -1604,7 +1631,7 @@ const TagCountBadge={
                     } finally {
                         _r2SyncInProgress = false;
                         _r2SyncPromise = null;
-                        if (_r2SyncDirty.size) await _runR2Sync();
+                        if (_r2DirtyManifests.size || _r2DirtyMessages.size) await _runR2Sync();
                     }
                 })();
                 return _r2SyncPromise;
@@ -1616,6 +1643,8 @@ const TagCountBadge={
                     try {
                         _markCloud(id);
                         await _syncConversationToR2(id);
+                        _r2DirtyManifests.delete(id);
+                        _r2DirtyMessages.delete(id);
                         await useSyncStore().push(true);
                         convoSyncStatus[id] = 'synced';
                         toast.q('Synced to cloud');
@@ -1627,7 +1656,8 @@ const TagCountBadge={
                     return;
                 }
                 convoSyncStatus[id] = 'pending';
-                _r2SyncDirty.add(id);
+                _r2DirtyManifests.add(id);
+                _r2DirtyMessages.set(id, null);
                 await _runR2Sync();
                 if (_r2SyncPromise) await Promise.race([
                     _r2SyncPromise,
