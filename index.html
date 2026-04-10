@@ -132,6 +132,7 @@
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
         const _pool = async (arr, fn, n = 5) => { let i = 0; const w = async () => { while (i < arr.length) await fn(arr[i++]); }; await Promise.all(Array.from({length: Math.min(n, arr.length)}, w)); };
+        const _refDel = (r, k) => { const o = { ...r.value }; delete o[k]; r.value = o; };
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
         const opfs = (() => {
             let _r;
@@ -151,13 +152,13 @@
             const config = useLocalStorage('nai-app-settings', {
                 tagTest: {iterations:1, isInfinite:false, isControl:true, prompts:[{id:1, val:'1girl, solo, wearing casual clothes'}], nextPromptId:2, unwantedContent:'multiple views, monochrome, black and white, looking at viewer, pov', tagsToTest:'sunset lighting\nwarm colors\nnight scene\nfog\nrain', tagPos:'beginning', tagTarget:'prompt', tagStrength:1.0, hasExtendedRange:false, areTagsVisible:false, shouldFilterMiddleResults:false},
                 genConfig: {steps:28, width:768, height:1344, scale:5.7, sampler:'k_euler_ancestral', cfgRescale:0, noiseSchedule:'karras', skipCfgAboveSigma:0, isOpus:false, shouldUseRandomOpusDimensions:false},
-                ui: {collapsibleStates:{'tag-test-settings':true, 'prompts-uc':true, 'tags-to-test':true, 'gen-settings':true, 'api-config':true, 'app-settings':true, 'img-comparison':true, 'results-panel':true, 'danbooru-search':true, 'danbooru-folders':true, 'danbooru-tags':true, 'nai-main-prompt':true, 'nai-char-prompts':true, 'nai-last-img':true, 'gen-header':true, 'gen-history':true, 'sync-settings':true, 'banana-settings':true}},
+                ui: {collapsibleStates:Object.fromEntries('tag-test-settings,prompts-uc,tags-to-test,gen-settings,api-config,app-settings,img-comparison,results-panel,danbooru-search,danbooru-folders,danbooru-tags,nai-main-prompt,nai-char-prompts,nai-last-img,gen-header,gen-history,sync-settings,banana-settings'.split(',').map(k=>[k,!0]))},
                 app: {apiKey:'', model:'nai-diffusion-4-5-full'},
                 gemini: {apiKey:''},
                 danbooru: {folders:[], nextFolderId:1, gridCols:4, lastPath:'/danbooru', blacklist:'', sortOrder:'id', ratingFilters:{g:true, s:true, q:true, e:true}, savedSearches:[{name:'Trending', prompt:'order:rank'}]},
                 genState: {prompt:'1girl, solo, wearing casual clothes', uc:'multiple views, monochrome, black and white, looking at viewer, pov', charPrompts:[{id:1, val:''}], nextCharPromptId:2},
                 jssync: {proxyUrl:'', lastSyncedAt:null},
-                _syncMeta: {tagTest:{updatedAt:0,rev:0}, genConfig:{updatedAt:0,rev:0}, genState:{updatedAt:0,rev:0}, app:{updatedAt:0,rev:0}, danbooru:{updatedAt:0,rev:0}}
+                _syncMeta: Object.fromEntries(_SYNC_KEYS.map(k=>[k,{updatedAt:0,rev:0}]))
             }, {mergeDefaults: true});
 
             const syncToken = useLocalStorage('nai-sync-token', '');
@@ -315,50 +316,8 @@
                 if (!res.ok && res.status !== 404 && res.status !== 304) throw new Error(`R2 request failed: ${res.status}`);
                 return res;
             };
-            return { r2Fetch, getWorkerUrl, getSecret };
-        });
-        const useSyncQueue = createGlobalState(() => {
-            const _queue = reactive([]);
-            const _running = ref(false);
-            let _timer = null;
-            const _BATCH_DELAY = 300;
-            const _MIN_INTERVAL = 1200;
-            let _lastRunAt = 0;
-            const enqueue = (key, fn) => {
-                const existing = _queue.findIndex(q => q.key === key);
-                if (existing !== -1) _queue[existing].fn = fn;
-                else _queue.push({ key, fn });
-                _scheduleRun();
-            };
-            const _scheduleRun = () => {
-                if (_running.value || _timer) return;
-                const elapsed = Date.now() - _lastRunAt;
-                const wait = Math.max(_BATCH_DELAY, _MIN_INTERVAL - elapsed);
-                _timer = setTimeout(_processQueue, wait);
-            };
-            const _processQueue = async () => {
-                _timer = null;
-                if (_running.value || !_queue.length) return;
-                _running.value = true;
-                try {
-                    while (_queue.length) {
-                        const batch = _queue.splice(0);
-                        const errors = [];
-                        for (const item of batch) {
-                            try { await item.fn(); }
-                            catch (e) { errors.push({ key: item.key, error: e }); console.warn(`Sync queue error [${item.key}]:`, e); }
-                        }
-                        _lastRunAt = Date.now();
-                        if (errors.length) {
-                            const failed = errors.map(e => e.key).join(', ');
-                            toast.warn(`Sync failed for: ${failed}`, 'sync', 4000);
-                        }
-                    }
-                } finally { _running.value = false; if (_queue.length) _scheduleRun(); }
-            };
-            const isRunning = computed(() => _running.value);
-            const pending = computed(() => _queue.length);
-            return { enqueue, isRunning, pending };
+            const isReady = () => !!(getWorkerUrl() && getSecret());
+            return { r2Fetch, getWorkerUrl, getSecret, isReady };
         });
         const useSyncStore = createGlobalState(() => {
             const isSyncing = ref(false);
@@ -366,7 +325,6 @@
             const syncStatus = ref('idle');
             const appStore = useAppStore();
             const r2Client = useR2Client();
-            const syncQueue = useSyncQueue();
             const TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
             const _finalizePush = (cfg) => {
                 cfg.jssync.lastSyncedAt = Date.now();
@@ -396,7 +354,7 @@
             watch([() => appStore.config.value.jssync.proxyUrl, () => appStore.syncToken.value], () => { _configEtag.value = null; _listEtag.value = null; });
             const pull = async () => {
                 const cfg = appStore.config.value;
-                if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
+                if (!r2Client.isReady()) return;
                 syncStatus.value = 'pulling'; syncError.value = null;
                 try {
                     const configOpts = _configEtag.value ? { ifNoneMatch: _configEtag.value } : {};
@@ -484,7 +442,7 @@
                             const remoteIdSet = new Set();
                             let addedCount = 0, updatedCount = 0;
                             for (const entry of remoteConvos) {
-                                if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+                                if (!_.isPlainObject(entry)) continue;
                                 const remoteId = entry.id;
                                 if (typeof remoteId !== 'string' || !remoteId) continue;
                                 const title = entry.title || 'Cloud Chat';
@@ -537,7 +495,7 @@
             };
             const push = async (silent = false) => {
                 const cfg = appStore.config.value;
-                if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
+                if (!r2Client.isReady()) return;
                 syncStatus.value = 'pushing'; syncError.value = null;
                 try {
                     const tombstones = cfg.jssync._deletedConversationIds || [];
@@ -580,9 +538,7 @@
                     if (syncStatus.value === 'idle') await push(true);
                 });
             };
-            const queueSync = () => {
-                syncQueue.enqueue('config', syncNow);
-            };
+            const queueSync = useDebounceFn(() => syncNow().catch(() => {}), 1200);
             return { isSyncing, syncStatus, syncError, pull, push, syncNow, queueSync };
         });
         const TAG_COLORS={artist:['badge-warning','bg-warning/20'],character:['badge-success','bg-success/20'],copyright:['badge-accent','bg-accent/20'],meta:['badge-info','bg-info/20'],default:['badge-primary','bg-primary/20']};
@@ -723,7 +679,7 @@ const TagCountBadge={
                     const naiReqs = !model ? [] : frags.map(f => fetchTags(`https://image.novelai.net/ai/generate-image/suggest-tags?model=${model}&prompt=${encodeURIComponent(f.txt)}`, d => d.tags?.map(t => ({ ...t, text: t.tag, fragmentStartPos: f.s, fragmentEndPos: cursorPos, source: "nai", sortScore: t.count })) || []));
                     const danReq = (!lastWord || lastWord.length < 2) ? [] : [fetchTags(`https://danbooru.donmai.us/tags.json?search[name_matches]=${encodeURIComponent(lastWord)}*&search[order]=count&limit=10&search[hide_empty]=yes`, d => d.map(t => ({ text: t.name.replace(/_/g, " "), count: t.post_count, category: t.category, fragmentStartPos: start + sub.slice(start).lastIndexOf(lastWord), fragmentEndPos: cursorPos, source: "danbooru", sortScore: Math.log10(Math.max(1, t.post_count)) * (t.category === 1 ? 5000 : 2600) - (t.category === 1 ? 5000 : 3200) })))];
                     const results = await Promise.all([...naiReqs, ...danReq]);
-                    return { suggestions: _.chain(results.flat()).orderBy("sortScore", "desc").uniqBy("text").value() };
+                    return { suggestions: _.uniqBy(_.orderBy(results.flat(), "sortScore", "desc"), "text") };
                 } catch { return {suggestions: []}; }
             };
             onScopeDispose(() => abortController.value?.abort()); return {getAutocomplete};
@@ -835,7 +791,7 @@ const TagCountBadge={
                     }
                 });
                 const fetchPosts = (tags, page = 1, append = false, filters = []) => { if (abortController) abortController.abort(); abortController = new AbortController(); if (!append) posts.value = []; return execute(0, tags, page, append, abortController.signal, filters); };
-                const sortedPosts = computed(() => { const {g, s, q, e} = ratingFilters.value; return _.chain(posts.value).filter(post => (g && s && q && e) || ratingFilters.value[post.rating]).orderBy(sortOrder.value === 'score' ? ['score', 'id'] : ['id'], ['desc', 'desc']).value(); });
+                const sortedPosts = computed(() => { const {g, s, q, e} = ratingFilters.value; return _.orderBy(_.filter(posts.value, post => (g && s && q && e) || ratingFilters.value[post.rating]), sortOrder.value === 'score' ? ['score', 'id'] : ['id'], ['desc', 'desc']); });
                 const selectedPostId = computed(() => {
                     const routeId = route.params?.postId ?? route.params?.id ?? route.query?.postId ?? route.query?.id;
                     return routeId == null ? null : String(routeId);
@@ -930,11 +886,8 @@ const TagCountBadge={
                 const pendingJobs = computed(() => queue.value.reduce((total, req) => total + (req.source === 'tagTest'), 0));
                 const formattedResults = computed(() => {
                     const {isControl, shouldFilterMiddleResults: filter} = tagTest.value, {tags, control} = resultsStore;
-                    const list = _.chain(Object.keys(tags))
-                        .concat(isControl && !_.isEmpty(control) ? ['Control'] : [])
-                        .map(name => { const d = name === 'Control' ? control : tags[name], total = d.wins + d.losses; return {name, score: +(total ? (d.wins / total) * 100 : 50).toFixed(1), tests: total, ...d}; })
-                        .orderBy('score', 'desc')
-                        .value();
+                    const tagKeys = Object.keys(tags).concat(isControl && !_.isEmpty(control) ? ['Control'] : []);
+                    const list = _.orderBy(tagKeys.map(name => { const d = name === 'Control' ? control : tags[name], total = d.wins + d.losses; return {name, score: +(total ? (d.wins / total) * 100 : 50).toFixed(1), tests: total, ...d}; }), 'score', 'desc');
                     return filter ? list.filter(r => r.score < 33 || r.score > 66) || list : list;
                 });
                 const progressText = computed(() => { if (!isTestActive.value && judgedPairsNum.value === 0) return ''; return `(${judgedPairsNum.value + (currentImages.imageA ? 1 : 0)} / ${generatedImageNum.value / 2} / ${tagTest.value.isInfinite ? '∞' : totalTests.value})`; });
@@ -1073,7 +1026,7 @@ const TagCountBadge={
         const useGeminiAPI = createGlobalState(() => {
             const store = useAppStore();
             const imageStore = useImageStore();
-            const _isSyncReady = () => !!(store.syncToken.value && store.config.value.jssync.proxyUrl);
+            const r2Client = useR2Client();
             const conversationMap = reactive(new Map());
             const activeConvoId = ref(null);
             const _createConvoState = (opts = {}) => reactive({
@@ -1106,7 +1059,7 @@ const TagCountBadge={
             const convoSyncStatus = reactive({});
             const _findMeta = id => savedConversations.value.find(x => x.id === id);
             const _markCloud = id => { if (!cloudConversations.value[id]) cloudConversations.value = { ...cloudConversations.value, [id]: true }; };
-            const _unmarkCloud = id => { const c = { ...cloudConversations.value }; delete c[id]; cloudConversations.value = c; };
+            const _unmarkCloud = id => _refDel(cloudConversations, id);
             const _requireGeminiKey = () => {
                 if (!store.config.value.gemini?.apiKey) { toast.err('Gemini API key required — set it in Settings'); return false; }
                 return true;
@@ -1257,7 +1210,7 @@ const TagCountBadge={
                 if (didSucceed) {
                     const isViewingThis = activeConvoId.value === convo.id && window.location.hash.includes('/banana');
                     if (!isViewingThis) store.incrementNotification('banana');
-                    if (!convo.isTemp && _isSyncReady()) {
+                    if (!convo.isTemp && r2Client.isReady()) {
                         _markCloud(convo.id);
                         _r2SyncDirty.add(convo.id);
                         _runR2Sync();
@@ -1343,7 +1296,7 @@ const TagCountBadge={
                 const idx = list.findIndex(x => x.id === convo.id);
                 if (idx !== -1) list[idx] = meta; else list.unshift(meta);
                 toast.q('Chat saved');
-                if (_isSyncReady()) {
+                if (r2Client.isReady()) {
                     syncConversationNow(id).catch(e => console.warn('Auto-sync to cloud failed:', e));
                 }
                 return actualTitle;
@@ -1443,7 +1396,7 @@ const TagCountBadge={
                 }
                 if (conversationMap.has(id)) closeConversation(id);
                 deleteCloudConversation(id).catch(() => {});
-                _isSyncReady() && useSyncStore().push(true).catch(() => {});
+                r2Client.isReady() && useSyncStore().push(true).catch(() => {});
                 toast.q('Removed from saved chats');
                 imageStore.cleanupOrphanedImages(savedConversations.value).catch(() => {});
             };
@@ -1481,7 +1434,7 @@ const TagCountBadge={
                 const convo = activeConvo.value;
                 if (convo && !convo.isTemp && !convo.generating && !convo.isHydrating) {
                     _saveConvoDirect(convo);
-                    if (_isSyncReady()) {
+                    if (r2Client.isReady()) {
                         _markCloud(convo.id);
                         if (convoSyncStatus[convo.id] !== 'syncing') convoSyncStatus[convo.id] = 'pending';
                         _r2SyncDirty.add(convo.id);
@@ -1492,7 +1445,6 @@ const TagCountBadge={
             watch(() => { const c = activeConvo.value; return c && !c.isTemp && !c.generating ? c.messages : null; }, (msgs) => {
                 if (msgs) _autoSave();
             }, { deep: true });
-            const r2Client = useR2Client();
             const _pushConvoR2Locks = new Map();
             const _pushConvoToR2 = (convoId, convoJson, imageIds, meta) => {
                 const prev = _pushConvoR2Locks.get(convoId) || Promise.resolve();
@@ -1530,7 +1482,7 @@ const TagCountBadge={
                 _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: nowSynced };
             };
             const _syncConversationToR2 = async (id) => {
-                if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
+                if (!r2Client.isReady()) return;
                 const rawBytes = await opfs.read(_convoPath(id));
                 if (!rawBytes) throw new Error('Conversation data not found locally.');
                 const imageIds = _collectImageIds(JSON.parse(new TextDecoder().decode(rawBytes)));
@@ -1606,12 +1558,8 @@ const TagCountBadge={
                     return;
                 }
                 _unmarkCloud(id);
-                const restSync = { ..._syncedR2Images.value };
-                delete restSync[id];
-                _syncedR2Images.value = restSync;
-                const restEtags = { ..._convoEtags.value };
-                delete restEtags[id];
-                _convoEtags.value = restEtags;
+                _refDel(_syncedR2Images, id);
+                _refDel(_convoEtags, id);
                 delete convoSyncStatus[id];
             };
             return {
