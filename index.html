@@ -1236,16 +1236,10 @@ const TagCountBadge={
                 setVarError(v, err.message || 'Unknown error');
                 toast.err(err.message || 'Generation failed'); return false;
             };
-            const _dirtyManifests = new Set();
             const _dirtyMessages = new Map();
             const _markMsgDirty = (convoId, msgId) => {
                 if (!_dirtyMessages.has(convoId)) _dirtyMessages.set(convoId, new Set());
                 _dirtyMessages.get(convoId).add(msgId);
-            };
-            const _markManifestDirty = (convoId) => _dirtyManifests.add(convoId);
-            const _buildMsgDescriptor = (serializedMsg) => {
-                const imageIds = [..._collectMsgImageIds(serializedMsg)];
-                return { msgId: serializedMsg.id, imageIds, updatedAt: Date.now() };
             };
             const _saveConvoDirect = async (convo, forceMsgIds) => {
                 if (!convo || convo.isTemp || !convo.messages.length) return;
@@ -1254,15 +1248,23 @@ const TagCountBadge={
                     const msgsToWrite = dirtyMsgSet.size ? convo.messages.filter(m => dirtyMsgSet.has(m.id)) : convo.messages;
                     const serialized = await Promise.all(msgsToWrite.map(m => serializeMessage(m)));
                     await Promise.all(serialized.map(s => _writeMsg(convo.id, s.id, s)));
-                    const allDescriptors = await Promise.all(convo.messages.map(async m => {
-                        const s = serialized.find(x => x.id === m.id) || await serializeMessage(m);
-                        return _buildMsgDescriptor(s);
-                    }));
-                    await _writeManifest(convo.id, convo.title, Date.now(), convo.params, allDescriptors);
+                    const now = Date.now();
+                    const serializedById = new Map(serialized.map(s => [s.id, s]));
+                    const prevManifest = await _readManifest(convo.id);
+                    const prevDescById = new Map((prevManifest?.messages || []).map(d => [d.msgId, d]));
+                    const currentMsgIds = new Set(convo.messages.map(m => m.id));
+                    const allDescriptors = convo.messages.map(m => {
+                        const s = serializedById.get(m.id);
+                        if (s) return { msgId: s.id, imageIds: [..._collectMsgImageIds(s)], updatedAt: now };
+                        const prev = prevDescById.get(m.id);
+                        return prev || { msgId: m.id, imageIds: [], updatedAt: now };
+                    });
+                    const orphanedMsgIds = [...prevDescById.keys()].filter(id => !currentMsgIds.has(id));
+                    if (orphanedMsgIds.length) await Promise.all(orphanedMsgIds.map(mid => opfs.remove(_msgPath(convo.id, mid))));
+                    await _writeManifest(convo.id, convo.title, now, convo.params, allDescriptors);
                     if (_dirtyMessages.has(convo.id)) _dirtyMessages.get(convo.id).clear();
-                    _dirtyManifests.delete(convo.id);
                     const meta = _findMeta(convo.id);
-                    if (meta) { meta.timestamp = Date.now(); }
+                    if (meta) { meta.timestamp = now; }
                 } catch (e) { console.warn('Auto-save failed:', e); }
             };
             const _pruneBananaThinkingStates = (msgIds) => {
@@ -1288,7 +1290,6 @@ const TagCountBadge={
                 convo.generating = false; convo.generatingMsgId = null; convo.generatingVarIdx = null; convo.abortCtrl = null;
                 if (!convo.isTemp) {
                     _markMsgDirty(convo.id, modelMsg.id);
-                    _markManifestDirty(convo.id);
                     _saveConvoDirect(convo, [modelMsg.id]);
                 }
                 const genVariant = modelMsg.variants[genVarIdx];
@@ -1313,7 +1314,6 @@ const TagCountBadge={
                 const userMsg = reactive({id: uid(), role: 'user', images: imgs.map(i => ({id: uid(), data: i.data, mimeType: i.mimeType, name: i.name, hidden: false})), text: text || '', hidden: false, timestamp: Date.now()});
                 convo.messages.push(userMsg);
                 _markMsgDirty(convo.id, userMsg.id);
-                _markManifestDirty(convo.id);
                 const modelMsg = createModelMsg(convo.params);
                 convo.messages.push(modelMsg);
                 const contents = _getContents(convo.messages, convo.messages.indexOf(modelMsg));
@@ -1404,14 +1404,17 @@ const TagCountBadge={
                     if (hTs && manifest.timestamp == null) { const n = Number(hTs); if (Number.isFinite(n)) manifest.timestamp = n; }
                     const msgDescriptors = manifest.messages || [];
                     const msgs = new Array(msgDescriptors.length);
+                    const missing = [];
                     await _pool(msgDescriptors.map((desc, i) => ({ desc, i })), async ({ desc, i }) => {
                         try {
                             const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/messages/${desc.msgId}`);
-                            if (res.ok) msgs[i] = JSON.parse(await res.text());
-                        } catch {}
+                            if (!res.ok) { missing.push(desc.msgId); return; }
+                            msgs[i] = JSON.parse(await res.text());
+                        } catch { missing.push(desc.msgId); }
                     });
-                    return { manifest, messages: msgs.filter(Boolean) };
-                } catch { return null; }
+                    if (missing.length) throw new Error(`Missing message(s): ${missing.join(', ')}`);
+                    return { manifest, messages: msgs };
+                } catch (e) { console.warn('_fetchConvoFromR2:', e); return null; }
             };
             const _pullMissingImagesFromR2 = async (manifest, convoId) => {
                 const imageIds = _collectImageIdsFromManifest(manifest);
@@ -1456,7 +1459,8 @@ const TagCountBadge={
                         if (manifest) {
                             const descriptors = manifest.messages || [];
                             const msgs = await Promise.all(descriptors.map(d => _readMsg(id, d.msgId)));
-                            serializedMessages = msgs.filter(Boolean);
+                            if (msgs.some(m => !m)) { manifest = null; serializedMessages = null; }
+                            else serializedMessages = msgs;
                         }
                     } catch {}
                     if (!manifest && cloudConversations.value[id]) {
@@ -1466,8 +1470,7 @@ const TagCountBadge={
                             serializedMessages = r2Data.messages;
                             try {
                                 await Promise.all(serializedMessages.map(m => _writeMsg(id, m.id, m)));
-                                const descriptors = serializedMessages.map(m => _buildMsgDescriptor(m));
-                                await _writeManifest(id, manifest.title, manifest.timestamp, manifest.params, descriptors);
+                                await _writeManifest(id, manifest.title, manifest.timestamp, manifest.params, manifest.messages || []);
                             } catch {}
                             if (manifest.title) {
                                 convo.title = manifest.title;
@@ -1550,7 +1553,6 @@ const TagCountBadge={
             const _autoSave = useDebounceFn(() => {
                 const convo = activeConvo.value;
                 if (convo && !convo.isTemp && !convo.generating && !convo.isHydrating) {
-                    _markManifestDirty(convo.id);
                     _saveConvoDirect(convo);
                     if (_isSyncReady()) {
                         _markCloud(convo.id);
@@ -1615,12 +1617,13 @@ const TagCountBadge={
                 const imageIds = _collectImageIdsFromManifest(manifest);
                 const descriptors = manifest.messages || [];
                 const msgFiles = [];
+                const missingMsgIds = [];
                 await _pool(descriptors, async (desc) => {
-                    try {
-                        const raw = await opfs.read(_msgPath(id, desc.msgId));
-                        if (raw) msgFiles.push({ msgId: desc.msgId, data: raw });
-                    } catch {}
+                    const raw = await opfs.read(_msgPath(id, desc.msgId));
+                    if (raw) msgFiles.push({ msgId: desc.msgId, data: raw });
+                    else missingMsgIds.push(desc.msgId);
                 });
+                if (missingMsgIds.length) throw new Error(`Missing local message file(s): ${missingMsgIds.join(', ')}`);
                 const meta = _findMeta(id);
                 const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
                 const manifestJson = await opfs.read(_manifestPath(id));
