@@ -1403,15 +1403,14 @@ const TagCountBadge={
                     const hTs = manifestRes.headers.get('X-Convo-Timestamp');
                     if (hTs && manifest.timestamp == null) { const n = Number(hTs); if (Number.isFinite(n)) manifest.timestamp = n; }
                     const msgDescriptors = manifest.messages || [];
-                    const msgs = [];
-                    await _pool(msgDescriptors, async (desc) => {
+                    const msgs = new Array(msgDescriptors.length);
+                    await _pool(msgDescriptors.map((desc, i) => ({ desc, i })), async ({ desc, i }) => {
                         try {
                             const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/messages/${desc.msgId}`);
-                            if (res.ok) msgs.push({ order: msgDescriptors.indexOf(desc), data: JSON.parse(await res.text()) });
+                            if (res.ok) msgs[i] = JSON.parse(await res.text());
                         } catch {}
                     });
-                    msgs.sort((a, b) => a.order - b.order);
-                    return { manifest, messages: msgs.map(m => m.data) };
+                    return { manifest, messages: msgs.filter(Boolean) };
                 } catch { return null; }
             };
             const _pullMissingImagesFromR2 = async (manifest, convoId) => {
@@ -1563,6 +1562,8 @@ const TagCountBadge={
             }, 1500);
             watch(() => { const c = activeConvo.value; return c && !c.isTemp && !c.generating ? c.messages : null; }, (msgs) => {
                 if (msgs) {
+                    // Deep watcher can't pinpoint which message changed; mark all dirty.
+                    // Generation path already marks specific messages via _markMsgDirty.
                     const convo = activeConvo.value;
                     if (convo) convo.messages.forEach(m => _markMsgDirty(convo.id, m.id));
                     _autoSave();
