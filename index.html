@@ -137,13 +137,14 @@
             let _r;
             const r = async () => _r ??= await navigator.storage.getDirectory();
             const gh = async (n, o) => (await r()).getFileHandle(n, o);
+            const gf = async n => (await gh(n)).getFile();
             return {
                 write: async (n, d) => { const w = await (await gh(n, {create:true})).createWritable(); await w.write(d); await w.close(); },
-                read: async (n) => { try { return new Uint8Array(await (await (await gh(n)).getFile()).arrayBuffer()); } catch { return null; } },
-                readText: async (n) => { try { return await (await (await gh(n)).getFile()).text(); } catch { return null; } },
+                read: async (n) => { try { return new Uint8Array(await (await gf(n)).arrayBuffer()); } catch { return null; } },
+                readText: async (n) => { try { return await (await gf(n)).text(); } catch { return null; } },
                 has: async (n) => { try { await gh(n); return true; } catch { return false; } },
                 remove: async (n) => { try { await (await r()).removeEntry(n); } catch {} },
-                keys: async () => { const d = await r(), a = []; for await (const k of d.keys()) a.push(k); return a; }
+                keys: async () => Array.fromAsync((await r()).keys())
             };
         })();
         const useAppStore = createGlobalState(() => {
@@ -238,24 +239,22 @@
             return `${proxyUrl.replace(/\/$/, '')}/proxy?url=${encodeURIComponent(url)}`;
         };
         const _convoPath = id => `convo_${id}.json`;
-        const _rmConvo = id => opfs.remove(_convoPath(id)).catch(() => {});
+        const _rmConvo = id => opfs.remove(_convoPath(id));
         const _writeConvo = (id, messages, params) =>
-            opfs.write(_convoPath(id), JSON.stringify({ messages, ...(params ? { params } : {}) }));
-        const _collectImageIds = (convoData) => {
-            const ids = new Set();
-            for (const msg of convoData.messages || []) {
-                for (const img of msg.images || []) { if (img.imageId) ids.add(img.imageId); }
-                for (const v of msg.variants || []) {
-                    for (const part of v.parts || []) { if (part._imageRef) ids.add(part._imageRef); }
-                    for (const img of v._images || []) { if (img.imageId) ids.add(img.imageId); }
+            opfs.write(_convoPath(id), JSON.stringify(params ? { messages, params } : { messages }));
+        const _collectImageIds = (d) => {
+            const s = new Set();
+            for (const m of d.messages || []) {
+                (m.images||[]).forEach(i => i.imageId && s.add(i.imageId));
+                for (const v of m.variants || []) {
+                    (v.parts||[]).forEach(p => p._imageRef && s.add(p._imageRef));
+                    (v._images||[]).forEach(i => i.imageId && s.add(i.imageId));
                 }
             }
-            return ids;
+            return s;
         };
         const useImageStore = createGlobalState(() => {
-            const saveImage = async (imageId, uint8Array) => {
-                await opfs.write(imageId, uint8Array);
-            };
+            const saveImage = (imageId, data) => opfs.write(imageId, data);
             const ingestImage = async (input) => {
                 let webpBytes;
                 if (input instanceof Blob) {
@@ -275,17 +274,16 @@
             const loadImage = async (imageId) => opfs.read(imageId);
             const cleanupOrphanedImages = async (savedConvosList) => {
                 const referenced = new Set();
-                for (const meta of savedConvosList || []) {
-                    if (!meta?.id) continue;
+                await _batch5(savedConvosList || [], async (meta) => {
+                    if (!meta?.id) return;
                     try {
                         const json = await opfs.readText(_convoPath(meta.id));
-                        if (json) _collectImageIds(JSON.parse(json)).forEach(id => referenced.add(id));
+                        if (json) for (const id of _collectImageIds(JSON.parse(json))) referenced.add(id);
                     } catch {}
-                }
+                });
                 try {
-                    for (const f of await opfs.keys()) {
-                        if (f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f)) opfs.remove(f).catch(() => {});
-                    }
+                    const orphaned = (await opfs.keys()).filter(f => f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f));
+                    await _batch5(orphaned, f => opfs.remove(f));
                 } catch {}
             };
             return { saveImage, loadImage, ingestImage, cleanupOrphanedImages };
@@ -1032,13 +1030,14 @@ const TagCountBadge={
         };
         const deserializeConversation = async (serializedData) => {
             if (!serializedData) return { messages: [] };
-            const imageStore = useImageStore();
+            const _imgCache = new Map();
+            const loadCached = (id) => { if (!_imgCache.has(id)) _imgCache.set(id, loadImageAsBase64(id)); return _imgCache.get(id); };
             const messages = await Promise.all((serializedData.messages || []).map(async (msg) => {
                 const dMsg = { ...msg };
                 if (dMsg.images && dMsg.images.length > 0) {
                     dMsg.images = await Promise.all(dMsg.images.map(async (img) => {
                         const dImg = { ...img };
-                        if (dImg.imageId) dImg.data = await loadImageAsBase64(dImg.imageId);
+                        if (dImg.imageId) dImg.data = await loadCached(dImg.imageId);
                         return dImg;
                     }));
                 }
@@ -1047,7 +1046,7 @@ const TagCountBadge={
                         const dV = { ...v };
                         dV.parts = await Promise.all(v.parts.map(async (part) => {
                             if (part._imageRef) {
-                                const imgB64 = await loadImageAsBase64(part._imageRef);
+                                const imgB64 = await loadCached(part._imageRef);
                                 if (!imgB64) console.warn(`Missing image data for ${part._imageRef}`);
                                 const base = _.omit(part, ['_imageRef', '_mimeType', '_thoughtSignature']);
                                 if (part._thoughtSignature) base.thoughtSignature = part._thoughtSignature;
@@ -1057,7 +1056,7 @@ const TagCountBadge={
                             return part;
                         }));
                         dV._images = await Promise.all((v._images || []).map(async (img) => {
-                            if (img.imageId) return { ...img, data: await loadImageAsBase64(img.imageId) };
+                            if (img.imageId) return { ...img, data: await loadCached(img.imageId) };
                             return img;
                         }));
                         dV._model = v._model || _FM;
