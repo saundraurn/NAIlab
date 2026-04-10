@@ -152,7 +152,7 @@
             const config = useLocalStorage('nai-app-settings', {
                 tagTest: {iterations:1, isInfinite:false, isControl:true, prompts:[{id:1, val:'1girl, solo, wearing casual clothes'}], nextPromptId:2, unwantedContent:'multiple views, monochrome, black and white, looking at viewer, pov', tagsToTest:'sunset lighting\nwarm colors\nnight scene\nfog\nrain', tagPos:'beginning', tagTarget:'prompt', tagStrength:1.0, hasExtendedRange:false, areTagsVisible:false, shouldFilterMiddleResults:false},
                 genConfig: {steps:28, width:768, height:1344, scale:5.7, sampler:'k_euler_ancestral', cfgRescale:0, noiseSchedule:'karras', skipCfgAboveSigma:0, isOpus:false, shouldUseRandomOpusDimensions:false},
-                ui: {collapsibleStates:Object.fromEntries('tag-test-settings,prompts-uc,tags-to-test,gen-settings,api-config,app-settings,img-comparison,results-panel,danbooru-search,danbooru-folders,danbooru-tags,nai-main-prompt,nai-char-prompts,nai-last-img,gen-header,gen-history,sync-settings,banana-settings'.split(',').map(k=>[k,!0]))},
+                ui: {collapsibleStates:Object.fromEntries('tag-test-settings,prompts-uc,tags-to-test,gen-settings,api-config,app-settings,img-comparison,results-panel,danbooru-search,danbooru-folders,danbooru-tags,nai-main-prompt,nai-char-prompts,nai-last-img,gen-header,gen-history,sync-settings,banana-settings'.split(',').map(k=>[k,true]))},
                 app: {apiKey:'', model:'nai-diffusion-4-5-full'},
                 gemini: {apiKey:''},
                 danbooru: {folders:[], nextFolderId:1, gridCols:4, lastPath:'/danbooru', blacklist:'', sortOrder:'id', ratingFilters:{g:true, s:true, q:true, e:true}, savedSearches:[{name:'Trending', prompt:'order:rank'}]},
