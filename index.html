@@ -1199,7 +1199,7 @@ const TagCountBadge={
                 if (!_findMeta(convo.id)) {
                     if (didSucceed) {
                         try {
-                            const title = convo.messages[0]?.text?.substring(0, 40) || 'Untitled Chat';
+                            const title = convo.messages.find(m => m.role === 'user')?.text?.substring(0, 40) || 'Untitled Chat';
                             convo.title = title; convo.timestamp = Date.now();
                             const meta = { id: convo.id, title, timestamp: convo.timestamp };
                             await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params);
