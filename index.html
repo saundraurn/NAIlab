@@ -230,10 +230,8 @@
         });
         const danbooruImgSrc = (url) => {
             if (!url) return '';
-            let {proxyUrl} = useAppStore().config.value.jssync;
-            if (!proxyUrl) return url;
-            if (!/^https?:\/\//i.test(proxyUrl)) proxyUrl = 'https://' + proxyUrl;
-            return `${proxyUrl.replace(/\/$/, '')}/proxy?url=${encodeURIComponent(url)}`;
+            const base = useR2Client().getWorkerUrl();
+            return base ? `${base}/proxy?url=${encodeURIComponent(url)}` : url;
         };
         const _convoPath = id => `convo_${id}.json`;
         const _rmConvo = id => opfs.remove(_convoPath(id));
@@ -251,17 +249,9 @@
             const saveImage = async (imageId, data) => { try { await opfs.write(imageId, data); } catch { _mem.set(imageId, data); } };
             const cacheImage = _mem.set.bind(_mem);
             const ingestImage = async (input) => {
-                let webpBytes;
-                if (input instanceof Blob) {
-                    webpBytes = await blobToWebP(input);
-                } else {
-                    if (input.mimeType === _WP) {
-                        webpBytes = Uint8Array.from(atob(input.data), c => c.charCodeAt(0));
-                    } else {
-                        const res = await fetch(`data:${input.mimeType};base64,${input.data}`);
-                        webpBytes = await blobToWebP(await res.blob());
-                    }
-                }
+                const webpBytes = input instanceof Blob ? await blobToWebP(input)
+                    : input.mimeType === _WP ? Uint8Array.from(atob(input.data), c => c.charCodeAt(0))
+                    : await blobToWebP(await (await fetch(`data:${input.mimeType};base64,${input.data}`)).blob());
                 const imageId = `img_${uid()}.webp`;
                 await saveImage(imageId, webpBytes);
                 _mem.set(imageId, webpBytes);
@@ -298,14 +288,12 @@
                 const secret = getSecret();
                 if (!base) throw new Error('Worker URL not configured.');
                 if (!secret) throw new Error('Sync secret not configured.');
-                const headers = { 'Authorization': `Bearer ${secret}` };
-                if (options.contentType) headers['Content-Type'] = options.contentType;
-                if (options.customHeaders) {
-                    for (const [key, value] of Object.entries(options.customHeaders)) {
-                        if (/^x-convo-/i.test(key)) headers[key] = value;
-                    }
-                }
-                if (options.ifNoneMatch) headers['If-None-Match'] = options.ifNoneMatch;
+                const headers = {
+                    'Authorization': `Bearer ${secret}`,
+                    ...(options.contentType && {'Content-Type': options.contentType}),
+                    ...(options.ifNoneMatch && {'If-None-Match': options.ifNoneMatch}),
+                    ...Object.fromEntries(Object.entries(options.customHeaders || {}).filter(([k]) => /^x-convo-/i.test(k)))
+                };
                 const res = await fetch(`${base}/r2/${path}`, { method, headers, body, cache: 'no-store' });
                 if (res.status === 401) throw new Error('Invalid sync secret.');
                 if (!res.ok && res.status !== 404 && res.status !== 304) throw new Error(`R2 request failed: ${res.status}`);
@@ -390,20 +378,18 @@
             const _configEtag = useLocalStorage('nai-config-etag', null);
             const _listEtag = useLocalStorage('nai-list-etag', null);
             watch([() => appStore.config.value.jssync.proxyUrl, () => appStore.syncToken.value], () => { _configEtag.value = null; _listEtag.value = null; });
+            const _loadFallbackOrNew = (convos) => { const fb = _.maxBy(convos, 'timestamp'); fb ? gemini.loadConversation(fb.id).catch(() => gemini.newChat()) : gemini.newChat(); };
             const pull = async () => {
                 const cfg = appStore.config.value;
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 syncStatus.value = 'pulling'; syncError.value = null;
                 try {
-                    const configOpts = _configEtag.value ? { ifNoneMatch: _configEtag.value } : {};
-                    const listOpts = _listEtag.value ? { ifNoneMatch: _listEtag.value } : {};
                     const [res, listRes] = await Promise.all([
-                        r2Client.r2Fetch('GET', 'config', null, configOpts),
-                        r2Client.r2Fetch('GET', 'conversations', null, listOpts).catch(e => { console.warn('Sync pull: failed to fetch conversations list.', e); return null; })
+                        r2Client.r2Fetch('GET', 'config', null, _configEtag.value ? { ifNoneMatch: _configEtag.value } : {}),
+                        r2Client.r2Fetch('GET', 'conversations', null, _listEtag.value ? { ifNoneMatch: _listEtag.value } : {}).catch(e => { console.warn('Sync pull: failed to fetch conversations list.', e); return null; })
                     ]);
                     if (res.status !== 304) {
-                    const newEtag = res.headers.get('ETag');
-                    if (newEtag) _configEtag.value = newEtag;
+                    _configEtag.value = res.headers.get('ETag') ?? _configEtag.value;
                     const remote = await res.json();
                     if (remote && Object.keys(remote).length) {
                         const localMeta = cfg._syncMeta || {};
@@ -427,13 +413,8 @@
                             toast.ok(`Pulled ${mergedKeys.length} updated section(s).`, 'sync', 3000);
                         }
                         if (remote._deletedConversationIds) {
-                            const localTombstones = cfg.jssync._deletedConversationIds || [];
                             const merged = new Map();
-                            for (const t of localTombstones) merged.set(t.id, t);
-                            for (const t of remote._deletedConversationIds) {
-                                const existing = merged.get(t.id);
-                                if (!existing || t.deletedAt > existing.deletedAt) merged.set(t.id, t);
-                            }
+                            for (const t of [...(cfg.jssync._deletedConversationIds || []), ...remote._deletedConversationIds]) { const e = merged.get(t.id); if (!e || t.deletedAt > e.deletedAt) merged.set(t.id, t); }
                             cfg.jssync._deletedConversationIds = _pruneTombstones([...merged.values()]);
                         }
                     }
@@ -445,35 +426,25 @@
                         const localCloud = { ...gemini.cloudConversations.value };
                         const activeWasTombstoned = tombstoneIds.has(gemini.activeConvoId.value);
                         gemini.savedConversations.value = gemini.savedConversations.value.filter(c => {
-                            if (tombstoneIds.has(c.id)) {
-                                delete localCloud[c.id];
-                                _rmConvo(c.id);
-                                if (gemini.conversationMap.has(c.id) && !activeWasTombstoned) {
-                                    gemini.closeConversation(c.id);
-                                } else if (gemini.conversationMap.has(c.id)) {
-                                    const convo = gemini.conversationMap.get(c.id);
-                                    if (convo?.generating && convo.abortCtrl) convo.abortCtrl.abort();
-                                    gemini.conversationMap.delete(c.id);
-                                }
-                                removedCount++;
-                                return false;
+                            if (!tombstoneIds.has(c.id)) return true;
+                            delete localCloud[c.id];
+                            _rmConvo(c.id);
+                            if (gemini.conversationMap.has(c.id)) {
+                                if (!activeWasTombstoned) gemini.closeConversation(c.id);
+                                else { const convo = gemini.conversationMap.get(c.id); if (convo?.generating && convo.abortCtrl) convo.abortCtrl.abort(); gemini.conversationMap.delete(c.id); }
                             }
-                            return true;
+                            removedCount++;
+                            return false;
                         });
                         if (removedCount) {
                             gemini.cloudConversations.value = localCloud;
-                            if (activeWasTombstoned) {
-                                const fallback = _.maxBy(gemini.savedConversations.value, 'timestamp');
-                                if (fallback) gemini.loadConversation(fallback.id).catch(() => gemini.newChat());
-                                else gemini.newChat();
-                            }
+                            if (activeWasTombstoned) _loadFallbackOrNew(gemini.savedConversations.value);
                             toast.info(`Removed ${removedCount} deleted conversation(s) from other device.`, 'sync', 3000);
                         }
                     }
                     try {
                         if (listRes && listRes.status !== 304 && listRes.ok) {
-                            const newListEtag = listRes.headers.get('ETag');
-                            if (newListEtag) _listEtag.value = newListEtag;
+                            _listEtag.value = listRes.headers.get('ETag') ?? _listEtag.value;
                             const remoteConvos = await listRes.json();
                             const localById = _.keyBy(gemini.savedConversations.value, 'id');
                             const localCloudMap = { ...gemini.cloudConversations.value };
@@ -514,9 +485,7 @@
                             gemini.cloudConversations.value = localCloudMap;
                             const activeId = gemini.activeConvoId.value;
                             if (activeId && !localById[activeId] && !gemini.conversationMap.has(activeId)) {
-                                const fallbackSaved = _.maxBy(Object.values(localById).filter(c => c?.id && c.id !== activeId), 'timestamp');
-                                if (fallbackSaved) gemini.loadConversation(fallbackSaved.id).catch(() => gemini.newChat());
-                                else gemini.newChat();
+                                _loadFallbackOrNew(Object.values(localById).filter(c => c?.id && c.id !== activeId));
                             } else if (activeId && !gemini.conversationMap.has(activeId) && localById[activeId]) {
                                 gemini.loadConversation(activeId).catch(() => {});
                             }
@@ -959,11 +928,12 @@ const TagCountBadge={
             const t = v?._text || v?.parts?.find(p => p.text && !p.thought)?.text;
             return (t || msgs.find(m => m.role === 'user')?.text || '').substring(0, 60);
         };
+        const _ts = p => ({...(p.thought && {thought:true}), ...(p.thoughtSignature && {thoughtSignature:p.thoughtSignature})});
         const serializeConversation = async (messages) => {
             const imageStore = useImageStore();
-            const serializedMessages = await Promise.all(messages.map(async (msg) => {
+            return Promise.all(messages.map(async (msg) => {
                 if (msg.role === 'user') {
-                    const serializedImages = await Promise.all((msg.images || []).map(async (img) => {
+                    return { id: msg.id, role: 'user', text: msg.text || '', images: await Promise.all((msg.images || []).map(async (img) => {
                         if (!img.imageId && img.data) {
                             const ingested = await imageStore.ingestImage({data: img.data, mimeType: img.mimeType});
                             img.imageId = ingested.imageId;
@@ -973,34 +943,28 @@ const TagCountBadge={
                             }
                         }
                         return { id: img.id, imageId: img.imageId, mimeType: _WP, name: img.name || '', hidden: !!img.hidden };
-                    }));
-                    return { id: msg.id, role: 'user', text: msg.text || '', images: serializedImages, hidden: !!msg.hidden };
+                    })), hidden: !!msg.hidden };
                 }
                 if (msg.role === 'model') {
-                    const serializedVariants = await Promise.all((msg.variants || []).map(async (v) => {
-                        let inlineDataCount = 0;
-                        const serializedParts = await Promise.all((v.parts || []).map(async (part) => {
-                            if (part.inlineData) {
-                                let imageId = v._images?.[inlineDataCount]?.imageId;
-                                if (!imageId) {
-                                    const ingested = await imageStore.ingestImage({data: part.inlineData.data, mimeType: part.inlineData.mimeType});
-                                    imageId = ingested.imageId;
-                                    if (v._images?.[inlineDataCount]) v._images[inlineDataCount].imageId = imageId;
-                                }
-                                inlineDataCount++;
-                                return { _imageRef: imageId, _mimeType: _WP, ...(part.thought && {thought: true}), ...(part.thoughtSignature && {thoughtSignature: part.thoughtSignature}), ...(part.text && {text: part.text}) };
-                            }
-                            return { text: part.text || '', ...(part.thought && {thought: true}), ...(part.thoughtSignature && {thoughtSignature: part.thoughtSignature}) };
-                        }));
-                        const serializedImages = (v._images || []).map(img => ({
-                            mimeType: img.mimeType || _WP,
-                            imageId: img.imageId || null
-                        }));
+                    return { id: msg.id, role: 'model', variants: await Promise.all((msg.variants || []).map(async (v) => {
+                        let idc = 0;
                         return {
                             id: v.id,
-                            parts: serializedParts,
+                            parts: await Promise.all((v.parts || []).map(async (part) => {
+                                if (part.inlineData) {
+                                    let imageId = v._images?.[idc]?.imageId;
+                                    if (!imageId) {
+                                        const ingested = await imageStore.ingestImage({data: part.inlineData.data, mimeType: part.inlineData.mimeType});
+                                        imageId = ingested.imageId;
+                                        if (v._images?.[idc]) v._images[idc].imageId = imageId;
+                                    }
+                                    idc++;
+                                    return { _imageRef: imageId, _mimeType: _WP, ..._ts(part), ...(part.text && {text: part.text}) };
+                                }
+                                return { text: part.text || '', ..._ts(part) };
+                            })),
                             _text: v._text || '',
-                            _images: serializedImages,
+                            _images: (v._images || []).map(img => ({ mimeType: img.mimeType || _WP, imageId: img.imageId || null })),
                             _imageSize: v._imageSize || '1K',
                             _model: v._model || _FM,
                             _flexInference: !!v._flexInference,
@@ -1011,18 +975,16 @@ const TagCountBadge={
                             _isPromptBlock: !!v._isPromptBlock,
                             timestamp: v.timestamp || null
                         };
-                    }));
-                    return { id: msg.id, role: 'model', variants: serializedVariants, activeVariant: msg.activeVariant || 0, hidden: !!msg.hidden };
+                    })), activeVariant: msg.activeVariant || 0, hidden: !!msg.hidden };
                 }
                 return { id: msg.id, role: msg.role, hidden: !!msg.hidden };
             }));
-            return serializedMessages;
         };
         const deserializeConversation = async (serializedData) => {
             if (!serializedData) return [];
             const _imgCache = new Map();
             const loadCached = (id) => { if (!_imgCache.has(id)) _imgCache.set(id, loadImageAsBase64(id)); return _imgCache.get(id); };
-            const messages = await Promise.all((serializedData.messages || []).map(async (msg) => {
+            return Promise.all((serializedData.messages || []).map(async (msg) => {
                 const { images: rawImages, variants: rawVariants, ...dMsg } = msg;
                 if (rawImages?.length) {
                     dMsg.images = await Promise.all(rawImages.map(async (img) => {
@@ -1057,7 +1019,6 @@ const TagCountBadge={
                 }
                 return dMsg;
             }));
-            return messages;
         };
         const _BLOCK_REASONS = new Set('SAFETY,IMAGE_SAFETY,IMAGE_PROHIBITED_CONTENT,PROHIBITED_CONTENT,RECITATION,IMAGE_RECITATION,OTHER,IMAGE_OTHER,NO_IMAGE,BLOCKLIST,SPII'.split(','));
         const _TERMINAL_REASONS = new Set(['LANGUAGE','MODEL_ARMOR']);
@@ -1117,13 +1078,9 @@ const TagCountBadge={
                 const m = params?.bananaModel || _FM, isPro = m === _PM;
                 const gc = {responseModalities: ['TEXT','IMAGE']};
                 if (!isPro) gc.thinkingConfig = {thinkingLevel: params?.thinkingLevel || 'MINIMAL', includeThoughts: true};
-                const ic = {};
-                if (params?.aspectRatio) ic.aspectRatio = params.aspectRatio;
-                if (params?.imageSize) ic.imageSize = params.imageSize === '0.5K' ? '512' : params.imageSize;
+                const ic = {...(params?.aspectRatio && {aspectRatio: params.aspectRatio}), ...(params?.imageSize && {imageSize: params.imageSize === '0.5K' ? '512' : params.imageSize})};
                 if (Object.keys(ic).length) gc.imageConfig = ic;
-                const b = {contents, generationConfig: gc};
-                if (params?.flexInference && m === _PM) b.service_tier = 'SERVICE_TIER_FLEX';
-                return b;
+                return {contents, generationConfig: gc, ...(params?.flexInference && m === _PM && {service_tier: 'SERVICE_TIER_FLEX'})};
             };
             const _getContents = (msgs, endIdx) => msgs.slice(0, endIdx).filter(m => !m.hidden).map(m => ({role: m.role, parts: getMsgParts(m)}));
             async function* parseSSE(res) {
@@ -1174,16 +1131,12 @@ const TagCountBadge={
                 const v = getV();
                 if (!v?._images?.length) { const reason = finalFinishReason || 'EMPTY'; throw mkErr(v?._text ? `No image generated (${reason})` : `Empty response (${reason})`, {isCandidateBlock:true, blockReason:reason}); }
                 if (v) {
-                    let inlineDataCount = 0;
-                    for (let i = 0; i < allParts.length; i++) {
-                        if (allParts[i].inlineData) {
-                            const ingested = await imageStore.ingestImage({data: allParts[i].inlineData.data, mimeType: allParts[i].inlineData.mimeType});
-                            allParts[i].inlineData.data = ingested.base64;
-                            allParts[i].inlineData.mimeType = _WP;
-                            v._images[inlineDataCount].data = ingested.base64;
-                            v._images[inlineDataCount].mimeType = _WP;
-                            v._images[inlineDataCount].imageId = ingested.imageId;
-                            inlineDataCount++;
+                    let idc = 0;
+                    for (const part of allParts) {
+                        if (part.inlineData) {
+                            const ingested = await imageStore.ingestImage(part.inlineData);
+                            Object.assign(part.inlineData, {data: ingested.base64, mimeType: _WP});
+                            Object.assign(v._images[idc++], {data: ingested.base64, mimeType: _WP, imageId: ingested.imageId});
                         }
                     }
                     v.parts = Vue.markRaw(allParts);
@@ -1394,17 +1347,8 @@ const TagCountBadge={
                         convoData = await _fetchConvoFromR2(id);
                         if (convoData) {
                             try { await _writeConvo(id, convoData.messages, convoData.params); } catch {}
-                            if (convoData.title) {
-                                convo.title = convoData.title;
-                                meta.title = convoData.title;
-                            }
-                            if (convoData.timestamp != null) {
-                                const ts = +convoData.timestamp;
-                                if (Number.isFinite(ts)) {
-                                    convo.timestamp = ts;
-                                    meta.timestamp = ts;
-                                }
-                            }
+                            if (convoData.title) convo.title = meta.title = convoData.title;
+                            if (convoData.timestamp != null) { const ts = +convoData.timestamp; if (Number.isFinite(ts)) convo.timestamp = meta.timestamp = ts; }
                         }
                     }
                     if (!convoData) {
@@ -1805,12 +1749,7 @@ const TagCountBadge={
                 };
                 const usagePct = computed(() => storageUsage.value ? Math.min(100, (storageUsage.value.totalBytes / R2_FREE_LIMIT) * 100) : 0);
                 const usageColor = computed(() => usagePct.value > 90 ? 'progress-error' : usagePct.value > 70 ? 'progress-warning' : 'progress-primary');
-                const fmtBytes = (b) => {
-                    if (b < 1024) return b + ' B';
-                    if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
-                    if (b < 1024 * 1024 * 1024) return (b / (1024 * 1024)).toFixed(1) + ' MB';
-                    return (b / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
-                };
+                const fmtBytes = (b) => { const u = ['B','KB','MB','GB']; let i = 0; while (b >= 1024 && i < 3) { b /= 1024; i++; } return (i ? b.toFixed(i > 2 ? 2 : 1) : b) + ' ' + u[i]; };
                 onMounted(() => { if (syncToken.value && jssync.proxyUrl) fetchUsage(); });
                 const statusMeta = computed(() => {
                     const m = {
