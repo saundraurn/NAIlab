@@ -1119,7 +1119,8 @@ const TagCountBadge={
                 if (!res.ok) {
                     const errData = await res.json().catch(() => null);
                     const msg = errData?.error?.message || `HTTP ${res.status}`;
-                    throw mkErr(_GEN_ERR.RETRY, msg, {status:res.status, isRetryable:_RETRY_CODES.has(res.status)||(res.status===400&&/quota|resource.?exhausted/i.test(msg))});
+                    const retryable = _RETRY_CODES.has(res.status) || (res.status === 400 && /quota|resource.?exhausted/i.test(msg));
+                    throw mkErr(retryable ? _GEN_ERR.RETRY : undefined, msg, {status: res.status});
                 }
                 const allParts = []; let finalFinishReason = null;
                 let _streamThinking = '', _streamText = '', _streamImages = Vue.markRaw([]);
@@ -1162,7 +1163,6 @@ const TagCountBadge={
                 const {kind, blockReason, message} = err;
                 switch (kind) {
                     case _GEN_ERR.RETRY:
-                        if (!err.isRetryable) break;
                         retryCount.value++;
                         const delay = getDelay(retryCount.value - 1);
                         toast.warn(`${err.status === 429 ? 'Rate limited' : 'Server error'}, retrying in ${Math.round(delay/1000)}s…`, undefined, delay + 500);
