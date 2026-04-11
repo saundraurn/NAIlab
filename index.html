@@ -317,6 +317,7 @@
             let _configDirty = false;
             let _pushTimer = null;
             let _pushRunning = false;
+            let _pushDoneResolvers = [];
             const _PUSH_DELAY = 1200;
             const _isReady = () => !!(r2Client.getWorkerUrl() && r2Client.getSecret());
             const markConvoDirty = (id) => { _dirtyConvos.add(id); _schedulePush(); };
@@ -325,6 +326,7 @@
                 if (!_isReady() || _pushRunning || _pushTimer) return;
                 _pushTimer = setTimeout(_runPush, _PUSH_DELAY);
             };
+            const _flushPush = () => { if (_pushTimer) { clearTimeout(_pushTimer); _pushTimer = null; } return _runPush(); };
             const _runPush = async () => {
                 _pushTimer = null;
                 if (_pushRunning) return;
@@ -338,7 +340,7 @@
                         _dirtyConvos.clear();
                         if (pushConfig) {
                             try { await _pushConfigOnly(); }
-                            catch (e) { console.warn('Config auto-sync failed:', e); toast.warn('Config sync failed: ' + e.message, 'sync', 4000); }
+                            catch (e) { _configDirty = true; console.warn('Config auto-sync failed:', e); toast.warn('Config sync failed: ' + e.message, 'sync', 4000); }
                         }
                         if (convoIds.length) {
                             const gemini = useGeminiAPI();
@@ -348,13 +350,19 @@
                                     await gemini.syncConversationToR2(id);
                                     gemini.convoSyncStatus[id] = 'synced';
                                 } catch (e) {
+                                    _dirtyConvos.add(id);
                                     gemini.convoSyncStatus[id] = 'error';
                                     console.warn('Convo R2 sync failed:', e);
                                 }
                             });
                         }
                     }
-                } finally { _pushRunning = false; if (_configDirty || _dirtyConvos.size) _schedulePush(); }
+                } finally {
+                    _pushRunning = false;
+                    const resolvers = _pushDoneResolvers.splice(0);
+                    resolvers.forEach(r => r());
+                    if (_configDirty || _dirtyConvos.size) _schedulePush();
+                }
             };
             const _pushConfigOnly = async () => {
                 const cfg = appStore.config.value;
@@ -365,7 +373,7 @@
                 _configEtag.value = null;
                 cfg.jssync.lastSyncedAt = Date.now();
             };
-            const getPushPromise = () => _pushRunning ? new Promise(resolve => { const check = () => _pushRunning ? setTimeout(check, 200) : resolve(); check(); }) : Promise.resolve();
+            const awaitPush = () => (_pushRunning || _pushTimer) ? new Promise(r => _pushDoneResolvers.push(r)) : Promise.resolve();
             const _finalizePush = (cfg) => {
                 cfg.jssync.lastSyncedAt = Date.now();
             };
@@ -559,7 +567,7 @@
                     if (syncStatus.value === 'idle') await push(true);
                 });
             };
-            return { isSyncing, syncStatus, syncError, pull, push, syncNow, markConfigDirty, markConvoDirty, getPushPromise };
+            return { isSyncing, syncStatus, syncError, pull, push, syncNow, markConfigDirty, markConvoDirty, awaitPush, _flushPush };
         });
         const TAG_COLORS={artist:['badge-warning','bg-warning/20'],character:['badge-success','bg-success/20'],copyright:['badge-accent','bg-accent/20'],meta:['badge-info','bg-info/20'],default:['badge-primary','bg-primary/20']};
         const useDropdown=()=>{const isOpen=ref(false),root=ref(null);return{isOpen,root,close:()=>{isOpen.value=false;if(document.activeElement&&root.value?.contains(document.activeElement))document.activeElement.blur();}};};
@@ -1521,7 +1529,9 @@ const TagCountBadge={
                 }
                 convoSyncStatus[id] = 'pending';
                 useSyncStore().markConvoDirty(id);
-                await useSyncStore().getPushPromise();
+                const sync = useSyncStore();
+                await sync._flushPush();
+                await sync.awaitPush();
                 const status = convoSyncStatus[id];
                 if (status === 'synced') toast.q('Synced to cloud');
                 else if (status === 'error') toast.err('Sync failed');
