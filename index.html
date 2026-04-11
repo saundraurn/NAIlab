@@ -172,7 +172,7 @@
             let uniqueIdCounter = 0;
             const removeToast = (id) => { const i = toasts.value.findIndex(t => t.id === id); if (i !== -1) { clearTimeout(toasts.value[i].timerId); toasts.value.splice(i, 1); } };
             const addToast = ({id, msg, type='info', source, dedupKey, duration=5000, persistent=false}) => {
-                let item = id ? _.find(toasts.value, {id}) : dedupKey ? _.findLast(toasts.value, t => t.dedupKey === dedupKey) : (type === 'error' && _.findLast(toasts.value, t => t.type === type && t.msg === msg));
+                let item = id ? _.find(toasts.value, {id}) : dedupKey ? toasts.value.findLast(t => t.dedupKey === dedupKey) : (type === 'error' && toasts.value.findLast(t => t.type === type && t.msg === msg));
                 if (!item) toasts.value.push(item = reactive({id: id || ++uniqueIdCounter, count: 0}));
                 Object.assign(item, {msg, type, source: source || dedupKey, dedupKey, persistent, duration, count: item.count + 1});
                 clearTimeout(item.timerId); if (!persistent) item.timerId = setTimeout(() => removeToast(item.id), duration);
@@ -375,7 +375,6 @@
             };
             const awaitPush = () => (_pushRunning || _pushTimer) ? new Promise(r => _pushDoneResolvers.push(r)) : Promise.resolve();
             const withFlag = (f, fn) => { f.value = true; return Promise.resolve().then(fn).finally(() => { f.value = false; }); };
-            const withSyncMerge = (fn) => withFlag(appStore.isSyncMerging, fn);
             const _applySectionDict = (cfg, dict) => {
                 Object.entries(dict).forEach(([key, val]) => {
                     if (key === '_syncMeta') return;
@@ -423,7 +422,7 @@
                         });
                         const mergedKeys = Object.keys(lwwMerged);
                         if (mergedKeys.length) {
-                            await withSyncMerge(() => {
+                            await withFlag(appStore.isSyncMerging, () => {
                                 _applySectionDict(cfg, lwwMerged);
                                 mergedKeys.forEach(k => {
                                     if (remoteMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remoteMeta[k]);
@@ -710,7 +709,7 @@ const TagCountBadge={
         };
         const CollapsiblePanel={
             props:{title:{type:String,default:''},storageKey:{type:String,required:true},flush:{type:Boolean,default:false},boxClass:{type:String,default:''}},
-            setup(p){const s=useAppStore();return{isOpen:computed({get:()=>s.config.value.ui.collapsibleStates[p.storageKey],set:v=>s.config.value.ui.collapsibleStates[p.storageKey]=v})};},
+            setup(p){const cs=useAppStore().config.value.ui.collapsibleStates;return{isOpen:computed({get:()=>cs[p.storageKey],set:v=>cs[p.storageKey]=v})};},
             template:`<div class="collapse collapse-arrow overflow-visible" :class="[boxClass||(flush?'glass rounded-none border-b border-white/20':'glass-nested rounded-xl border border-white/20'),{'collapse-open':isOpen,'collapse-close':!isOpen}]"><div class="collapse-title flex items-center text-lg font-semibold text-neutral-100 cursor-pointer hover:text-primary transition-colors select-none pr-12" @click="isOpen=!isOpen"><div class="flex-1 min-w-0 flex-row-gap mr-4"><slot name="header">{{title}}</slot></div><div class="ml-auto flex-none flex-row-gap relative z-10" @click.stop><slot name="actions"></slot></div></div><div class="collapse-content px-4 space-y-3 !overflow-visible"><slot></slot></div></div>`
         };
         const PromptList={
@@ -795,7 +794,7 @@ const TagCountBadge={
                 const restoreScroll = () => { if (gridRoutes.includes(route.name) && rightPanelRef.value) rightPanelRef.value.scrollTop = lastScrollPos.value; };
                 watch(scrollTop, useDebounceFn(() => { if (gridRoutes.includes(route.name)) lastScrollPos.value = scrollTop.value; }, 150));
                 onActivated(() => nextTick(restoreScroll));
-                watch(() => route.fullPath, (path) => { if (['danbooru-grid', 'danbooru-folder'].includes(route.name)) danbooru.value.lastPath = path; });
+                watch(() => route.fullPath, (path) => { if (gridRoutes.includes(route.name)) danbooru.value.lastPath = path; });
                 let abortController = null;
                 const {isLoading, error: err, execute} = useAsyncState(async (tags, page = 1, append = false, signal, clientFilters = []) => {
                     try {
@@ -825,7 +824,9 @@ const TagCountBadge={
                     return _.find(posts.value, post => String(post.id) === selectedPostId.value) || null;
                 });
                 const displayedImage = computed(() => selectedImage.value || hoveredImage.value), foldersById = computed(() => _.keyBy(danbooru.value.folders, 'id')), activeFolderId = computed(() => route.name === 'danbooru-folder' ? route.params.folderId : null);
-                watch(() => [isLoading.value, sortedPosts.value.length], ([loading, len]) => { if (!loading && len < 15 && hasMorePages.value && gridRoutes.includes(route.name) && _.some(ratingFilters.value)) fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []); });
+                const _canLoadMore = () => _.some(ratingFilters.value) && !isLoading.value && hasMorePages.value && gridRoutes.includes(route.name);
+                const _loadMore = () => _canLoadMore() && fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []);
+                watch(() => [isLoading.value, sortedPosts.value.length], ([loading, len]) => { if (!loading && len < 15) _loadMore(); });
                 const executeSearch = (query) => {
                     lastFetchedQuery.value = query; let effective = query || '', apiTags, clientFilters = [];
                     if ((effective).includes('|')) apiTags = effective.split('|').map(p => _.compact(p.split(/\s*,\s*/).map(t => t.trim().replace(/\s+/g, '_'))).join(' ')).join('|');
@@ -869,7 +870,7 @@ const TagCountBadge={
                 const addTagToSearch = (t) => searchQueryInput.value = [...new Set([..._.compact((searchQueryInput.value||'').split(',').map(x => x.trim())), t.replace(/_/g, ' ')])].join(', ');
                 const searchSingleTag = (t) => (searchQueryInput.value = t.replace(/_/g, ' '), search());
                 const toggleTagInSearch = (tag, searchItem) => { const raw = tag.replace(/ /g, '_'), p = searchItem.prompt || ''; if (p.includes('|')) { searchItem.prompt = _.xorBy(_.compact(p.split('|').map(x => x.trim())), [raw], _.toLower).join(' | '); } else { const r = new RegExp(`(^|\\s)${_.escapeRegExp(raw)}($|\\s)`, 'i'); searchItem.prompt = r.test(p) ? p.replace(r, ' ').trim() : (p ? `${p} | ${raw}` : raw); } toast.ok(`Updated "${searchItem.name}"`, 'danbooru', 1000); };
-                useInfiniteScroll(rightPanelRef, () => _.some(ratingFilters.value) && !isLoading.value && hasMorePages.value && gridRoutes.includes(route.name) && fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []), {distance: 1000});
+                useInfiniteScroll(rightPanelRef, _loadMore, {distance: 1000});
                 provide('danbooruState', { posts: sortedPosts, isLoading, isLoadingMore: computed(() => isLoading.value && pageNum.value > 1), hasMorePages, statusMsg: computed(() => isLoading.value && !posts.value.length ? 'Searching...' : err.value ? `Error: ${err.value.message}` : !posts.value.length ? 'Search for images on Danbooru.' : `Showing ${posts.value.length} posts${hasMorePages.value ? ' (scroll for more)' : ''}`), hoveredImage, rightPanelRef, lastScrollPos, gridSize: toRef(danbooru.value, 'gridCols') });
                 provide('danbooruFolders', {folders: toRef(danbooru.value, 'folders'), isPostInFolder: (pid, fid) => foldersById.value[fid]?.postIds?.includes(pid), togglePostInFolder});
                 provide('danbooruSearch', {onSearch: addTagToSearch, onSingle: searchSingleTag, savedSearches, onToggleSearch: toggleTagInSearch, isTagIn: (p, t) => (p||'').split((p||'').includes('|') ? '|' : /\s+/).map(x => x.trim().toLowerCase()).includes(t.replace(/ /g, '_').toLowerCase())});
