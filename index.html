@@ -104,7 +104,7 @@
         const parsePrompt = (txt) => { const [p='',n=''] = (txt||'').split('--'); return {positive:p.trim(), negative:n.trim()}; };
         const prepareGenConfig = (cfg) => (!cfg.isOpus || !cfg.shouldUseRandomOpusDimensions) ? {...cfg} : {...cfg, ..._.sample(OPUS_DIMENSIONS.filter(d => d.width <= cfg.width && d.height <= cfg.height))};
         const fmtAgo = ts => !ts ? 'never' : formatTimeAgo(new Date(ts));
-        const _tf=(t,d)=>(m,s,dd)=>useAppStore().addToast({msg:m,type:t,source:s,duration:dd??d});const toast={ok:_tf('success',3000),err:_tf('error'),warn:_tf('warning',4000),info:_tf('info',3000),q:(m,d=2000)=>useAppStore().addToast({msg:m,type:'success',duration:d})};
+        const _tf=(t,d)=>(m,dedupKey,dd)=>useAppStore().addToast({msg:m,type:t,dedupKey,duration:dd??d});const toast={ok:_tf('success',3000),err:_tf('error'),warn:_tf('warning',4000),info:_tf('info',3000),q:(m,d=2000)=>useAppStore().addToast({msg:m,type:'success',duration:d})};
         const splitTagString = (str) => _.compact((str || '').split(' '));
         const TAG_CATEGORIES = 'artist,copyright,character,general,meta'.split(',');
         const getPostTags = (post) => TAG_CATEGORIES.flatMap(type => splitTagString(post[`tag_string_${type}`]).map(name => ({name, type})));
@@ -126,7 +126,8 @@
         const fmtCost = (c) => c === null ? '' : c < 0.0001 ? '~$0' : '$' + c.toFixed(4);
         const downloadImage = (src, name) => { const a = document.createElement('a'); a.href = src; a.download = name || 'gemini-'+Date.now()+'.webp'; document.body.appendChild(a); a.click(); a.remove(); };
         const abortableSleep = (ms, signal) => new Promise((resolve, reject) => { if (signal?.aborted) return reject(new DOMException('', 'AbortError')); const t = setTimeout(resolve, ms); signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('', 'AbortError')); }, {once: true}); });
-        const mkErr = (msg, props) => Object.assign(new Error(msg), props);
+        const _GEN_ERR = { RETRY: 'retry', PROMPT_BLOCK: 'promptBlock', OUTPUT_BLOCK: 'outputBlock', TERMINAL: 'terminal' };
+        const mkErr = (kind, msg, extra = {}) => Object.assign(new Error(msg), { kind, ...extra });
         const _RETRY_CODES = new Set([429, 500, 502, 503, 504]);
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
@@ -170,10 +171,10 @@
             const toasts = ref([]), notifications = reactive({}), queue = ref([]), isDispatcherRunning = ref(false), isApiHalted = ref(false);
             let uniqueIdCounter = 0;
             const removeToast = (id) => { const i = toasts.value.findIndex(t => t.id === id); if (i !== -1) { clearTimeout(toasts.value[i].timerId); toasts.value.splice(i, 1); } };
-            const addToast = ({id, msg, type='info', source='default', duration=5000, persistent=false}) => {
-                let item = id ? _.find(toasts.value, {id}) : (type === 'error' && _.findLast(toasts.value, {type, msg, source}));
+            const addToast = ({id, msg, type='info', source, dedupKey, duration=5000, persistent=false}) => {
+                let item = id ? _.find(toasts.value, {id}) : dedupKey ? _.findLast(toasts.value, t => t.dedupKey === dedupKey) : (type === 'error' && _.findLast(toasts.value, t => t.type === type && t.msg === msg));
                 if (!item) toasts.value.push(item = reactive({id: id || ++uniqueIdCounter, count: 0}));
-                Object.assign(item, {msg, type, source, persistent, duration, count: item.count + 1});
+                Object.assign(item, {msg, type, source: source || dedupKey, dedupKey, persistent, duration, count: item.count + 1});
                 clearTimeout(item.timerId); if (!persistent) item.timerId = setTimeout(() => removeToast(item.id), duration);
                 return item.id;
             };
@@ -1118,12 +1119,12 @@ const TagCountBadge={
                 if (!res.ok) {
                     const errData = await res.json().catch(() => null);
                     const msg = errData?.error?.message || `HTTP ${res.status}`;
-                    throw mkErr(msg, {status:res.status, isRetryable:_RETRY_CODES.has(res.status)||(res.status===400&&/quota|resource.?exhausted/i.test(msg))});
+                    throw mkErr(_GEN_ERR.RETRY, msg, {status:res.status, isRetryable:_RETRY_CODES.has(res.status)||(res.status===400&&/quota|resource.?exhausted/i.test(msg))});
                 }
                 const allParts = []; let finalFinishReason = null;
                 let _streamThinking = '', _streamText = '', _streamImages = Vue.markRaw([]);
                 for await (const chunk of parseSSE(res)) {
-                    if (chunk.promptFeedback?.blockReason) throw mkErr(`Prompt blocked: ${chunk.promptFeedback.blockReason}`, {isPromptBlock:true, blockReason:chunk.promptFeedback.blockReason});
+                    if (chunk.promptFeedback?.blockReason) throw mkErr(_GEN_ERR.PROMPT_BLOCK, `Prompt blocked: ${chunk.promptFeedback.blockReason}`, {blockReason:chunk.promptFeedback.blockReason});
                     const cand = chunk.candidates?.[0];
                     if (cand?.content?.parts) {
                         for (const p of cand.content.parts) {
@@ -1137,10 +1138,10 @@ const TagCountBadge={
                     const v = getV();
                     if (v) { v._thinking = _streamThinking; v._text = _streamText; v._images = _streamImages; if (chunk.usageMetadata) v._usage = chunk.usageMetadata; }
                 }
-                if (_BLOCK_REASONS.has(finalFinishReason)) throw mkErr(`Output blocked: ${finalFinishReason}`, {isCandidateBlock:true, blockReason:finalFinishReason});
-                if (_TERMINAL_REASONS.has(finalFinishReason)) throw mkErr(`Generation stopped: ${finalFinishReason}`, {isTerminal:true, blockReason:finalFinishReason});
+                if (_BLOCK_REASONS.has(finalFinishReason)) throw mkErr(_GEN_ERR.OUTPUT_BLOCK, `Output blocked: ${finalFinishReason}`, {blockReason:finalFinishReason});
+                if (_TERMINAL_REASONS.has(finalFinishReason)) throw mkErr(_GEN_ERR.TERMINAL, `Generation stopped: ${finalFinishReason}`, {blockReason:finalFinishReason});
                 const v = getV();
-                if (!v?._images?.length) { const reason = finalFinishReason || 'EMPTY'; throw mkErr(v?._text ? `No image generated (${reason})` : `Empty response (${reason})`, {isCandidateBlock:true, blockReason:reason}); }
+                if (!v?._images?.length) { const reason = finalFinishReason || 'EMPTY'; throw mkErr(_GEN_ERR.OUTPUT_BLOCK, v?._text ? `No image generated (${reason})` : `Empty response (${reason})`, {blockReason:reason}); }
                 if (v) {
                     let idc = 0;
                     for (const part of allParts) {
@@ -1158,20 +1159,23 @@ const TagCountBadge={
             };
             const _handleStreamError = async (err, v, retryCount, onNewVariant, convo) => {
                 if (err.name === 'AbortError') return setVarError(v, 'Request cancelled.'), false;
-                if (err.isRetryable) {
-                    retryCount.value++;
-                    const delay = getDelay(retryCount.value - 1);
-                    toast.warn(`${err.status === 429 ? 'Rate limited' : 'Server error'}, retrying in ${Math.round(delay/1000)}s…`, undefined, delay + 500);
-                    try { await abortableSleep(delay, convo.abortCtrl?.signal); } catch { return setVarError(v, 'Request cancelled.'), false; }
-                    return true;
-                }
-                const {isTerminal, isPromptBlock, isCandidateBlock, blockReason, message} = err;
-                if (isTerminal) return setVarError(v, `Stopped: ${blockReason}`, {_blockReason: blockReason}), toast.err(`Generation stopped: ${blockReason}`), false;
-                if (isPromptBlock) return setVarError(v, message, {_blockReason: blockReason, _isPromptBlock: true}), toast.err(message), false;
-                if (isCandidateBlock) {
-                    setVarError(v, message, {_blockReason: blockReason});
-                    if (convo.params?.autoRetry) return toast.warn(`Blocked (${blockReason}), retrying…`, undefined, 1500), onNewVariant(), retryCount.value = 0, true;
-                    return false;
+                const {kind, blockReason, message} = err;
+                switch (kind) {
+                    case _GEN_ERR.RETRY:
+                        if (!err.isRetryable) break;
+                        retryCount.value++;
+                        const delay = getDelay(retryCount.value - 1);
+                        toast.warn(`${err.status === 429 ? 'Rate limited' : 'Server error'}, retrying in ${Math.round(delay/1000)}s…`, undefined, delay + 500);
+                        try { await abortableSleep(delay, convo.abortCtrl?.signal); } catch { return setVarError(v, 'Request cancelled.'), false; }
+                        return true;
+                    case _GEN_ERR.TERMINAL:
+                        return setVarError(v, `Stopped: ${blockReason}`, {_blockReason: blockReason}), toast.err(`Generation stopped: ${blockReason}`), false;
+                    case _GEN_ERR.PROMPT_BLOCK:
+                        return setVarError(v, message, {_blockReason: blockReason, _isPromptBlock: true}), toast.err(message), false;
+                    case _GEN_ERR.OUTPUT_BLOCK:
+                        setVarError(v, message, {_blockReason: blockReason});
+                        if (convo.params?.autoRetry) return toast.warn(`Blocked (${blockReason}), retrying…`, undefined, 1500), onNewVariant(), retryCount.value = 0, true;
+                        return false;
                 }
                 return setVarError(v, message || 'Unknown error'), toast.err(message || 'Generation failed'), false;
             };
