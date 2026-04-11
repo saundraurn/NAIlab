@@ -358,7 +358,7 @@
             const withFlag = (f, fn) => { f.value = true; return Promise.resolve().then(fn).finally(() => { f.value = false; }); };
             const withSyncMerge = (fn) => withFlag(appStore.isSyncMerging, fn);
             const _applySectionDict = (cfg, dict) => {
-                _.forOwn(dict, (val, key) => {
+                Object.entries(dict).forEach(([key, val]) => {
                     if (key === '_syncMeta') return;
                     const merged = _.isArray(val) ? _.cloneDeep(val) : _.mergeWith({}, cfg[key], val, (_o, s) => _.isArray(s) ? _.cloneDeep(s) : undefined);
                     if (_.isPlainObject(merged) && _.isPlainObject(cfg[key])) { Object.assign(cfg[key], merged); }
@@ -406,7 +406,7 @@
                         if (mergedKeys.length) {
                             await withSyncMerge(() => {
                                 _applySectionDict(cfg, lwwMerged);
-                                _.forOwn(lwwMerged, (_v, k) => {
+                                mergedKeys.forEach(k => {
                                     if (remoteMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remoteMeta[k]);
                                 });
                             });
@@ -1146,26 +1146,26 @@ const TagCountBadge={
                 }
             };
             const _handleStreamError = async (err, v, retryCount, onNewVariant, convo) => {
-                if (err.name === 'AbortError') { setVarError(v, 'Request cancelled.'); return false; }
+                if (err.name === 'AbortError') return setVarError(v, 'Request cancelled.'), false;
                 if (err.isRetryable) {
                     retryCount.value++;
                     const delay = getDelay(retryCount.value - 1);
                     toast.warn(`${err.status === 429 ? 'Rate limited' : 'Server error'}, retrying in ${Math.round(delay/1000)}s…`, undefined, delay + 500);
-                    try { await abortableSleep(delay, convo.abortCtrl?.signal); } catch { setVarError(v, 'Request cancelled.'); return false; }
+                    try { await abortableSleep(delay, convo.abortCtrl?.signal); } catch { return setVarError(v, 'Request cancelled.'), false; }
                     return true;
                 }
-                if (err.isTerminal) { setVarError(v, `Stopped: ${err.blockReason}`, {_blockReason: err.blockReason}); toast.err(`Generation stopped: ${err.blockReason}`); return false; }
-                if (err.isPromptBlock) { setVarError(v, err.message, {_blockReason: err.blockReason, _isPromptBlock: true}); toast.err(err.message); return false; }
-                if (err.isCandidateBlock) {
-                    setVarError(v, err.message, {_blockReason: err.blockReason});
-                    if (convo.params?.autoRetry) { toast.warn(`Blocked (${err.blockReason}), retrying…`, undefined, 1500); onNewVariant(); retryCount.value = 0; return true; }
+                const {isTerminal, isPromptBlock, isCandidateBlock, blockReason, message} = err;
+                if (isTerminal) return setVarError(v, `Stopped: ${blockReason}`, {_blockReason: blockReason}), toast.err(`Generation stopped: ${blockReason}`), false;
+                if (isPromptBlock) return setVarError(v, message, {_blockReason: blockReason, _isPromptBlock: true}), toast.err(message), false;
+                if (isCandidateBlock) {
+                    setVarError(v, message, {_blockReason: blockReason});
+                    if (convo.params?.autoRetry) return toast.warn(`Blocked (${blockReason}), retrying…`, undefined, 1500), onNewVariant(), retryCount.value = 0, true;
                     return false;
                 }
-                setVarError(v, err.message || 'Unknown error');
-                toast.err(err.message || 'Generation failed'); return false;
+                return setVarError(v, message || 'Unknown error'), toast.err(message || 'Generation failed'), false;
             };
             const _saveConvoDirect = async (convo) => {
-                if (!convo || convo.isTemp || !convo.messages.length) return;
+                if (!convo?.messages?.length || convo.isTemp) return;
                 try {
                     await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params);
                     const meta = _findMeta(convo.id);
@@ -1416,13 +1416,13 @@ const TagCountBadge={
             });
             const abort = () => { const convo = activeConvo.value; if (convo?.abortCtrl) convo.abortCtrl.abort(); };
             const _autoSave = useDebounceFn(() => {
-                const convo = activeConvo.value;
-                if (!convo || convo.isTemp || convo.generating || convo.isHydrating) return;
-                _saveConvoDirect(convo);
+                const c = activeConvo.value;
+                if (!c || c.isTemp || c.generating || c.isHydrating) return;
+                _saveConvoDirect(c);
                 if (!_isSyncReady()) return;
-                _markCloud(convo.id);
-                if (convoSyncStatus[convo.id] !== 'syncing') convoSyncStatus[convo.id] = 'pending';
-                _r2SyncDirty.add(convo.id);
+                _markCloud(c.id);
+                if (convoSyncStatus[c.id] !== 'syncing') convoSyncStatus[c.id] = 'pending';
+                _r2SyncDirty.add(c.id);
                 _runR2Sync();
             }, 1500);
             watch(() => { const c = activeConvo.value; return c && !c.isTemp && !c.generating ? c.messages : null; }, (msgs) => {
@@ -1824,7 +1824,7 @@ const TagCountBadge={
             template:`<div class="flex h-screen animated-bg animate-gradientShift"><nav class="z-50 p-2 glass border-r-0 flex flex-col"><ul class="menu bg-transparent rounded-box p-0 space-y-2"><li v-for="item in navItems" :key="item.path"><nav-link :to="item.path" :icon="item.icon" :label="item.label" :notification="notifications[item.source]"></nav-link></li></ul><ul class="menu bg-transparent rounded-box p-0 mt-auto pt-2 border-t border-white/10"><li><div class="indicator p-0 flex-center w-14 h-14"><span v-if="syncStatus === 'error'" class="indicator-item badge badge-error badge-xs">!</span><nav-link to="/settings" icon="settings"></nav-link></div></li></ul></nav><main class="flex-1 overflow-hidden"><router-view v-slot="{Component}"><keep-alive><component :is="Component" /></keep-alive></router-view></main><toast-container></toast-container></div>`
         };
         const app = createApp(App);
-        _.forOwn({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, ToggleBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, HoverCard, ImagePreviewCard, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ToastContainer, FolderDropdown, LabelRow, NavLink, HiddenBadge, SpinIcon, SyncBadge, ChatMessage, NanoBanana}, (c, n) => app.component(n, c));
+        Object.entries({MaterialIcon, FloatingLabel, TagCountBadge, ChecklistDropdown, TagPill, IconBtn, ToggleBtn, SettingInput, Counter, SegmentedControl, SplitPane, LazyImage, HoverCard, ImagePreviewCard, AutocompleteField, CollapsiblePanel, PromptList, GenerationSettingsPanel, Placeholder, ToastContainer, FolderDropdown, LabelRow, NavLink, HiddenBadge, SpinIcon, SyncBadge, ChatMessage, NanoBanana}).forEach(([n, c]) => app.component(n, c));
         app.use(router);
 app.mount('#app');
 window.__VUE_APP_MOUNTED__ = true;</script>
