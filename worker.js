@@ -175,7 +175,8 @@ async function handleR2(request, env, url) {
         putOptions
       );
       const index = await readIndex(env);
-      const entry = { id: convoId, title: titleHeader ? decTitle(titleHeader) : 'Cloud Chat', timestamp: Number.isFinite(+timestampHeader) ? +timestampHeader : Date.now() };
+      const parsedTimestamp = timestampHeader != null && timestampHeader !== '' ? +timestampHeader : NaN;
+      const entry = { id: convoId, title: titleHeader ? decTitle(titleHeader) : 'Cloud Chat', timestamp: Number.isFinite(parsedTimestamp) ? parsedTimestamp : Date.now() };
       const idx = index.findIndex(e => e.id === convoId);
       if (idx !== -1) index[idx] = entry; else index.push(entry);
       await writeIndex(env, index);
