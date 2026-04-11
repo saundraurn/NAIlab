@@ -104,11 +104,11 @@
         const parsePrompt = (txt) => { const [p='',n=''] = (txt||'').split('--'); return {positive:p.trim(), negative:n.trim()}; };
         const prepareGenConfig = (cfg) => (!cfg.isOpus || !cfg.shouldUseRandomOpusDimensions) ? {...cfg} : {...cfg, ..._.sample(OPUS_DIMENSIONS.filter(d => d.width <= cfg.width && d.height <= cfg.height))};
         const fmtAgo = ts => !ts ? 'never' : formatTimeAgo(new Date(ts));
-        const _tf=(t,d)=>(m,s,dd)=>useAppStore().addToast({msg:m,type:t,source:s,duration:dd??d});const toast={ok:_tf('success',3000),err:_tf('error'),warn:_tf('warning',4000),info:_tf('info',3000),q:(m,d=2000)=>useAppStore().addToast({msg:m,type:'success',duration:d})};
+        const _tf=(t,d)=>(m,dedupKey,dd)=>useAppStore().addToast({msg:m,type:t,dedupKey,duration:dd??d});const toast={ok:_tf('success',3000),err:_tf('error'),warn:_tf('warning',4000),info:_tf('info',3000),q:(m,d=2000)=>useAppStore().addToast({msg:m,type:'success',duration:d})};
         const splitTagString = (str) => _.compact((str || '').split(' '));
         const TAG_CATEGORIES = 'artist,copyright,character,general,meta'.split(',');
         const getPostTags = (post) => TAG_CATEGORIES.flatMap(type => splitTagString(post[`tag_string_${type}`]).map(name => ({name, type})));
-        const loadImageAsBase64 = async (imageId) => { const bytes = await useImageStore().loadImage(imageId); return bytes ? uint8ArrayToBase64(bytes) : null; };
+        
         const models = [['4-5-full','v4.5 Full'],['4-5-curated','v4.5 Curated'],['4-full','v4 Full']].map(([s,text])=>({val:'nai-diffusion-'+s,text}));
         const _SYNC_KEYS = ['tagTest','genConfig','genState','app','danbooru'];
 
@@ -117,7 +117,7 @@
         const imgSrc = (img) => img?._previewUrl || (img?.data ? `data:${img.mimeType};base64,${img.data}` : '');
         const uint8ArrayToBase64 = arr => btoa(fflate.strFromU8(arr, true));
         const _FM='gemini-3.1-flash-image-preview',_PM='gemini-3-pro-image-preview',_WP='image/webp';
-        const blobToWebP = async (blob) => { const bm = await createImageBitmap(blob), c = new OffscreenCanvas(bm.width, bm.height); c.getContext('2d').drawImage(bm, 0, 0); return new Uint8Array(await (await c.convertToBlob({type:_WP,quality:1})).arrayBuffer()); };
+        
         const _IMGTOK = {'0.5K': 747, '1K': 1120, '2K': 1680, '4K': 2520};
         const _MODEL_PRICING = {[_FM]:{inPerM:0.50,txtPerM:3,imgPerM:60,label:'Nano Banana 2',shortLabel:'NB2',tooltipPricing:'$0.50/M in · $3/M text · $60/M img'},[_PM]:{inPerM:1.25,txtPerM:5,imgPerM:120,label:'Nano Banana Pro',shortLabel:'NBPro',tooltipPricing:'$1.25/M in · $5/M text · $120/M img'}};
         const _BANANA_MODELS = Object.entries(_MODEL_PRICING).map(([val,{label:text}])=>({val,text}));
@@ -126,7 +126,8 @@
         const fmtCost = (c) => c === null ? '' : c < 0.0001 ? '~$0' : '$' + c.toFixed(4);
         const downloadImage = (src, name) => { const a = document.createElement('a'); a.href = src; a.download = name || 'gemini-'+Date.now()+'.webp'; document.body.appendChild(a); a.click(); a.remove(); };
         const abortableSleep = (ms, signal) => new Promise((resolve, reject) => { if (signal?.aborted) return reject(new DOMException('', 'AbortError')); const t = setTimeout(resolve, ms); signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('', 'AbortError')); }, {once: true}); });
-        const mkErr = (msg, props) => Object.assign(new Error(msg), props);
+        const _GEN_ERR = { RETRY: 'retry', PROMPT_BLOCK: 'promptBlock', OUTPUT_BLOCK: 'outputBlock', TERMINAL: 'terminal' };
+        const mkErr = (kind, msg, extra = {}) => Object.assign(new Error(msg), { kind, ...extra });
         const _RETRY_CODES = new Set([429, 500, 502, 503, 504]);
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
@@ -170,10 +171,10 @@
             const toasts = ref([]), notifications = reactive({}), queue = ref([]), isDispatcherRunning = ref(false), isApiHalted = ref(false);
             let uniqueIdCounter = 0;
             const removeToast = (id) => { const i = toasts.value.findIndex(t => t.id === id); if (i !== -1) { clearTimeout(toasts.value[i].timerId); toasts.value.splice(i, 1); } };
-            const addToast = ({id, msg, type='info', source='default', duration=5000, persistent=false}) => {
-                let item = id ? _.find(toasts.value, {id}) : (type === 'error' && _.findLast(toasts.value, {type, msg, source}));
+            const addToast = ({id, msg, type='info', source, dedupKey, duration=5000, persistent=false}) => {
+                let item = id ? _.find(toasts.value, {id}) : dedupKey ? toasts.value.findLast(t => t.dedupKey === dedupKey) : (type === 'error' && toasts.value.findLast(t => t.type === type && t.msg === msg));
                 if (!item) toasts.value.push(item = reactive({id: id || ++uniqueIdCounter, count: 0}));
-                Object.assign(item, {msg, type, source, persistent, duration, count: item.count + 1});
+                Object.assign(item, {msg, type, source: source || dedupKey, dedupKey, persistent, duration, count: item.count + 1});
                 clearTimeout(item.timerId); if (!persistent) item.timerId = setTimeout(() => removeToast(item.id), duration);
                 return item.id;
             };
@@ -237,17 +238,12 @@
         const _rmConvo = id => opfs.remove(_convoPath(id));
         const _writeConvo = (id, messages, params) =>
             opfs.write(_convoPath(id), JSON.stringify({messages, ...(params && {params})}));
-        const _collectImageIds = (d) => new Set((d.messages || []).flatMap(m => [
-            ...(m.images||[]).flatMap(i => i.imageId ? [i.imageId] : []),
-            ...(m.variants||[]).flatMap(v => [
-                ...(v.parts||[]).flatMap(p => p._imageRef ? [p._imageRef] : []),
-                ...(v._images||[]).flatMap(i => i.imageId ? [i.imageId] : [])
-            ])
-        ]));
+        
         const useImageStore = createGlobalState(() => {
             const _mem = new Map(); // in-memory fallback when OPFS is unavailable (e.g. file:// security)
             const saveImage = async (imageId, data) => { try { await opfs.write(imageId, data); } catch { _mem.set(imageId, data); } };
             const cacheImage = _mem.set.bind(_mem);
+            const blobToWebP = async (blob) => { const bm = await createImageBitmap(blob), c = new OffscreenCanvas(bm.width, bm.height); c.getContext('2d').drawImage(bm, 0, 0); return new Uint8Array(await (await c.convertToBlob({type:_WP,quality:1})).arrayBuffer()); };
             const ingestImage = async (input) => {
                 const webpBytes = input instanceof Blob ? await blobToWebP(input)
                     : input.mimeType === _WP ? Uint8Array.from(atob(input.data), c => c.charCodeAt(0))
@@ -257,14 +253,22 @@
                 _mem.set(imageId, webpBytes);
                 return { imageId, base64: uint8ArrayToBase64(webpBytes), webpBytes };
             };
-            const loadImage = async (imageId) => { const b = await opfs.read(imageId); return b ?? (_mem.get(imageId) || null); };
+            const loadImage = async (imageId) => { const b = await opfs.read(imageId); return b ?? _mem.get(imageId) ?? null; };
+            const loadImageAsBase64 = async (imageId) => { const bytes = await loadImage(imageId); return bytes ? uint8ArrayToBase64(bytes) : null; };
+            const collectImageIds = (d) => new Set((d.messages || []).flatMap(m => [
+                ...(m.images||[]).flatMap(i => i.imageId ? [i.imageId] : []),
+                ...(m.variants||[]).flatMap(v => [
+                    ...(v.parts||[]).flatMap(p => p._imageRef ? [p._imageRef] : []),
+                    ...(v._images||[]).flatMap(i => i.imageId ? [i.imageId] : [])
+                ])
+            ]));
             const cleanupOrphanedImages = async (savedConvosList) => {
                 const referenced = new Set();
                 await _pool(savedConvosList || [], async (meta) => {
                     if (!meta?.id) return;
                     try {
                         const json = await opfs.readText(_convoPath(meta.id));
-                        if (json) for (const id of _collectImageIds(JSON.parse(json))) referenced.add(id);
+                        if (json) for (const id of collectImageIds(JSON.parse(json))) referenced.add(id);
                     } catch {}
                 });
                 try {
@@ -272,7 +276,7 @@
                     await _pool(orphaned, f => opfs.remove(f));
                 } catch {}
             };
-            return { saveImage, loadImage, ingestImage, cacheImage, cleanupOrphanedImages };
+            return { saveImage, loadImage, loadImageAsBase64, ingestImage, cacheImage, cleanupOrphanedImages, collectImageIds };
         });
         const useR2Client = createGlobalState(() => {
             const appStore = useAppStore();
@@ -301,62 +305,76 @@
             };
             return { r2Fetch, getWorkerUrl, getSecret };
         });
-        const useSyncQueue = createGlobalState(() => {
-            const _queue = reactive([]);
-            const _running = ref(false);
-            let _timer = null;
-            const _BATCH_DELAY = 300;
-            const _MIN_INTERVAL = 1200;
-            let _lastRunAt = 0;
-            const enqueue = (key, fn) => {
-                const existing = _queue.findIndex(q => q.key === key);
-                if (existing !== -1) _queue[existing].fn = fn;
-                else _queue.push({ key, fn });
-                _scheduleRun();
-            };
-            const _scheduleRun = () => {
-                if (_running.value || _timer) return;
-                const elapsed = Date.now() - _lastRunAt;
-                const wait = Math.max(_BATCH_DELAY, _MIN_INTERVAL - elapsed);
-                _timer = setTimeout(_processQueue, wait);
-            };
-            const _processQueue = async () => {
-                _timer = null;
-                if (_running.value || !_queue.length) return;
-                _running.value = true;
-                try {
-                    while (_queue.length) {
-                        const batch = _queue.splice(0);
-                        const errors = [];
-                        for (const item of batch) {
-                            try { await item.fn(); }
-                            catch (e) { errors.push({ key: item.key, error: e }); console.warn(`Sync queue error [${item.key}]:`, e); }
-                        }
-                        _lastRunAt = Date.now();
-                        if (errors.length) {
-                            const failed = errors.map(e => e.key).join(', ');
-                            toast.warn(`Sync failed for: ${failed}`, 'sync', 4000);
-                        }
-                    }
-                } finally { _running.value = false; if (_queue.length) _scheduleRun(); }
-            };
-            const isRunning = computed(() => _running.value);
-            const pending = computed(() => _queue.length);
-            return { enqueue, isRunning, pending };
-        });
         const useSyncStore = createGlobalState(() => {
             const isSyncing = ref(false);
             const syncError = ref(null);
             const syncStatus = ref('idle');
             const appStore = useAppStore();
             const r2Client = useR2Client();
-            const syncQueue = useSyncQueue();
             const TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-            const _finalizePush = (cfg) => {
+            // ── Unified dirty tracking & scheduling ──
+            const _dirtyConvos = new Set();
+            let _configDirty = false;
+            let _pushTimer = null;
+            let _pushRunning = false;
+            let _pushDoneResolvers = [];
+            const _PUSH_DELAY = 1200;
+            const _isReady = () => !!(r2Client.getWorkerUrl() && r2Client.getSecret());
+            const markConvoDirty = (id) => { _dirtyConvos.add(id); _schedulePush(); };
+            const markConfigDirty = () => { _configDirty = true; _schedulePush(); };
+            const _schedulePush = () => {
+                if (!_isReady() || _pushRunning || _pushTimer) return;
+                _pushTimer = setTimeout(_runPush, _PUSH_DELAY);
+            };
+            const _flushPush = () => { if (_pushTimer) { clearTimeout(_pushTimer); _pushTimer = null; } return _runPush(); };
+            const _runPush = async () => {
+                _pushTimer = null;
+                if (_pushRunning) return;
+                if (!_isReady()) return;
+                _pushRunning = true;
+                try {
+                    while (_configDirty || _dirtyConvos.size) {
+                        const pushConfig = _configDirty;
+                        _configDirty = false;
+                        const convoIds = [..._dirtyConvos];
+                        _dirtyConvos.clear();
+                        if (pushConfig) {
+                            try { await _pushConfigOnly(); }
+                            catch (e) { _configDirty = true; console.warn('Config auto-sync failed:', e); toast.warn('Config sync failed: ' + e.message, 'sync', 4000); }
+                        }
+                        if (convoIds.length) {
+                            const gemini = useGeminiAPI();
+                            await _pool(convoIds.filter(id => gemini.cloudConversations.value[id]), async (id) => {
+                                gemini.convoSyncStatus[id] = 'syncing';
+                                try {
+                                    await gemini.syncConversationToR2(id);
+                                    gemini.convoSyncStatus[id] = 'synced';
+                                } catch (e) {
+                                    _dirtyConvos.add(id);
+                                    gemini.convoSyncStatus[id] = 'error';
+                                    console.warn('Convo R2 sync failed:', e);
+                                }
+                            });
+                        }
+                    }
+                } finally {
+                    _pushRunning = false;
+                    const resolvers = _pushDoneResolvers.splice(0);
+                    resolvers.forEach(r => r());
+                    if (_configDirty || _dirtyConvos.size) _schedulePush();
+                }
+            };
+            const _pushConfigOnly = async () => {
+                const cfg = appStore.config.value;
+                const tombstones = cfg.jssync._deletedConversationIds || [];
+                const payload = extractSyncPayload(cfg);
+                payload._deletedConversationIds = _pruneTombstones(tombstones);
+                await r2Client.r2Fetch('PUT', 'config', JSON.stringify(payload), { contentType: 'application/json' });
+                _configEtag.value = null;
                 cfg.jssync.lastSyncedAt = Date.now();
             };
+            const awaitPush = () => (_pushRunning || _pushTimer) ? new Promise(r => _pushDoneResolvers.push(r)) : Promise.resolve();
             const withFlag = (f, fn) => { f.value = true; return Promise.resolve().then(fn).finally(() => { f.value = false; }); };
-            const withSyncMerge = (fn) => withFlag(appStore.isSyncMerging, fn);
             const _applySectionDict = (cfg, dict) => {
                 Object.entries(dict).forEach(([key, val]) => {
                     if (key === '_syncMeta') return;
@@ -404,7 +422,7 @@
                         });
                         const mergedKeys = Object.keys(lwwMerged);
                         if (mergedKeys.length) {
-                            await withSyncMerge(() => {
+                            await withFlag(appStore.isSyncMerging, () => {
                                 _applySectionDict(cfg, lwwMerged);
                                 mergedKeys.forEach(k => {
                                     if (remoteMeta[k]) cfg._syncMeta[k] = _.cloneDeep(remoteMeta[k]);
@@ -530,7 +548,7 @@
                     const tombstonesToDelete = tombstones.filter(t => t.deletedAt > lastSynced);
                     await _pool(tombstonesToDelete, t => r2Client.r2Fetch('DELETE', `conversations/${t.id}`).catch(() => {}));
                     if (dirtyMetas.length || tombstonesToDelete.length) _listEtag.value = null;
-                    _finalizePush(cfg);
+                    cfg.jssync.lastSyncedAt = Date.now();
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config synced to cloud.', 'sync', 2500);
                 } catch (e) {
@@ -545,10 +563,7 @@
                     if (syncStatus.value === 'idle') await push(true);
                 });
             };
-            const queueSync = () => {
-                syncQueue.enqueue('config', syncNow);
-            };
-            return { isSyncing, syncStatus, syncError, pull, push, syncNow, queueSync };
+            return { isSyncing, syncStatus, syncError, pull, push, syncNow, markConfigDirty, markConvoDirty, awaitPush, _flushPush };
         });
         const TAG_COLORS={artist:['badge-warning','bg-warning/20'],character:['badge-success','bg-success/20'],copyright:['badge-accent','bg-accent/20'],meta:['badge-info','bg-info/20'],default:['badge-primary','bg-primary/20']};
         const useDropdown=()=>{const isOpen=ref(false),root=ref(null);return{isOpen,root,close:()=>{isOpen.value=false;if(document.activeElement&&root.value?.contains(document.activeElement))document.activeElement.blur();}};};
@@ -694,7 +709,7 @@ const TagCountBadge={
         };
         const CollapsiblePanel={
             props:{title:{type:String,default:''},storageKey:{type:String,required:true},flush:{type:Boolean,default:false},boxClass:{type:String,default:''}},
-            setup(p){const s=useAppStore();return{isOpen:computed({get:()=>s.config.value.ui.collapsibleStates[p.storageKey],set:v=>s.config.value.ui.collapsibleStates[p.storageKey]=v})};},
+            setup(p){const cs=useAppStore().config.value.ui.collapsibleStates;return{isOpen:computed({get:()=>cs[p.storageKey],set:v=>cs[p.storageKey]=v})};},
             template:`<div class="collapse collapse-arrow overflow-visible" :class="[boxClass||(flush?'glass rounded-none border-b border-white/20':'glass-nested rounded-xl border border-white/20'),{'collapse-open':isOpen,'collapse-close':!isOpen}]"><div class="collapse-title flex items-center text-lg font-semibold text-neutral-100 cursor-pointer hover:text-primary transition-colors select-none pr-12" @click="isOpen=!isOpen"><div class="flex-1 min-w-0 flex-row-gap mr-4"><slot name="header">{{title}}</slot></div><div class="ml-auto flex-none flex-row-gap relative z-10" @click.stop><slot name="actions"></slot></div></div><div class="collapse-content px-4 space-y-3 !overflow-visible"><slot></slot></div></div>`
         };
         const PromptList={
@@ -779,7 +794,7 @@ const TagCountBadge={
                 const restoreScroll = () => { if (gridRoutes.includes(route.name) && rightPanelRef.value) rightPanelRef.value.scrollTop = lastScrollPos.value; };
                 watch(scrollTop, useDebounceFn(() => { if (gridRoutes.includes(route.name)) lastScrollPos.value = scrollTop.value; }, 150));
                 onActivated(() => nextTick(restoreScroll));
-                watch(() => route.fullPath, (path) => { if (['danbooru-grid', 'danbooru-folder'].includes(route.name)) danbooru.value.lastPath = path; });
+                watch(() => route.fullPath, (path) => { if (gridRoutes.includes(route.name)) danbooru.value.lastPath = path; });
                 let abortController = null;
                 const {isLoading, error: err, execute} = useAsyncState(async (tags, page = 1, append = false, signal, clientFilters = []) => {
                     try {
@@ -809,11 +824,13 @@ const TagCountBadge={
                     return _.find(posts.value, post => String(post.id) === selectedPostId.value) || null;
                 });
                 const displayedImage = computed(() => selectedImage.value || hoveredImage.value), foldersById = computed(() => _.keyBy(danbooru.value.folders, 'id')), activeFolderId = computed(() => route.name === 'danbooru-folder' ? route.params.folderId : null);
-                watch(() => [isLoading.value, sortedPosts.value.length], ([loading, len]) => { if (!loading && len < 15 && hasMorePages.value && gridRoutes.includes(route.name) && _.some(ratingFilters.value)) fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []); });
+                const _canLoadMore = () => _.some(ratingFilters.value) && !isLoading.value && hasMorePages.value && gridRoutes.includes(route.name);
+                const _loadMore = () => _canLoadMore() && fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []);
+                watch(() => [isLoading.value, sortedPosts.value.length], ([loading, len]) => { if (!loading && len < 15) _loadMore(); });
                 const executeSearch = (query) => {
                     lastFetchedQuery.value = query; let effective = query || '', apiTags, clientFilters = [];
                     if ((effective).includes('|')) apiTags = effective.split('|').map(p => _.compact(p.split(/\s*,\s*/).map(t => t.trim().replace(/\s+/g, '_'))).join(' ')).join('|');
-                    else { const tags = _.compact((effective).split(/\s*,\s*/).map(tag => tag.trim().replace(/\s+/g, '_'))); apiTags = _.take(tags, 2).join(' '); clientFilters = tags.slice(2); }
+                    else { const tags = _.compact((effective).split(/\s*,\s*/).map(tag => tag.trim().replace(/\s+/g, '_'))); apiTags = tags.slice(0, 2).join(' '); clientFilters = tags.slice(2); }
                     fetchPosts(apiTags, 1, false, clientFilters);
                 };
                 watch(() => route.query.q, (q) => {
@@ -850,10 +867,10 @@ const TagCountBadge={
                     delete: (item) => (_.pull(savedSearches.value, item), toast.info(`Deleted "${item.name}".`, 'danbooru')),
                 };
                 const savedSearchAction = (action, item) => _savedSearchActions[action]?.(item);
-                const addTagToSearch = (t) => searchQueryInput.value = _.uniq([..._.compact((searchQueryInput.value||'').split(',').map(x => x.trim())), t.replace(/_/g, ' ')]).join(', ');
+                const addTagToSearch = (t) => searchQueryInput.value = [...new Set([..._.compact((searchQueryInput.value||'').split(',').map(x => x.trim())), t.replace(/_/g, ' ')])].join(', ');
                 const searchSingleTag = (t) => (searchQueryInput.value = t.replace(/_/g, ' '), search());
                 const toggleTagInSearch = (tag, searchItem) => { const raw = tag.replace(/ /g, '_'), p = searchItem.prompt || ''; if (p.includes('|')) { searchItem.prompt = _.xorBy(_.compact(p.split('|').map(x => x.trim())), [raw], _.toLower).join(' | '); } else { const r = new RegExp(`(^|\\s)${_.escapeRegExp(raw)}($|\\s)`, 'i'); searchItem.prompt = r.test(p) ? p.replace(r, ' ').trim() : (p ? `${p} | ${raw}` : raw); } toast.ok(`Updated "${searchItem.name}"`, 'danbooru', 1000); };
-                useInfiniteScroll(rightPanelRef, () => _.some(ratingFilters.value) && !isLoading.value && hasMorePages.value && gridRoutes.includes(route.name) && fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []), {distance: 1000});
+                useInfiniteScroll(rightPanelRef, _loadMore, {distance: 1000});
                 provide('danbooruState', { posts: sortedPosts, isLoading, isLoadingMore: computed(() => isLoading.value && pageNum.value > 1), hasMorePages, statusMsg: computed(() => isLoading.value && !posts.value.length ? 'Searching...' : err.value ? `Error: ${err.value.message}` : !posts.value.length ? 'Search for images on Danbooru.' : `Showing ${posts.value.length} posts${hasMorePages.value ? ' (scroll for more)' : ''}`), hoveredImage, rightPanelRef, lastScrollPos, gridSize: toRef(danbooru.value, 'gridCols') });
                 provide('danbooruFolders', {folders: toRef(danbooru.value, 'folders'), isPostInFolder: (pid, fid) => foldersById.value[fid]?.postIds?.includes(pid), togglePostInFolder});
                 provide('danbooruSearch', {onSearch: addTagToSearch, onSingle: searchSingleTag, savedSearches, onToggleSearch: toggleTagInSearch, isTagIn: (p, t) => (p||'').split((p||'').includes('|') ? '|' : /\s+/).map(x => x.trim().toLowerCase()).includes(t.replace(/ /g, '_').toLowerCase())});
@@ -983,15 +1000,14 @@ const TagCountBadge={
         const deserializeConversation = async (serializedData) => {
             if (!serializedData) return [];
             const _imgCache = new Map();
-            const loadCached = (id) => { if (!_imgCache.has(id)) _imgCache.set(id, loadImageAsBase64(id)); return _imgCache.get(id); };
+            const _imageStore = useImageStore();
+            const loadCached = (id) => { if (!_imgCache.has(id)) _imgCache.set(id, _imageStore.loadImageAsBase64(id)); return _imgCache.get(id); };
             return Promise.all((serializedData.messages || []).map(async (msg) => {
                 const { images: rawImages, variants: rawVariants, ...dMsg } = msg;
                 if (rawImages?.length) {
-                    dMsg.images = await Promise.all(rawImages.map(async (img) => {
-                        const dImg = { ...img };
-                        if (dImg.imageId) dImg.data = await loadCached(dImg.imageId);
-                        return dImg;
-                    }));
+                    dMsg.images = await Promise.all(rawImages.map(async (img) =>
+                        img.imageId ? { ...img, data: await loadCached(img.imageId) } : img
+                    ));
                 }
                 if (rawVariants?.length) {
                     dMsg.variants = await Promise.all(rawVariants.map(async (v) => {
@@ -1007,10 +1023,9 @@ const TagCountBadge={
                             }
                             return part;
                         }));
-                        dV._images = await Promise.all((rawVImages || []).map(async (img) => {
-                            if (img.imageId) return { ...img, data: await loadCached(img.imageId) };
-                            return img;
-                        }));
+                        dV._images = await Promise.all((rawVImages || []).map(async (img) =>
+                            img.imageId ? { ...img, data: await loadCached(img.imageId) } : img
+                        ));
                         dV._model = v._model || _FM;
                         dV._flexInference = !!v._flexInference;
                         dV._genTimeMs = v._genTimeMs || null;
@@ -1029,7 +1044,7 @@ const TagCountBadge={
             const conversationMap = reactive(new Map());
             const activeConvoId = ref(null);
             const _createConvoState = (opts = {}) => reactive({
-                id: opts.id || uid(), title: opts.title || 'New Chat', isTemp: opts.isTemp !== false,
+                id: opts.id || uid(), title: opts.title || 'New Chat',
                 messages: opts.messages || [], generating: false, generatingMsgId: null, generatingVarIdx: null,
                 abortCtrl: null, isHydrating: false, timestamp: opts.timestamp || Date.now(),
                 _lastGenStatus: null,
@@ -1107,12 +1122,13 @@ const TagCountBadge={
                 if (!res.ok) {
                     const errData = await res.json().catch(() => null);
                     const msg = errData?.error?.message || `HTTP ${res.status}`;
-                    throw mkErr(msg, {status:res.status, isRetryable:_RETRY_CODES.has(res.status)||(res.status===400&&/quota|resource.?exhausted/i.test(msg))});
+                    const retryable = _RETRY_CODES.has(res.status) || (res.status === 400 && /quota|resource.?exhausted/i.test(msg));
+                    throw mkErr(retryable ? _GEN_ERR.RETRY : undefined, msg, {status: res.status});
                 }
                 const allParts = []; let finalFinishReason = null;
                 let _streamThinking = '', _streamText = '', _streamImages = Vue.markRaw([]);
                 for await (const chunk of parseSSE(res)) {
-                    if (chunk.promptFeedback?.blockReason) throw mkErr(`Prompt blocked: ${chunk.promptFeedback.blockReason}`, {isPromptBlock:true, blockReason:chunk.promptFeedback.blockReason});
+                    if (chunk.promptFeedback?.blockReason) throw mkErr(_GEN_ERR.PROMPT_BLOCK, `Prompt blocked: ${chunk.promptFeedback.blockReason}`, {blockReason:chunk.promptFeedback.blockReason});
                     const cand = chunk.candidates?.[0];
                     if (cand?.content?.parts) {
                         for (const p of cand.content.parts) {
@@ -1126,10 +1142,10 @@ const TagCountBadge={
                     const v = getV();
                     if (v) { v._thinking = _streamThinking; v._text = _streamText; v._images = _streamImages; if (chunk.usageMetadata) v._usage = chunk.usageMetadata; }
                 }
-                if (_BLOCK_REASONS.has(finalFinishReason)) throw mkErr(`Output blocked: ${finalFinishReason}`, {isCandidateBlock:true, blockReason:finalFinishReason});
-                if (_TERMINAL_REASONS.has(finalFinishReason)) throw mkErr(`Generation stopped: ${finalFinishReason}`, {isTerminal:true, blockReason:finalFinishReason});
+                if (_BLOCK_REASONS.has(finalFinishReason)) throw mkErr(_GEN_ERR.OUTPUT_BLOCK, `Output blocked: ${finalFinishReason}`, {blockReason:finalFinishReason});
+                if (_TERMINAL_REASONS.has(finalFinishReason)) throw mkErr(_GEN_ERR.TERMINAL, `Generation stopped: ${finalFinishReason}`, {blockReason:finalFinishReason});
                 const v = getV();
-                if (!v?._images?.length) { const reason = finalFinishReason || 'EMPTY'; throw mkErr(v?._text ? `No image generated (${reason})` : `Empty response (${reason})`, {isCandidateBlock:true, blockReason:reason}); }
+                if (!v?._images?.length) { const reason = finalFinishReason || 'EMPTY'; throw mkErr(_GEN_ERR.OUTPUT_BLOCK, v?._text ? `No image generated (${reason})` : `Empty response (${reason})`, {blockReason:reason}); }
                 if (v) {
                     let idc = 0;
                     for (const part of allParts) {
@@ -1147,29 +1163,31 @@ const TagCountBadge={
             };
             const _handleStreamError = async (err, v, retryCount, onNewVariant, convo) => {
                 if (err.name === 'AbortError') return setVarError(v, 'Request cancelled.'), false;
-                if (err.isRetryable) {
-                    retryCount.value++;
-                    const delay = getDelay(retryCount.value - 1);
-                    toast.warn(`${err.status === 429 ? 'Rate limited' : 'Server error'}, retrying in ${Math.round(delay/1000)}s…`, undefined, delay + 500);
-                    try { await abortableSleep(delay, convo.abortCtrl?.signal); } catch { return setVarError(v, 'Request cancelled.'), false; }
-                    return true;
-                }
-                const {isTerminal, isPromptBlock, isCandidateBlock, blockReason, message} = err;
-                if (isTerminal) return setVarError(v, `Stopped: ${blockReason}`, {_blockReason: blockReason}), toast.err(`Generation stopped: ${blockReason}`), false;
-                if (isPromptBlock) return setVarError(v, message, {_blockReason: blockReason, _isPromptBlock: true}), toast.err(message), false;
-                if (isCandidateBlock) {
-                    setVarError(v, message, {_blockReason: blockReason});
-                    if (convo.params?.autoRetry) return toast.warn(`Blocked (${blockReason}), retrying…`, undefined, 1500), onNewVariant(), retryCount.value = 0, true;
-                    return false;
+                const {kind, blockReason, message} = err;
+                switch (kind) {
+                    case _GEN_ERR.RETRY:
+                        retryCount.value++;
+                        const delay = getDelay(retryCount.value - 1);
+                        toast.warn(`${err.status === 429 ? 'Rate limited' : 'Server error'}, retrying in ${Math.round(delay/1000)}s…`, undefined, delay + 500);
+                        try { await abortableSleep(delay, convo.abortCtrl?.signal); } catch { return setVarError(v, 'Request cancelled.'), false; }
+                        return true;
+                    case _GEN_ERR.TERMINAL:
+                        return setVarError(v, `Stopped: ${blockReason}`, {_blockReason: blockReason}), toast.err(`Generation stopped: ${blockReason}`), false;
+                    case _GEN_ERR.PROMPT_BLOCK:
+                        return setVarError(v, message, {_blockReason: blockReason, _isPromptBlock: true}), toast.err(message), false;
+                    case _GEN_ERR.OUTPUT_BLOCK:
+                        setVarError(v, message, {_blockReason: blockReason});
+                        if (convo.params?.autoRetry) return toast.warn(`Blocked (${blockReason}), retrying…`, undefined, 1500), onNewVariant(), retryCount.value = 0, true;
+                        return false;
                 }
                 return setVarError(v, message || 'Unknown error'), toast.err(message || 'Generation failed'), false;
             };
             const _saveConvoDirect = async (convo) => {
-                if (!convo?.messages?.length || convo.isTemp) return;
+                const meta = convo?.messages?.length && _findMeta(convo.id);
+                if (!meta) return;
                 try {
                     await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params);
-                    const meta = _findMeta(convo.id);
-                    meta && (meta.timestamp = Date.now());
+                    meta.timestamp = Date.now();
                 } catch (e) { console.warn('Auto-save failed:', e); }
             };
             const _pruneBananaThinkingStates = (msgIds) => {
@@ -1193,17 +1211,28 @@ const TagCountBadge={
                     catch (err) { if (!await _handleStreamError(err, v, retryCount, () => { modelMsg.variants.push(createVariant(convo.params)); genVarIdx = modelMsg.variants.length - 1; convo.generatingVarIdx = genVarIdx; modelMsg.activeVariant = genVarIdx; }, convo)) break; }
                 }
                 convo.generating = false; convo.generatingMsgId = null; convo.generatingVarIdx = null; convo.abortCtrl = null;
-                if (!convo.isTemp) _saveConvoDirect(convo);
                 const genVariant = modelMsg.variants[genVarIdx];
                 const didSucceed = genVariant?._images?.length > 0;
                 convo._lastGenStatus = didSucceed ? 'success' : 'error';
+                if (!_findMeta(convo.id)) {
+                    if (didSucceed) {
+                        try {
+                            const title = convo.messages.find(m => m.role === 'user')?.text?.substring(0, 40) || 'Untitled Chat';
+                            convo.title = title; convo.timestamp = Date.now();
+                            const meta = { id: convo.id, title, timestamp: convo.timestamp };
+                            await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params);
+                            savedConversations.value.unshift(meta);
+                        } catch (e) { console.warn('Auto-save new convo failed:', e); }
+                    }
+                } else {
+                    _saveConvoDirect(convo);
+                }
                 if (didSucceed) {
                     const isViewingThis = activeConvoId.value === convo.id && window.location.hash.includes('/banana');
                     if (!isViewingThis) store.incrementNotification('banana');
-                    if (!convo.isTemp && _isSyncReady()) {
+                    if (_findMeta(convo.id) && _isSyncReady()) {
                         _markCloud(convo.id);
-                        _r2SyncDirty.add(convo.id);
-                        _runR2Sync();
+                        useSyncStore().markConvoDirty(convo.id);
                     }
                 }
             };
@@ -1255,7 +1284,7 @@ const TagCountBadge={
                 if (idx !== -1) { _pruneBananaThinkingStates([msgId]); convo.messages.splice(idx, 1); toast.q('All variants deleted'); }
             });
             const newChat = () => {
-                const convo = _createConvoState({ isTemp: true });
+                const convo = _createConvoState();
                 conversationMap.set(convo.id, convo);
                 activeConvoId.value = convo.id;
                 return convo.id;
@@ -1277,7 +1306,7 @@ const TagCountBadge={
                 const convo = conversationMap.get(id);
                 if (!convo || !convo.messages.length) return;
                 const actualTitle = title?.trim() || convo.messages[0]?.text?.substring(0, 40) || 'Untitled Chat';
-                convo.title = actualTitle; convo.isTemp = false;
+                convo.title = actualTitle;
                 convo.timestamp = Date.now();
                 const meta = { id: convo.id, title: actualTitle, timestamp: convo.timestamp };
                 try { await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params); }
@@ -1304,7 +1333,7 @@ const TagCountBadge={
                 } catch { return null; }
             };
             const _pullMissingImagesFromR2 = async (convoData, convoId) => {
-                const imageIds = _collectImageIds(convoData);
+                const imageIds = imageStore.collectImageIds(convoData);
                 if (!imageIds.size) return;
                 const localKeys = new Set(await opfs.keys());
                 const missing = [...imageIds].filter(id => !localKeys.has(id));
@@ -1333,7 +1362,7 @@ const TagCountBadge={
                 if (conversationMap.has(id)) { activeConvoId.value = id; return; }
                 const meta = _findMeta(id);
                 if (!meta) return;
-                const convo = _createConvoState({ id, title: meta.title, isTemp: false, timestamp: meta.timestamp });
+                const convo = _createConvoState({ id, title: meta.title, timestamp: meta.timestamp });
                 convo.isHydrating = true;
                 conversationMap.set(id, convo);
                 activeConvoId.value = id;
@@ -1381,7 +1410,7 @@ const TagCountBadge={
                 }
                 if (conversationMap.has(id)) closeConversation(id);
                 deleteCloudConversation(id).catch(() => {});
-                _isSyncReady() && useSyncStore().push(true).catch(() => {});
+                _isSyncReady() && useSyncStore().markConfigDirty();
                 toast.q('Removed from saved chats');
                 imageStore.cleanupOrphanedImages(savedConversations.value).catch(() => {});
             };
@@ -1417,15 +1446,14 @@ const TagCountBadge={
             const abort = () => { const convo = activeConvo.value; if (convo?.abortCtrl) convo.abortCtrl.abort(); };
             const _autoSave = useDebounceFn(() => {
                 const c = activeConvo.value;
-                if (!c || c.isTemp || c.generating || c.isHydrating) return;
+                if (!c || !_findMeta(c.id) || c.generating || c.isHydrating) return;
                 _saveConvoDirect(c);
                 if (!_isSyncReady()) return;
                 _markCloud(c.id);
                 if (convoSyncStatus[c.id] !== 'syncing') convoSyncStatus[c.id] = 'pending';
-                _r2SyncDirty.add(c.id);
-                _runR2Sync();
+                useSyncStore().markConvoDirty(c.id);
             }, 1500);
-            watch(() => { const c = activeConvo.value; return c && !c.isTemp && !c.generating ? c.messages : null; }, (msgs) => {
+            watch(() => { const c = activeConvo.value; return c && _findMeta(c.id) && !c.generating ? c.messages : null; }, (msgs) => {
                 if (msgs) _autoSave();
             }, { deep: true });
             const r2Client = useR2Client();
@@ -1447,21 +1475,19 @@ const TagCountBadge={
                 const syncedSet = new Set(_syncedR2Images.value[convoId] || []);
                 const newImages = [...imageIds].filter(id => !syncedSet.has(id));
                 const orphaned = [...syncedSet].filter(id => !imageIds.has(id));
-                const uploaded = new Set();
                 await Promise.all([
                     _pool(newImages, async (imgId) => {
                         try {
                             const imgData = await opfs.read(imgId);
                             if (imgData) {
                                 await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
-                                uploaded.add(imgId);
+                                syncedSet.add(imgId);
                             }
                         } catch {}
                     }),
-                    _pool(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}))
+                    _pool(orphaned, name => { syncedSet.delete(name); return r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}); })
                 ]);
-                const nowSynced = [...imageIds].filter(id => syncedSet.has(id) || uploaded.has(id));
-                _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: nowSynced };
+                _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...syncedSet].filter(id => imageIds.has(id)) };
             };
             const _syncConversationToR2 = async (id) => {
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
@@ -1471,50 +1497,21 @@ const TagCountBadge={
                     throw new Error('Conversation data not found locally.');
                 }
                 let imageIds;
-                try { imageIds = _collectImageIds(JSON.parse(raw)); }
+                try { imageIds = imageStore.collectImageIds(JSON.parse(raw)); }
                 catch { throw new Error('Conversation data corrupted locally.'); }
                 const meta = _findMeta(id);
                 const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
                 await _pushConvoToR2(id, raw, imageIds, metaPick);
             };
-            let _r2SyncInProgress = false;
-            let _r2SyncPromise = null;
-            const _r2SyncDirty = new Set();
-            const _runR2Sync = () => {
-                if (_r2SyncInProgress) return _r2SyncPromise || Promise.resolve();
-                _r2SyncInProgress = true;
-                _r2SyncPromise = (async () => {
-                    try {
-                        const ids = [..._r2SyncDirty];
-                        _r2SyncDirty.clear();
-                        await _pool(ids.filter(id => cloudConversations.value[id]), async (id) => {
-                            convoSyncStatus[id] = 'syncing';
-                            try {
-                                await _syncConversationToR2(id);
-                                convoSyncStatus[id] = 'synced';
-                            } catch (e) {
-                                convoSyncStatus[id] = 'error';
-                                console.warn('Convo R2 sync failed:', e);
-                                const title = _findMeta(id)?.title || id;
-                                toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
-                            }
-                        });
-                    } finally {
-                        _r2SyncInProgress = false;
-                        _r2SyncPromise = null;
-                        if (_r2SyncDirty.size) await _runR2Sync();
-                    }
-                })();
-                return _r2SyncPromise;
-            };
 
             const syncConversationNow = async (id) => {
+                const sync = useSyncStore();
                 if (!cloudConversations.value[id]) {
                     convoSyncStatus[id] = 'syncing';
                     try {
                         _markCloud(id);
                         await _syncConversationToR2(id);
-                        await useSyncStore().push(true);
+                        await sync.push(true);
                         convoSyncStatus[id] = 'synced';
                         toast.q('Synced to cloud');
                     } catch (e) {
@@ -1525,16 +1522,13 @@ const TagCountBadge={
                     return;
                 }
                 convoSyncStatus[id] = 'pending';
-                _r2SyncDirty.add(id);
-                await _runR2Sync();
-                if (_r2SyncPromise) await Promise.race([
-                    _r2SyncPromise,
-                    new Promise(r => setTimeout(r, 120000))
-                ]);
+                sync.markConvoDirty(id);
+                await sync._flushPush();
+                await sync.awaitPush();
                 const status = convoSyncStatus[id];
                 if (status === 'synced') toast.q('Synced to cloud');
                 else if (status === 'error') toast.err('Sync failed');
-                else toast.warn('Sync timed out — will retry automatically');
+                else toast.warn('Sync pending — will complete automatically');
             };
             const deleteCloudConversation = async (id) => {
                 if (!cloudConversations.value[id]) return;
@@ -1682,11 +1676,12 @@ const TagCountBadge={
                 };
                 onKeyStroke('Escape', () => { if (lightboxSrc.value) lightboxSrc.value = null; });
                 const openConversations = computed(() => _.orderBy([...conversationMap.values()], 'timestamp', 'desc'));
+                const savedIds = computed(() => new Set(savedConversations.value.map(c => c.id)));
                 const closedSavedConversations = computed(() => {
                     const openIds = new Set(conversationMap.keys());
                     return _.orderBy((savedConversations.value || []).filter(c => !openIds.has(c.id)), 'timestamp', 'desc');
                 });
-                const handleRename = (convo, t) => { if (!t?.trim()) return; conversationMap.get(convo.id)?.isTemp ? saveConversation(convo.id, t) : renameConversation(convo.id, t); };
+                const handleRename = (convo, t) => { if (!t?.trim()) return; savedIds.value.has(convo.id) ? renameConversation(convo.id, t) : saveConversation(convo.id, t); };
                 const allHiddenFromModel = computed(() => messages.value.length > 0 && messages.value.every(m => m.hidden));
                 const hasNoImageMessages = computed(() => {
                     const genMsgId = activeConvo.value?.generatingMsgId;
@@ -1715,7 +1710,7 @@ const TagCountBadge={
                     activeConvoId, conversationMap,
                     conversationGists: cloudConversations, convoSyncStatus, syncConversationNow,
                     syncToken: store.syncToken,
-                    openConversations, closedSavedConversations,
+                    openConversations, closedSavedConversations, savedIds,
                     switchConversation, closeConversation, saveConversation, loadConversation, deleteConversation,
                     handleRename,
                     allHiddenFromModel, toggleHideAllFromModel,
@@ -1723,7 +1718,7 @@ const TagCountBadge={
                     fmtAgo, getConvoPreview: _getConvoPreview
                 };
             },
-            template: `<split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #header><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0 w-28"><setting-input v-model="convoParams.aspectRatio" label="Aspect Ratio" type="select" :options="aspectRatios"></setting-input></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></template><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><label-row v-for="convo in openConversations" :key="convo.id" :label="convo.title" :active="activeConvoId===convo.id" placeholder="Untitled Chat" delete-icon="close" @click="switchConversation(convo.id)" @rename="handleRename(convo,$event)" @delete="closeConversation(convo.id)"><template #icon><span v-if="convo.generating" class="loading loading-spinner loading-xs text-primary shrink-0"></span><material-icon v-else-if="convo.isTemp" icon="schedule" :size="14" class="text-neutral-500 shrink-0"/><span v-else-if="convo._lastGenStatus==='success'" class="w-2 h-2 rounded-full bg-success/60 shrink-0 inline-block"></span><span v-else-if="convo._lastGenStatus==='error'" class="w-2 h-2 rounded-full bg-error/60 shrink-0 inline-block"></span><material-icon v-else icon="bookmark" :size="14" class="text-primary/70 shrink-0"/><sync-badge v-if="!convo.isTemp&&!!conversationGists[convo.id]" :status="convoSyncStatus[convo.id]"/></template><template v-if="convo.messages.length" #meta><span class="tabular-nums">{{convo.messages.length}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn v-if="convo.isTemp&&convo.messages.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/></template></label-row><template v-if="closedSavedConversations.length"><div class="divider text-xs text-neutral-600 my-2 select-none">Saved ({{ closedSavedConversations.length }})</div><label-row v-for="convo in closedSavedConversations" :key="convo.id" :label="convo.title" placeholder="Untitled Chat" @click="loadConversation(convo.id)" @rename="handleRename(convo,$event)" @delete="deleteConversation(convo.id)"><template #icon><material-icon icon="bookmark" :size="14" class="text-neutral-500 shrink-0"/><sync-badge v-if="!!conversationGists[convo.id]" :status="convoSyncStatus[convo.id]"/></template><template #meta><span class="tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template></label-row></template><div v-if="!openConversations.length && !closedSavedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()"></chat-message></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><image-preview-card v-for="(img, idx) in pendingImages" :key="idx" :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport>`
+            template: `<split-pane config-key="splitSizesBanana" left-class="p-0 flex flex-col" right-class="p-0 flex flex-col"><template #header><input ref="fileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,false)"><input ref="editFileInputRef" type="file" accept="image/*" multiple class="hidden" @change="onFileInput($event,true)"><collapsible-panel storage-key="banana-settings" flush><template #header><span>Nano Banana</span></template><template #actions><icon-btn icon="image_not_supported" @click="pruneNoImageMessages" :disabled="!hasNoImageMessages" title="Remove non-image responses" color="glass-nested text-neutral-500 border-white/10" size="btn-sm min-h-0"/><toggle-btn :model-value="allHiddenFromModel" icon="visibility_off" @update:model-value="toggleHideAllFromModel"></toggle-btn><toggle-btn v-model="convoParams.autoRetry" icon="autorenew"></toggle-btn><toggle-btn v-model="convoParams.hideVariantsNoImage" icon="hide_image"/><toggle-btn v-model="convoParams.flexInference" icon="savings" :disabled="convoParams.bananaModel!==_PM"/></template><div class="flex flex-wrap items-end gap-3 pt-1 pb-1"><div class="shrink-0 w-52"><setting-input v-model="convoParams.bananaModel" label="Model" type="select" :options="bananaModels"></setting-input></div><div class="relative shrink-0 w-[8.5rem]"><floating-label label="Thinking" color="badge-secondary"/><div class="mt-1 pt-1"><segmented-control v-if="convoParams.bananaModel !== _PM" v-model="convoParams.thinkingLevel" :options="[{val:'MINIMAL',label:'Min'},{val:'HIGH',label:'High'}]" height="h-8" active-class="btn-secondary text-white shadow-md" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control><div v-else class="flex items-center h-8 px-2 glass-nested rounded-lg text-xs text-secondary/80 font-semibold select-none"><material-icon icon="psychology" :size="14" class="mr-1"/>Always On</div></div></div><div class="shrink-0 w-28"><setting-input v-model="convoParams.aspectRatio" label="Aspect Ratio" type="select" :options="aspectRatios"></setting-input></div><div class="relative shrink-0 w-[14.5rem]"><floating-label label="Image Size"/><div class="mt-1 pt-1"><segmented-control v-model="convoParams.imageSize" :options="availableImageSizes" height="h-8" inactive-class="glass-nested text-white/60 hover:bg-white/5 hover:text-white"></segmented-control></div></div></div></collapsible-panel></template><template #left><div class="p-3 border-b border-white/10 shrink-0 flex gap-2"><button @click="newChat" class="btn btn-sm flex-1 bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300"><material-icon icon="add" :size="16"/> New Chat </button></div><div class="flex-1 overflow-y-auto custom-scroll p-2 space-y-1"><label-row v-for="convo in openConversations" :key="convo.id" :label="convo.title" :active="activeConvoId===convo.id" placeholder="Untitled Chat" delete-icon="close" @click="switchConversation(convo.id)" @rename="handleRename(convo,$event)" @delete="closeConversation(convo.id)"><template #icon><span v-if="convo.generating" class="loading loading-spinner loading-xs text-primary shrink-0"></span><material-icon v-else-if="!savedIds.has(convo.id)" icon="schedule" :size="14" class="text-neutral-500 shrink-0"/><span v-else-if="convo._lastGenStatus==='success'" class="w-2 h-2 rounded-full bg-success/60 shrink-0 inline-block"></span><span v-else-if="convo._lastGenStatus==='error'" class="w-2 h-2 rounded-full bg-error/60 shrink-0 inline-block"></span><material-icon v-else icon="bookmark" :size="14" class="text-primary/70 shrink-0"/><sync-badge v-if="savedIds.has(convo.id)&&!!conversationGists[convo.id]" :status="convoSyncStatus[convo.id]"/></template><template v-if="convo.messages.length" #meta><span class="tabular-nums">{{convo.messages.length}} · {{fmtAgo(convo.timestamp)}}</span></template><template #actions><icon-btn v-if="!savedIds.has(convo.id)&&convo.messages.length" icon="save" @click.stop="saveConversation(convo.id,'')" title="Save" color="btn-ghost text-neutral-500 hover:text-success" size="btn-xs"/></template></label-row><template v-if="closedSavedConversations.length"><div class="divider text-xs text-neutral-600 my-2 select-none">Saved ({{ closedSavedConversations.length }})</div><label-row v-for="convo in closedSavedConversations" :key="convo.id" :label="convo.title" placeholder="Untitled Chat" @click="loadConversation(convo.id)" @rename="handleRename(convo,$event)" @delete="deleteConversation(convo.id)"><template #icon><material-icon icon="bookmark" :size="14" class="text-neutral-500 shrink-0"/><sync-badge v-if="!!conversationGists[convo.id]" :status="convoSyncStatus[convo.id]"/></template><template #meta><span class="tabular-nums">{{fmtAgo(convo.timestamp)}}</span></template></label-row></template><div v-if="!openConversations.length && !closedSavedConversations.length" class="text-center text-xs text-neutral-500 py-6 select-none px-2 leading-relaxed"> No conversations yet.<br>Click New Chat to start. </div></div></template><template #right><div ref="chatEl" class="flex-1 overflow-y-auto custom-scroll p-4 space-y-4"><div v-if="isHydrating" class="flex flex-col items-center justify-center min-h-[55vh] text-center gap-4 select-none"><span class="loading loading-spinner loading-lg text-primary"></span><p class="text-sm text-neutral-400 font-medium tracking-wide">Restoring conversation...</p></div><chat-message v-for="msg in messages" :key="msg.id" :msg="msg" :edit-state="editState" :filter-no-image="convoParams.hideVariantsNoImage" @update:edit-state="editState = $event" @open-lightbox="lightboxSrc = $event" @request-edit-upload="openEditFile()"></chat-message></div><div class="shrink-0 border-t border-white/10 p-3 bg-base-100/10"><div v-if="pendingImages.length" class="flex flex-wrap gap-1.5 mb-2.5 p-2 glass-nested rounded-xl"><image-preview-card v-for="(img, idx) in pendingImages" :key="idx" :src="imgSrc(img)" @close="removePendingImage(idx)"></image-preview-card></div><div class="flex-row-gap"><icon-btn icon="attach_file" @click="openFile()" color="btn-ghost text-neutral-500 hover:text-white border-white/10" class="shrink-0" title="Upload image(s)"/><textarea ref="promptInputEl" @keydown="onKeydown" @input="autoResize" @paste="onPaste" :disabled="generating" placeholder="Describe an image to generate... (Enter to send, Shift+Enter for new line)" class="textarea textarea-bordered flex-1 text-sm resize-none min-h-[42px] leading-normal bg-base-100/30 focus:outline-none focus:border-primary/60 transition-colors" rows="1" style="overflow-y:hidden;height:42px"></textarea><toggle-btn :model-value="generating" icon="send" icon-off="stop" active-class="btn-error" inactive-class="btn-primary" :disabled="!generating && !hasApiKey" size="btn-square shrink-0 transition-colors shadow-sm" @update:model-value="generating ? abort() : doSend()"></toggle-btn></div></div></template></split-pane><teleport to="body"><transition name="fade"><div v-if="lightboxSrc" class="fixed inset-0 z-[500] flex flex-col items-center justify-center p-6" style="background:rgba(5,4,3,0.93);backdrop-filter:blur(6px)" @click.self="lightboxSrc = null"><icon-btn icon="close" @click="lightboxSrc = null" class="absolute top-4 right-4 text-neutral-300 hover:text-white hover:bg-white/10" style="z-index:1" circle/><img :src="lightboxSrc" class="max-w-[94vw] max-h-[80vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" @click.stop><div class="flex gap-3 mt-5"><button @click="downloadImage(lightboxSrc)" class="btn btn-sm gap-1.5 bg-white/10 text-white border-white/15 hover:bg-white/20"><material-icon icon="download" :size="15"/>Download </button></div></div></transition></teleport>`
         };
         const Settings = {
             setup() {
@@ -1804,7 +1799,7 @@ const TagCountBadge={
                     const _debouncedAutoSync = useDebounceFn(() => {
                         const js = config.value.jssync;
                         if (!syncToken.value || !js.proxyUrl) return;
-                        syncStore.queueSync();
+                        syncStore.markConfigDirty();
                     }, 2000);
                     watch(
                         () => {

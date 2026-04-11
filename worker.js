@@ -15,6 +15,11 @@ function decTitle(encoded) {
   try { return decodeURIComponent(encoded); } catch { return encoded; }
 }
 
+function makeEntry(id, meta) {
+  const ts = Number(meta?.timestamp);
+  return { id, title: meta?.title ? decTitle(meta.title) : 'Cloud Chat', timestamp: Number.isFinite(ts) ? ts : Date.now() };
+}
+
 function corsJson(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -73,27 +78,21 @@ async function readIndex(env) {
     const list = await env.BUCKET.list({
       prefix: 'conversations/',
       delimiter: '/',
-      ...(cursor ? { cursor } : {}),
+      ...(cursor && { cursor }),
     });
     for (const prefix of list.delimitedPrefixes || []) {
       const id = prefix.replace('conversations/', '').replace(/\/$/, '');
       if (id) ids.push(id);
     }
-    cursor = list.truncated ? list.cursor : null;
+    cursor = list.truncated && list.cursor;
   } while (cursor);
-  const BATCH_SIZE = 50;
   const convos = [];
-  for (let i = 0; i < ids.length; i += BATCH_SIZE) {
-    const batch = ids.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < ids.length; i += 50) {
+    const batch = ids.slice(i, i + 50);
     const results = await Promise.all(batch.map(async (id) => {
       try {
         const head = await env.BUCKET.head(`conversations/${id}/conversation.json`);
-        if (!head) return null;
-        const meta = head.customMetadata || {};
-        let title = 'Cloud Chat';
-        if (meta.title) title = decTitle(meta.title);
-        const ts = Number(meta.timestamp);
-        return { id, title, timestamp: Number.isFinite(ts) ? ts : Date.now() };
+        return head ? makeEntry(id, head.customMetadata) : null;
       } catch { return null; }
     }));
     convos.push(...results.filter(Boolean));
@@ -175,23 +174,22 @@ async function handleR2(request, env, url) {
         putOptions
       );
       const index = await readIndex(env);
-      const parsedTimestamp = timestampHeader != null && timestampHeader !== '' ? +timestampHeader : NaN;
-      const entry = { id: convoId, title: titleHeader ? decTitle(titleHeader) : 'Cloud Chat', timestamp: Number.isFinite(parsedTimestamp) ? parsedTimestamp : Date.now() };
+      const entry = makeEntry(convoId, { title: titleHeader, timestamp: timestampHeader });
       const idx = index.findIndex(e => e.id === convoId);
       if (idx !== -1) index[idx] = entry; else index.push(entry);
       await writeIndex(env, index);
-      return corsResponse('OK', 200, putResult?.httpEtag ? { 'ETag': putResult.httpEtag } : {});
+      return corsResponse('OK', 200, putResult?.httpEtag && { 'ETag': putResult.httpEtag });
     }
     if (request.method === 'DELETE') {
       let cursor;
       do {
         const list = await env.BUCKET.list({
           prefix: `conversations/${convoId}/`,
-          ...(cursor ? { cursor } : {}),
+          ...(cursor && { cursor }),
         });
         const keys = list.objects.map(o => o.key);
         if (keys.length) await env.BUCKET.delete(keys);
-        cursor = list.truncated ? list.cursor : null;
+        cursor = list.truncated && list.cursor;
       } while (cursor);
       const index = await readIndex(env);
       const filtered = index.filter(e => e.id !== convoId);
@@ -213,7 +211,7 @@ async function handleR2(request, env, url) {
     do {
       const list = await env.BUCKET.list(cursor ? { cursor } : {});
       for (const obj of list.objects) { totalSize += obj.size; objectCount++; }
-      cursor = list.truncated ? list.cursor : null;
+      cursor = list.truncated && list.cursor;
     } while (cursor);
     return corsJson({ totalBytes: totalSize, objectCount });
   }
