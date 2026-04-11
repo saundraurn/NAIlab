@@ -830,7 +830,7 @@ const TagCountBadge={
                         if (aborted || error) return error && toast.err(error, 'danbooru');
                         const bl = _.compact((blacklist.value||'').split(',').map(t => t.trim())), results = data.filter(p => p.large_file_url && !p.is_banned && p.image_width > 0 && /png|jpe?g|gif/.test(p.file_ext) && !bl.some(b => (p.tag_string||'').includes(b)) && (!clientFilters.length || clientFilters.every(f => (` ${p.tag_string||''} `).includes(` ${f} `))));
                         results.forEach(p => TAG_CATEGORIES.forEach(t => splitTagString(p[`tag_string_${t}`]).forEach(tag => { if (tag && !naiTagKnowledge.value[tag] && !queuedTags.has(tag)) { tagQueues[t === 'artist' ? 'danbooru' : 'nai'].push(tag); queuedTags.add(tag); processQueues(); } })));
-                        posts.value = append ? posts.value.concat(results) : results; hasMorePages.value = data.length >= (tags.includes('|') ? (DANBOORU_LIMIT / 2) : DANBOORU_LIMIT); pageNum.value = page; currentSearchTags.value = tags;
+                        posts.value = append ? _.uniqBy(posts.value.concat(results), 'id') : results; hasMorePages.value = data.length >= (tags.includes('|') ? (DANBOORU_LIMIT / 2) : DANBOORU_LIMIT); pageNum.value = page; currentSearchTags.value = tags;
                         if (page === 1) toast.ok(`Found ${results.length} posts.`, 'danbooru', 2000);
                     }
                 });
