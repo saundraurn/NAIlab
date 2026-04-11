@@ -253,7 +253,7 @@
                 _mem.set(imageId, webpBytes);
                 return { imageId, base64: uint8ArrayToBase64(webpBytes), webpBytes };
             };
-            const loadImage = async (imageId) => { const b = await opfs.read(imageId); return b ?? (_mem.get(imageId) || null); };
+            const loadImage = async (imageId) => { const b = await opfs.read(imageId); return b ?? _mem.get(imageId) ?? null; };
             const loadImageAsBase64 = async (imageId) => { const bytes = await loadImage(imageId); return bytes ? uint8ArrayToBase64(bytes) : null; };
             const collectImageIds = (d) => new Set((d.messages || []).flatMap(m => [
                 ...(m.images||[]).flatMap(i => i.imageId ? [i.imageId] : []),
@@ -374,9 +374,6 @@
                 cfg.jssync.lastSyncedAt = Date.now();
             };
             const awaitPush = () => (_pushRunning || _pushTimer) ? new Promise(r => _pushDoneResolvers.push(r)) : Promise.resolve();
-            const _finalizePush = (cfg) => {
-                cfg.jssync.lastSyncedAt = Date.now();
-            };
             const withFlag = (f, fn) => { f.value = true; return Promise.resolve().then(fn).finally(() => { f.value = false; }); };
             const withSyncMerge = (fn) => withFlag(appStore.isSyncMerging, fn);
             const _applySectionDict = (cfg, dict) => {
@@ -552,7 +549,7 @@
                     const tombstonesToDelete = tombstones.filter(t => t.deletedAt > lastSynced);
                     await _pool(tombstonesToDelete, t => r2Client.r2Fetch('DELETE', `conversations/${t.id}`).catch(() => {}));
                     if (dirtyMetas.length || tombstonesToDelete.length) _listEtag.value = null;
-                    _finalizePush(cfg);
+                    cfg.jssync.lastSyncedAt = Date.now();
                     syncStatus.value = 'idle';
                     if (!silent) toast.ok('Config synced to cloud.', 'sync', 2500);
                 } catch (e) {
@@ -832,7 +829,7 @@ const TagCountBadge={
                 const executeSearch = (query) => {
                     lastFetchedQuery.value = query; let effective = query || '', apiTags, clientFilters = [];
                     if ((effective).includes('|')) apiTags = effective.split('|').map(p => _.compact(p.split(/\s*,\s*/).map(t => t.trim().replace(/\s+/g, '_'))).join(' ')).join('|');
-                    else { const tags = _.compact((effective).split(/\s*,\s*/).map(tag => tag.trim().replace(/\s+/g, '_'))); apiTags = _.take(tags, 2).join(' '); clientFilters = tags.slice(2); }
+                    else { const tags = _.compact((effective).split(/\s*,\s*/).map(tag => tag.trim().replace(/\s+/g, '_'))); apiTags = tags.slice(0, 2).join(' '); clientFilters = tags.slice(2); }
                     fetchPosts(apiTags, 1, false, clientFilters);
                 };
                 watch(() => route.query.q, (q) => {
@@ -869,7 +866,7 @@ const TagCountBadge={
                     delete: (item) => (_.pull(savedSearches.value, item), toast.info(`Deleted "${item.name}".`, 'danbooru')),
                 };
                 const savedSearchAction = (action, item) => _savedSearchActions[action]?.(item);
-                const addTagToSearch = (t) => searchQueryInput.value = _.uniq([..._.compact((searchQueryInput.value||'').split(',').map(x => x.trim())), t.replace(/_/g, ' ')]).join(', ');
+                const addTagToSearch = (t) => searchQueryInput.value = [...new Set([..._.compact((searchQueryInput.value||'').split(',').map(x => x.trim())), t.replace(/_/g, ' ')])].join(', ');
                 const searchSingleTag = (t) => (searchQueryInput.value = t.replace(/_/g, ' '), search());
                 const toggleTagInSearch = (tag, searchItem) => { const raw = tag.replace(/ /g, '_'), p = searchItem.prompt || ''; if (p.includes('|')) { searchItem.prompt = _.xorBy(_.compact(p.split('|').map(x => x.trim())), [raw], _.toLower).join(' | '); } else { const r = new RegExp(`(^|\\s)${_.escapeRegExp(raw)}($|\\s)`, 'i'); searchItem.prompt = r.test(p) ? p.replace(r, ' ').trim() : (p ? `${p} | ${raw}` : raw); } toast.ok(`Updated "${searchItem.name}"`, 'danbooru', 1000); };
                 useInfiniteScroll(rightPanelRef, () => _.some(ratingFilters.value) && !isLoading.value && hasMorePages.value && gridRoutes.includes(route.name) && fetchPosts(currentSearchTags.value, pageNum.value + 1, true, execute.args?.[3] || []), {distance: 1000});
@@ -1007,11 +1004,9 @@ const TagCountBadge={
             return Promise.all((serializedData.messages || []).map(async (msg) => {
                 const { images: rawImages, variants: rawVariants, ...dMsg } = msg;
                 if (rawImages?.length) {
-                    dMsg.images = await Promise.all(rawImages.map(async (img) => {
-                        const dImg = { ...img };
-                        if (dImg.imageId) dImg.data = await loadCached(dImg.imageId);
-                        return dImg;
-                    }));
+                    dMsg.images = await Promise.all(rawImages.map(async (img) =>
+                        img.imageId ? { ...img, data: await loadCached(img.imageId) } : img
+                    ));
                 }
                 if (rawVariants?.length) {
                     dMsg.variants = await Promise.all(rawVariants.map(async (v) => {
@@ -1027,10 +1022,9 @@ const TagCountBadge={
                             }
                             return part;
                         }));
-                        dV._images = await Promise.all((rawVImages || []).map(async (img) => {
-                            if (img.imageId) return { ...img, data: await loadCached(img.imageId) };
-                            return img;
-                        }));
+                        dV._images = await Promise.all((rawVImages || []).map(async (img) =>
+                            img.imageId ? { ...img, data: await loadCached(img.imageId) } : img
+                        ));
                         dV._model = v._model || _FM;
                         dV._flexInference = !!v._flexInference;
                         dV._genTimeMs = v._genTimeMs || null;
@@ -1188,11 +1182,11 @@ const TagCountBadge={
                 return setVarError(v, message || 'Unknown error'), toast.err(message || 'Generation failed'), false;
             };
             const _saveConvoDirect = async (convo) => {
-                if (!convo?.messages?.length || !_findMeta(convo.id)) return;
+                const meta = convo?.messages?.length && _findMeta(convo.id);
+                if (!meta) return;
                 try {
                     await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params);
-                    const meta = _findMeta(convo.id);
-                    meta && (meta.timestamp = Date.now());
+                    meta.timestamp = Date.now();
                 } catch (e) { console.warn('Auto-save failed:', e); }
             };
             const _pruneBananaThinkingStates = (msgIds) => {
@@ -1480,21 +1474,19 @@ const TagCountBadge={
                 const syncedSet = new Set(_syncedR2Images.value[convoId] || []);
                 const newImages = [...imageIds].filter(id => !syncedSet.has(id));
                 const orphaned = [...syncedSet].filter(id => !imageIds.has(id));
-                const uploaded = new Set();
                 await Promise.all([
                     _pool(newImages, async (imgId) => {
                         try {
                             const imgData = await opfs.read(imgId);
                             if (imgData) {
                                 await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
-                                uploaded.add(imgId);
+                                syncedSet.add(imgId);
                             }
                         } catch {}
                     }),
-                    _pool(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}))
+                    _pool(orphaned, name => { syncedSet.delete(name); return r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}); })
                 ]);
-                const nowSynced = [...imageIds].filter(id => syncedSet.has(id) || uploaded.has(id));
-                _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: nowSynced };
+                _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: [...syncedSet].filter(id => imageIds.has(id)) };
             };
             const _syncConversationToR2 = async (id) => {
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
@@ -1512,12 +1504,13 @@ const TagCountBadge={
             };
 
             const syncConversationNow = async (id) => {
+                const sync = useSyncStore();
                 if (!cloudConversations.value[id]) {
                     convoSyncStatus[id] = 'syncing';
                     try {
                         _markCloud(id);
                         await _syncConversationToR2(id);
-                        await useSyncStore().push(true);
+                        await sync.push(true);
                         convoSyncStatus[id] = 'synced';
                         toast.q('Synced to cloud');
                     } catch (e) {
@@ -1528,8 +1521,7 @@ const TagCountBadge={
                     return;
                 }
                 convoSyncStatus[id] = 'pending';
-                useSyncStore().markConvoDirty(id);
-                const sync = useSyncStore();
+                sync.markConvoDirty(id);
                 await sync._flushPush();
                 await sync.awaitPush();
                 const status = convoSyncStatus[id];
