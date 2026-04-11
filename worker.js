@@ -6,12 +6,7 @@ const CORS_HEADERS = {
   'Access-Control-Max-Age': '86400',
 };
 
-const NO_CACHE_HEADERS = {
-  'Cache-Control': 'no-store, no-cache, must-revalidate',
-  'Pragma': 'no-cache',
-};
-
-const BASE_HEADERS = { ...CORS_HEADERS, ...NO_CACHE_HEADERS };
+const BASE_HEADERS = { ...CORS_HEADERS, 'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache' };
 const JSON_HEADERS = { ...BASE_HEADERS, 'Content-Type': 'application/json' };
 const CONVO_RE = /^conversations\/([^/]+)$/;
 const IMG_RE = /^conversations\/([^/]+)\/images\/([^/]+)$/;
@@ -29,6 +24,37 @@ function corsJson(data, status = 200, extraHeaders = {}) {
 
 function corsResponse(body, status = 200, extra = {}) {
   return new Response(body, { status, headers: { ...CORS_HEADERS, ...extra } });
+}
+
+function etagCheck(obj, request, headers) {
+  const etag = obj.httpEtag;
+  const ifNoneMatch = request.headers.get('If-None-Match');
+  if (etag && ifNoneMatch && etag === ifNoneMatch) {
+    return new Response(null, { status: 304, headers: BASE_HEADERS });
+  }
+  if (etag) headers['ETag'] = etag;
+  return null;
+}
+
+async function handleCrud(request, env, key, contentType) {
+  if (request.method === 'GET') {
+    const obj = await env.BUCKET.get(key);
+    if (!obj) return corsResponse('Not found', 404);
+    return new Response(obj.body, {
+      headers: { ...CORS_HEADERS, 'Content-Type': obj.httpMetadata?.contentType || contentType },
+    });
+  }
+  if (request.method === 'PUT') {
+    await env.BUCKET.put(key, request.body, {
+      httpMetadata: { contentType: request.headers.get('Content-Type') || contentType },
+    });
+    return corsResponse('OK');
+  }
+  if (request.method === 'DELETE') {
+    await env.BUCKET.delete(key);
+    return corsResponse('OK');
+  }
+  return null;
 }
 
 // ── Conversation index helpers ──────────────────────────────────────────────
@@ -91,13 +117,9 @@ async function handleR2(request, env, url) {
     if (request.method === 'GET') {
       const obj = await env.BUCKET.get('config.json');
       if (!obj) return corsJson({});
-      const etag = obj.httpEtag;
-      const ifNoneMatch = request.headers.get('If-None-Match');
-      if (etag && ifNoneMatch && etag === ifNoneMatch) {
-        return new Response(null, { status: 304, headers: BASE_HEADERS });
-      }
       const headers = { ...JSON_HEADERS };
-      if (etag) headers['ETag'] = etag;
+      const cached = etagCheck(obj, request, headers);
+      if (cached) return cached;
       return new Response(obj.body, { headers });
     }
     if (request.method === 'PUT') {
@@ -112,21 +134,14 @@ async function handleR2(request, env, url) {
   if (path === 'conversations' && request.method === 'GET') {
     const obj = await env.BUCKET.get('conversations/index.json');
     if (obj) {
-      const etag = obj.httpEtag;
-      const ifNoneMatch = request.headers.get('If-None-Match');
-      if (etag && ifNoneMatch && etag === ifNoneMatch) {
-        return new Response(null, { status: 304, headers: BASE_HEADERS });
-      }
+      const headers = { ...JSON_HEADERS };
+      const cached = etagCheck(obj, request, headers);
+      if (cached) return cached;
       let data;
       try { data = await obj.json(); } catch {}
-      if (Array.isArray(data)) {
-        const headers = { ...JSON_HEADERS };
-        if (etag) headers['ETag'] = etag;
-        return new Response(JSON.stringify(data), { headers });
-      }
+      if (Array.isArray(data)) return new Response(JSON.stringify(data), { headers });
     }
-    const data = await readIndex(env);
-    return corsJson(data);
+    return corsJson(await readIndex(env));
   }
 
   // ── Single conversation (JSON) ───────────────────────────────────────────
@@ -136,13 +151,9 @@ async function handleR2(request, env, url) {
     if (request.method === 'GET') {
       const obj = await env.BUCKET.get(`conversations/${convoId}/conversation.json`);
       if (!obj) return corsResponse('Not found', 404);
-      const etag = obj.httpEtag;
-      const ifNoneMatch = request.headers.get('If-None-Match');
-      if (etag && ifNoneMatch && etag === ifNoneMatch) {
-        return new Response(null, { status: 304, headers: BASE_HEADERS });
-      }
       const headers = { ...JSON_HEADERS };
-      if (etag) headers['ETag'] = etag;
+      const cached = etagCheck(obj, request, headers);
+      if (cached) return cached;
       const cm = obj.customMetadata || {};
       if (cm.title) headers['X-Convo-Title'] = cm.title;
       if (cm.timestamp) headers['X-Convo-Timestamp'] = cm.timestamp;
@@ -153,28 +164,22 @@ async function handleR2(request, env, url) {
       const timestampHeader = request.headers.get('X-Convo-Timestamp');
       const putOptions = { httpMetadata: { contentType: 'application/json' } };
       if (titleHeader || timestampHeader) {
-        const customMetadata = {};
-        if (titleHeader) customMetadata.title = titleHeader;
-        if (timestampHeader) customMetadata.timestamp = timestampHeader;
-        putOptions.customMetadata = customMetadata;
+        putOptions.customMetadata = {
+          ...(titleHeader && {title: titleHeader}),
+          ...(timestampHeader && {timestamp: timestampHeader})
+        };
       }
       const putResult = await env.BUCKET.put(
         `conversations/${convoId}/conversation.json`,
         request.body,
         putOptions
       );
-      // Update conversation index (last-write-wins; single-user app, so concurrent writes are acceptable)
       const index = await readIndex(env);
-      let title = 'Cloud Chat';
-      if (titleHeader) title = decTitle(titleHeader);
-      const ts = Number(timestampHeader);
-      const entry = { id: convoId, title, timestamp: Number.isFinite(ts) ? ts : Date.now() };
+      const entry = { id: convoId, title: titleHeader ? decTitle(titleHeader) : 'Cloud Chat', timestamp: Number.isFinite(+timestampHeader) ? +timestampHeader : Date.now() };
       const idx = index.findIndex(e => e.id === convoId);
       if (idx !== -1) index[idx] = entry; else index.push(entry);
       await writeIndex(env, index);
-      const putExtra = {};
-      if (putResult?.httpEtag) putExtra['ETag'] = putResult.httpEtag;
-      return corsResponse('OK', 200, putExtra);
+      return corsResponse('OK', 200, putResult?.httpEtag ? { 'ETag': putResult.httpEtag } : {});
     }
     if (request.method === 'DELETE') {
       let cursor;
@@ -187,7 +192,6 @@ async function handleR2(request, env, url) {
         if (keys.length) await env.BUCKET.delete(keys);
         cursor = list.truncated ? list.cursor : null;
       } while (cursor);
-      // Remove from conversation index (last-write-wins; single-user app, so concurrent writes are acceptable)
       const index = await readIndex(env);
       const filtered = index.filter(e => e.id !== convoId);
       if (filtered.length !== index.length) await writeIndex(env, filtered);
@@ -198,38 +202,16 @@ async function handleR2(request, env, url) {
   // ── Conversation images ──────────────────────────────────────────────────
   const imgMatch = path.match(IMG_RE);
   if (imgMatch) {
-    const [, convoId, imageId] = imgMatch;
-    const key = `conversations/${convoId}/${imageId}`;
-    if (request.method === 'GET') {
-      const obj = await env.BUCKET.get(key);
-      if (!obj) return corsResponse('Not found', 404);
-      return new Response(obj.body, {
-        headers: { ...CORS_HEADERS, 'Content-Type': obj.httpMetadata?.contentType || 'image/webp' },
-      });
-    }
-    if (request.method === 'PUT') {
-      await env.BUCKET.put(key, request.body, {
-        httpMetadata: { contentType: request.headers.get('Content-Type') || 'image/webp' },
-      });
-      return corsResponse('OK');
-    }
-    if (request.method === 'DELETE') {
-      await env.BUCKET.delete(key);
-      return corsResponse('OK');
-    }
+    const res = await handleCrud(request, env, `conversations/${imgMatch[1]}/${imgMatch[2]}`, 'image/webp');
+    if (res) return res;
   }
 
   // ── Storage usage ──────────────────────────────────────────────────────────
   if (path === 'usage' && request.method === 'GET') {
-    let totalSize = 0;
-    let objectCount = 0;
-    let cursor;
+    let totalSize = 0, objectCount = 0, cursor;
     do {
       const list = await env.BUCKET.list(cursor ? { cursor } : {});
-      for (const obj of list.objects) {
-        totalSize += obj.size;
-        objectCount++;
-      }
+      for (const obj of list.objects) { totalSize += obj.size; objectCount++; }
       cursor = list.truncated ? list.cursor : null;
     } while (cursor);
     return corsJson({ totalBytes: totalSize, objectCount });
