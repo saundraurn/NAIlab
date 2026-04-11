@@ -301,57 +301,67 @@
             };
             return { r2Fetch, getWorkerUrl, getSecret };
         });
-        const useSyncQueue = createGlobalState(() => {
-            const _queue = reactive([]);
-            const _running = ref(false);
-            let _timer = null;
-            const _BATCH_DELAY = 300;
-            const _MIN_INTERVAL = 1200;
-            let _lastRunAt = 0;
-            const enqueue = (key, fn) => {
-                const existing = _queue.findIndex(q => q.key === key);
-                if (existing !== -1) _queue[existing].fn = fn;
-                else _queue.push({ key, fn });
-                _scheduleRun();
-            };
-            const _scheduleRun = () => {
-                if (_running.value || _timer) return;
-                const elapsed = Date.now() - _lastRunAt;
-                const wait = Math.max(_BATCH_DELAY, _MIN_INTERVAL - elapsed);
-                _timer = setTimeout(_processQueue, wait);
-            };
-            const _processQueue = async () => {
-                _timer = null;
-                if (_running.value || !_queue.length) return;
-                _running.value = true;
-                try {
-                    while (_queue.length) {
-                        const batch = _queue.splice(0);
-                        const errors = [];
-                        for (const item of batch) {
-                            try { await item.fn(); }
-                            catch (e) { errors.push({ key: item.key, error: e }); console.warn(`Sync queue error [${item.key}]:`, e); }
-                        }
-                        _lastRunAt = Date.now();
-                        if (errors.length) {
-                            const failed = errors.map(e => e.key).join(', ');
-                            toast.warn(`Sync failed for: ${failed}`, 'sync', 4000);
-                        }
-                    }
-                } finally { _running.value = false; if (_queue.length) _scheduleRun(); }
-            };
-            const isRunning = computed(() => _running.value);
-            const pending = computed(() => _queue.length);
-            return { enqueue, isRunning, pending };
-        });
         const useSyncStore = createGlobalState(() => {
             const isSyncing = ref(false);
             const syncError = ref(null);
             const syncStatus = ref('idle');
             const appStore = useAppStore();
             const r2Client = useR2Client();
-            const syncQueue = useSyncQueue();
             const TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+            // ── Unified dirty tracking & scheduling ──
+            const _dirtyConvos = new Set();
+            let _configDirty = false;
+            let _pushTimer = null;
+            let _pushRunning = false;
+            const _PUSH_DELAY = 1200;
+            const _isReady = () => !!(r2Client.getWorkerUrl() && r2Client.getSecret());
+            const markConvoDirty = (id) => { _dirtyConvos.add(id); _schedulePush(); };
+            const markConfigDirty = () => { _configDirty = true; _schedulePush(); };
+            const _schedulePush = () => {
+                if (!_isReady() || _pushRunning || _pushTimer) return;
+                _pushTimer = setTimeout(_runPush, _PUSH_DELAY);
+            };
+            const _runPush = async () => {
+                _pushTimer = null;
+                if (_pushRunning) return;
+                if (!_isReady()) return;
+                _pushRunning = true;
+                try {
+                    while (_configDirty || _dirtyConvos.size) {
+                        const pushConfig = _configDirty;
+                        _configDirty = false;
+                        const convoIds = [..._dirtyConvos];
+                        _dirtyConvos.clear();
+                        if (pushConfig) {
+                            try { await _pushConfigOnly(); }
+                            catch (e) { console.warn('Config auto-sync failed:', e); toast.warn('Config sync failed: ' + e.message, 'sync', 4000); }
+                        }
+                        if (convoIds.length) {
+                            const gemini = useGeminiAPI();
+                            await _pool(convoIds.filter(id => gemini.cloudConversations.value[id]), async (id) => {
+                                gemini.convoSyncStatus[id] = 'syncing';
+                                try {
+                                    await gemini.syncConversationToR2(id);
+                                    gemini.convoSyncStatus[id] = 'synced';
+                                } catch (e) {
+                                    gemini.convoSyncStatus[id] = 'error';
+                                    console.warn('Convo R2 sync failed:', e);
+                                }
+                            });
+                        }
+                    }
+                } finally { _pushRunning = false; if (_configDirty || _dirtyConvos.size) _schedulePush(); }
+            };
+            const _pushConfigOnly = async () => {
+                const cfg = appStore.config.value;
+                const tombstones = cfg.jssync._deletedConversationIds || [];
+                const payload = extractSyncPayload(cfg);
+                payload._deletedConversationIds = _pruneTombstones(tombstones);
+                await r2Client.r2Fetch('PUT', 'config', JSON.stringify(payload), { contentType: 'application/json' });
+                _configEtag.value = null;
+                cfg.jssync.lastSyncedAt = Date.now();
+            };
+            const getPushPromise = () => _pushRunning ? new Promise(resolve => { const check = () => _pushRunning ? setTimeout(check, 200) : resolve(); check(); }) : Promise.resolve();
             const _finalizePush = (cfg) => {
                 cfg.jssync.lastSyncedAt = Date.now();
             };
@@ -545,10 +555,7 @@
                     if (syncStatus.value === 'idle') await push(true);
                 });
             };
-            const queueSync = () => {
-                syncQueue.enqueue('config', syncNow);
-            };
-            return { isSyncing, syncStatus, syncError, pull, push, syncNow, queueSync };
+            return { isSyncing, syncStatus, syncError, pull, push, syncNow, markConfigDirty, markConvoDirty, getPushPromise };
         });
         const TAG_COLORS={artist:['badge-warning','bg-warning/20'],character:['badge-success','bg-success/20'],copyright:['badge-accent','bg-accent/20'],meta:['badge-info','bg-info/20'],default:['badge-primary','bg-primary/20']};
         const useDropdown=()=>{const isOpen=ref(false),root=ref(null);return{isOpen,root,close:()=>{isOpen.value=false;if(document.activeElement&&root.value?.contains(document.activeElement))document.activeElement.blur();}};};
@@ -1214,8 +1221,7 @@ const TagCountBadge={
                     if (!isViewingThis) store.incrementNotification('banana');
                     if (_findMeta(convo.id) && _isSyncReady()) {
                         _markCloud(convo.id);
-                        _r2SyncDirty.add(convo.id);
-                        _runR2Sync();
+                        useSyncStore().markConvoDirty(convo.id);
                     }
                 }
             };
@@ -1393,7 +1399,7 @@ const TagCountBadge={
                 }
                 if (conversationMap.has(id)) closeConversation(id);
                 deleteCloudConversation(id).catch(() => {});
-                _isSyncReady() && useSyncStore().push(true).catch(() => {});
+                _isSyncReady() && useSyncStore().markConfigDirty();
                 toast.q('Removed from saved chats');
                 imageStore.cleanupOrphanedImages(savedConversations.value).catch(() => {});
             };
@@ -1434,8 +1440,7 @@ const TagCountBadge={
                 if (!_isSyncReady()) return;
                 _markCloud(c.id);
                 if (convoSyncStatus[c.id] !== 'syncing') convoSyncStatus[c.id] = 'pending';
-                _r2SyncDirty.add(c.id);
-                _runR2Sync();
+                useSyncStore().markConvoDirty(c.id);
             }, 1500);
             watch(() => { const c = activeConvo.value; return c && _findMeta(c.id) && !c.generating ? c.messages : null; }, (msgs) => {
                 if (msgs) _autoSave();
@@ -1489,36 +1494,6 @@ const TagCountBadge={
                 const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
                 await _pushConvoToR2(id, raw, imageIds, metaPick);
             };
-            let _r2SyncInProgress = false;
-            let _r2SyncPromise = null;
-            const _r2SyncDirty = new Set();
-            const _runR2Sync = () => {
-                if (_r2SyncInProgress) return _r2SyncPromise || Promise.resolve();
-                _r2SyncInProgress = true;
-                _r2SyncPromise = (async () => {
-                    try {
-                        const ids = [..._r2SyncDirty];
-                        _r2SyncDirty.clear();
-                        await _pool(ids.filter(id => cloudConversations.value[id]), async (id) => {
-                            convoSyncStatus[id] = 'syncing';
-                            try {
-                                await _syncConversationToR2(id);
-                                convoSyncStatus[id] = 'synced';
-                            } catch (e) {
-                                convoSyncStatus[id] = 'error';
-                                console.warn('Convo R2 sync failed:', e);
-                                const title = _findMeta(id)?.title || id;
-                                toast.warn(`Auto-sync failed for "${title}": ${e.message}`, 'sync', 5000);
-                            }
-                        });
-                    } finally {
-                        _r2SyncInProgress = false;
-                        _r2SyncPromise = null;
-                        if (_r2SyncDirty.size) await _runR2Sync();
-                    }
-                })();
-                return _r2SyncPromise;
-            };
 
             const syncConversationNow = async (id) => {
                 if (!cloudConversations.value[id]) {
@@ -1537,16 +1512,12 @@ const TagCountBadge={
                     return;
                 }
                 convoSyncStatus[id] = 'pending';
-                _r2SyncDirty.add(id);
-                await _runR2Sync();
-                if (_r2SyncPromise) await Promise.race([
-                    _r2SyncPromise,
-                    new Promise(r => setTimeout(r, 120000))
-                ]);
+                useSyncStore().markConvoDirty(id);
+                await useSyncStore().getPushPromise();
                 const status = convoSyncStatus[id];
                 if (status === 'synced') toast.q('Synced to cloud');
                 else if (status === 'error') toast.err('Sync failed');
-                else toast.warn('Sync timed out — will retry automatically');
+                else toast.warn('Sync pending — will complete automatically');
             };
             const deleteCloudConversation = async (id) => {
                 if (!cloudConversations.value[id]) return;
@@ -1817,7 +1788,7 @@ const TagCountBadge={
                     const _debouncedAutoSync = useDebounceFn(() => {
                         const js = config.value.jssync;
                         if (!syncToken.value || !js.proxyUrl) return;
-                        syncStore.queueSync();
+                        syncStore.markConfigDirty();
                     }, 2000);
                     watch(
                         () => {
