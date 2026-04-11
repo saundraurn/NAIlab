@@ -1492,8 +1492,11 @@ const TagCountBadge={
             const _pushConvoToR2 = (convoId, convoJson, imageIds, meta) => {
                 const prev = _pushConvoR2Locks.get(convoId) || Promise.resolve();
                 const next = prev.then(() => _doPushConvoToR2(convoId, convoJson, imageIds, meta)).catch(() => {});
-                _pushConvoR2Locks.set(convoId, next);
-                return next;
+                const tracked = next.finally(() => {
+                    if (_pushConvoR2Locks.get(convoId) === tracked) _pushConvoR2Locks.delete(convoId);
+                });
+                _pushConvoR2Locks.set(convoId, tracked);
+                return tracked;
             };
             const _doPushConvoToR2 = async (convoId, convoJson, imageIds, meta) => {
                 const customHeaders = {};
