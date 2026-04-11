@@ -11,10 +11,19 @@ const NO_CACHE_HEADERS = {
   'Pragma': 'no-cache',
 };
 
+const BASE_HEADERS = { ...CORS_HEADERS, ...NO_CACHE_HEADERS };
+const JSON_HEADERS = { ...BASE_HEADERS, 'Content-Type': 'application/json' };
+const CONVO_RE = /^conversations\/([^/]+)$/;
+const IMG_RE = /^conversations\/([^/]+)\/images\/([^/]+)$/;
+
+function decTitle(encoded) {
+  try { return decodeURIComponent(encoded); } catch { return encoded; }
+}
+
 function corsJson(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'Content-Type': 'application/json', ...extraHeaders },
+    headers: { ...JSON_HEADERS, ...extraHeaders },
   });
 }
 
@@ -56,7 +65,7 @@ async function readIndex(env) {
         if (!head) return null;
         const meta = head.customMetadata || {};
         let title = 'Cloud Chat';
-        if (meta.title) { try { title = decodeURIComponent(meta.title); } catch { title = meta.title; } }
+        if (meta.title) title = decTitle(meta.title);
         const ts = Number(meta.timestamp);
         return { id, title, timestamp: Number.isFinite(ts) ? ts : Date.now() };
       } catch { return null; }
@@ -85,9 +94,9 @@ async function handleR2(request, env, url) {
       const etag = obj.httpEtag;
       const ifNoneMatch = request.headers.get('If-None-Match');
       if (etag && ifNoneMatch && etag === ifNoneMatch) {
-        return new Response(null, { status: 304, headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS } });
+        return new Response(null, { status: 304, headers: BASE_HEADERS });
       }
-      const headers = { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'Content-Type': 'application/json' };
+      const headers = { ...JSON_HEADERS };
       if (etag) headers['ETag'] = etag;
       return new Response(obj.body, { headers });
     }
@@ -106,12 +115,12 @@ async function handleR2(request, env, url) {
       const etag = obj.httpEtag;
       const ifNoneMatch = request.headers.get('If-None-Match');
       if (etag && ifNoneMatch && etag === ifNoneMatch) {
-        return new Response(null, { status: 304, headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS } });
+        return new Response(null, { status: 304, headers: BASE_HEADERS });
       }
       let data;
       try { data = await obj.json(); } catch {}
       if (Array.isArray(data)) {
-        const headers = { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'Content-Type': 'application/json' };
+        const headers = { ...JSON_HEADERS };
         if (etag) headers['ETag'] = etag;
         return new Response(JSON.stringify(data), { headers });
       }
@@ -121,7 +130,7 @@ async function handleR2(request, env, url) {
   }
 
   // ── Single conversation (JSON) ───────────────────────────────────────────
-  const convoMatch = path.match(/^conversations\/([^/]+)$/);
+  const convoMatch = path.match(CONVO_RE);
   if (convoMatch) {
     const convoId = convoMatch[1];
     if (request.method === 'GET') {
@@ -130,9 +139,9 @@ async function handleR2(request, env, url) {
       const etag = obj.httpEtag;
       const ifNoneMatch = request.headers.get('If-None-Match');
       if (etag && ifNoneMatch && etag === ifNoneMatch) {
-        return new Response(null, { status: 304, headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS } });
+        return new Response(null, { status: 304, headers: BASE_HEADERS });
       }
-      const headers = { ...CORS_HEADERS, ...NO_CACHE_HEADERS, 'Content-Type': 'application/json' };
+      const headers = { ...JSON_HEADERS };
       if (etag) headers['ETag'] = etag;
       const cm = obj.customMetadata || {};
       if (cm.title) headers['X-Convo-Title'] = cm.title;
@@ -157,7 +166,7 @@ async function handleR2(request, env, url) {
       // Update conversation index (last-write-wins; single-user app, so concurrent writes are acceptable)
       const index = await readIndex(env);
       let title = 'Cloud Chat';
-      if (titleHeader) { try { title = decodeURIComponent(titleHeader); } catch { title = titleHeader; } }
+      if (titleHeader) title = decTitle(titleHeader);
       const ts = Number(timestampHeader);
       const entry = { id: convoId, title, timestamp: Number.isFinite(ts) ? ts : Date.now() };
       const idx = index.findIndex(e => e.id === convoId);
@@ -187,7 +196,7 @@ async function handleR2(request, env, url) {
   }
 
   // ── Conversation images ──────────────────────────────────────────────────
-  const imgMatch = path.match(/^conversations\/([^/]+)\/images\/([^/]+)$/);
+  const imgMatch = path.match(IMG_RE);
   if (imgMatch) {
     const [, convoId, imageId] = imgMatch;
     const key = `conversations/${convoId}/${imageId}`;
