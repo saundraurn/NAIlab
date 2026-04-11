@@ -105,7 +105,7 @@
         const prepareGenConfig = (cfg) => (!cfg.isOpus || !cfg.shouldUseRandomOpusDimensions) ? {...cfg} : {...cfg, ..._.sample(OPUS_DIMENSIONS.filter(d => d.width <= cfg.width && d.height <= cfg.height))};
         const fmtAgo = ts => !ts ? 'never' : formatTimeAgo(new Date(ts));
         const _t=(msg,type,source,duration)=>useAppStore().addToast({msg,type,source,duration});
-        const toast={ok:(msg,src,dur=3000)=>_t(msg,'success',src,dur),err:(msg,src)=>_t(msg,'error',src),warn:(msg,src,dur=4000)=>_t(msg,'warning',src,dur),info:(msg,src,dur=3000)=>_t(msg,'info',src,dur),q:(msg,dur=2000)=>_t(msg,'success',undefined,dur)};
+        const _tf=(t,d)=>(m,s,dd)=>_t(m,t,s,dd??d);const toast={ok:_tf('success',3000),err:_tf('error'),warn:_tf('warning',4000),info:_tf('info',3000),q:(m,d=2000)=>_t(m,'success',undefined,d)};
         const splitTagString = (str) => _.compact((str || '').split(' '));
         const TAG_CATEGORIES = 'artist,copyright,character,general,meta'.split(',');
         const getPostTags = (post) => TAG_CATEGORIES.flatMap(type => splitTagString(post[`tag_string_${type}`]).map(name => ({name, type})));
@@ -134,14 +134,12 @@
         const _pool = async (arr, fn, n = 5) => { let i = 0; const w = async () => { while (i < arr.length) await fn(arr[i++]); }; await Promise.all(Array.from({length: Math.min(n, arr.length)}, w)); };
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
         const opfs = (() => {
-            let _r;
-            const r = async () => _r ??= await navigator.storage.getDirectory();
+            let _r, r = async () => _r ??= await navigator.storage.getDirectory();
             const gh = async (n, o) => (await r()).getFileHandle(n, o);
-            const gf = async n => (await gh(n)).getFile();
             return {
                 write: async (n, d) => { const w = await (await gh(n, {create:true})).createWritable(); await w.write(d); await w.close(); },
-                read: async (n) => { try { return new Uint8Array(await (await gf(n)).arrayBuffer()); } catch { return null; } },
-                readText: async (n) => { try { return await (await gf(n)).text(); } catch { return null; } },
+                read: async (n) => { try { return new Uint8Array(await (await (await gh(n)).getFile()).arrayBuffer()); } catch { return null; } },
+                readText: async (n) => { try { return await (await (await gh(n)).getFile()).text(); } catch { return null; } },
                 has: async (n) => { try { await gh(n); return true; } catch { return false; } },
                 remove: async (n) => { try { await (await r()).removeEntry(n); } catch {} },
                 keys: async () => Array.fromAsync((await r()).keys())
@@ -244,13 +242,13 @@
             opfs.write(_convoPath(id), JSON.stringify(params ? { messages, params } : { messages }));
         const _collectImageIds = (d) => {
             const s = new Set();
-            for (const m of d.messages || []) {
+            (d.messages || []).forEach(m => {
                 (m.images||[]).forEach(i => i.imageId && s.add(i.imageId));
-                for (const v of m.variants || []) {
+                (m.variants||[]).forEach(v => {
                     (v.parts||[]).forEach(p => p._imageRef && s.add(p._imageRef));
                     (v._images||[]).forEach(i => i.imageId && s.add(i.imageId));
-                }
-            }
+                });
+            });
             return s;
         };
         const useImageStore = createGlobalState(() => {
@@ -992,11 +990,7 @@ const TagCountBadge={
                                     if (v._images?.[inlineDataCount]) v._images[inlineDataCount].imageId = imageId;
                                 }
                                 inlineDataCount++;
-                                const sPart = { _imageRef: imageId, _mimeType: _WP };
-                                if (part.thought) sPart.thought = true;
-                                if (part.thoughtSignature) sPart.thoughtSignature = part.thoughtSignature;
-                                if (part.text) sPart.text = part.text;
-                                return sPart;
+                                return { _imageRef: imageId, _mimeType: _WP, ...(part.thought && {thought: true}), ...(part.thoughtSignature && {thoughtSignature: part.thoughtSignature}), ...(part.text && {text: part.text}) };
                             }
                             return { text: part.text || '', ...(part.thought ? { thought: true } : {}), ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}) };
                         }));
@@ -1013,7 +1007,7 @@ const TagCountBadge={
                             _model: v._model || _FM,
                             _flexInference: !!v._flexInference,
                             _genTimeMs: v._genTimeMs || null,
-                            _usage: v._usage ? Object.assign({promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0}, v._usage.candidatesTokensDetails && {candidatesTokensDetails: v._usage.candidatesTokensDetails}, v._usage.thoughtsTokenCount && {thoughtsTokenCount: v._usage.thoughtsTokenCount}) : null,
+                            _usage: v._usage ? {promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0, ...(v._usage.candidatesTokensDetails && {candidatesTokensDetails: v._usage.candidatesTokensDetails}), ...(v._usage.thoughtsTokenCount && {thoughtsTokenCount: v._usage.thoughtsTokenCount})} : null,
                             _error: v._error || null,
                             _blockReason: v._blockReason || null,
                             _isPromptBlock: !!v._isPromptBlock,
@@ -1224,7 +1218,7 @@ const TagCountBadge={
                 try {
                     await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params);
                     const meta = _findMeta(convo.id);
-                    if (meta) { meta.timestamp = Date.now(); }
+                    meta && (meta.timestamp = Date.now());
                 } catch (e) { console.warn('Auto-save failed:', e); }
             };
             const _pruneBananaThinkingStates = (msgIds) => {
@@ -1350,7 +1344,7 @@ const TagCountBadge={
                 try {
                     const res = await r2Client.r2Fetch('GET', `conversations/${convoId}`);
                     if (!res.ok) return null;
-                    const data = JSON.parse(await res.text());
+                    const data = await res.json();
                     const hTitle = res.headers.get('X-Convo-Title');
                     if (hTitle && !data.title) try { data.title = decodeURIComponent(hTitle); } catch { data.title = hTitle; }
                     const hTs = res.headers.get('X-Convo-Timestamp');
@@ -1482,15 +1476,13 @@ const TagCountBadge={
             const abort = () => { const convo = activeConvo.value; if (convo?.abortCtrl) convo.abortCtrl.abort(); };
             const _autoSave = useDebounceFn(() => {
                 const convo = activeConvo.value;
-                if (convo && !convo.isTemp && !convo.generating && !convo.isHydrating) {
-                    _saveConvoDirect(convo);
-                    if (_isSyncReady()) {
-                        _markCloud(convo.id);
-                        if (convoSyncStatus[convo.id] !== 'syncing') convoSyncStatus[convo.id] = 'pending';
-                        _r2SyncDirty.add(convo.id);
-                        _runR2Sync();
-                    }
-                }
+                if (!convo || convo.isTemp || convo.generating || convo.isHydrating) return;
+                _saveConvoDirect(convo);
+                if (!_isSyncReady()) return;
+                _markCloud(convo.id);
+                if (convoSyncStatus[convo.id] !== 'syncing') convoSyncStatus[convo.id] = 'pending';
+                _r2SyncDirty.add(convo.id);
+                _runR2Sync();
             }, 1500);
             watch(() => { const c = activeConvo.value; return c && !c.isTemp && !c.generating ? c.messages : null; }, (msgs) => {
                 if (msgs) _autoSave();
@@ -1499,11 +1491,8 @@ const TagCountBadge={
             const _pushConvoR2Locks = new Map();
             const _pushConvoToR2 = (convoId, convoJson, imageIds, meta) => {
                 const prev = _pushConvoR2Locks.get(convoId) || Promise.resolve();
-                const next = prev.then(() => _doPushConvoToR2(convoId, convoJson, imageIds, meta));
-                const lock = next.catch(() => {}).finally(() => {
-                    if (_pushConvoR2Locks.get(convoId) === lock) _pushConvoR2Locks.delete(convoId);
-                });
-                _pushConvoR2Locks.set(convoId, lock);
+                const next = prev.then(() => _doPushConvoToR2(convoId, convoJson, imageIds, meta)).catch(() => {});
+                _pushConvoR2Locks.set(convoId, next);
                 return next;
             };
             const _doPushConvoToR2 = async (convoId, convoJson, imageIds, meta) => {
@@ -1511,22 +1500,22 @@ const TagCountBadge={
                 if (meta?.title) customHeaders['X-Convo-Title'] = encodeURIComponent(meta.title);
                 if (meta?.timestamp) customHeaders['X-Convo-Timestamp'] = String(meta.timestamp);
                 await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json', customHeaders });
-                const syncedArr = _syncedR2Images.value[convoId] || [];
-                const syncedSet = new Set(syncedArr);
+                const syncedSet = new Set(_syncedR2Images.value[convoId] || []);
                 const newImages = [...imageIds].filter(id => !syncedSet.has(id));
+                const orphaned = [...syncedSet].filter(id => !imageIds.has(id));
                 const uploaded = new Set();
-                await _pool(newImages, async (imgId) => {
-                    try {
-                        const imgData = await opfs.read(imgId);
-                        if (imgData) {
-                            await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
-                            uploaded.add(imgId);
-                        }
-                    } catch {}
-                });
-                const orphaned = syncedArr.filter(id => !imageIds.has(id));
-                await _pool(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}));
-                // Only persist IDs that are confirmed in R2: previously synced (still current) + newly uploaded
+                await Promise.all([
+                    _pool(newImages, async (imgId) => {
+                        try {
+                            const imgData = await opfs.read(imgId);
+                            if (imgData) {
+                                await r2Client.r2Fetch('PUT', `conversations/${convoId}/images/${imgId}`, imgData, { contentType: 'image/webp' });
+                                uploaded.add(imgId);
+                            }
+                        } catch {}
+                    }),
+                    _pool(orphaned, name => r2Client.r2Fetch('DELETE', `conversations/${convoId}/images/${name}`).catch(() => {}))
+                ]);
                 const nowSynced = [...imageIds].filter(id => syncedSet.has(id) || uploaded.has(id));
                 _syncedR2Images.value = { ..._syncedR2Images.value, [convoId]: nowSynced };
             };
@@ -1608,8 +1597,7 @@ const TagCountBadge={
                     return;
                 }
                 _unmarkCloud(id);
-                const restSync = { ..._syncedR2Images.value };
-                delete restSync[id];
+                const {[id]: _, ...restSync} = _syncedR2Images.value;
                 _syncedR2Images.value = restSync;
                 delete convoSyncStatus[id];
             };
