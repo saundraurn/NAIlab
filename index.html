@@ -1699,7 +1699,7 @@ const TagCountBadge={
                     const openIds = new Set(conversationMap.keys());
                     return _.orderBy((savedConversations.value || []).filter(c => !openIds.has(c.id)), 'timestamp', 'desc');
                 });
-                const handleRename = (convo, t) => { if (!t?.trim()) return; savedConversations.value.some(s => s.id === convo.id) ? renameConversation(convo.id, t) : saveConversation(convo.id, t); };
+                const handleRename = (convo, t) => { if (!t?.trim()) return; savedIds.value.has(convo.id) ? renameConversation(convo.id, t) : saveConversation(convo.id, t); };
                 const allHiddenFromModel = computed(() => messages.value.length > 0 && messages.value.every(m => m.hidden));
                 const hasNoImageMessages = computed(() => {
                     const genMsgId = activeConvo.value?.generatingMsgId;
