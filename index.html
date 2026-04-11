@@ -142,7 +142,7 @@
                 readText: async (n) => { try { return await (await (await gh(n)).getFile()).text(); } catch { return null; } },
                 has: async (n) => { try { await gh(n); return true; } catch { return false; } },
                 remove: async (n) => { try { await (await r()).removeEntry(n); } catch {} },
-                keys: async () => Array.fromAsync((await r()).keys())
+                keys: async () => { try { return Array.fromAsync((await r()).keys()); } catch { return []; } }
             };
         })();
         const useAppStore = createGlobalState(() => {
@@ -252,7 +252,9 @@
             return s;
         };
         const useImageStore = createGlobalState(() => {
-            const saveImage = (imageId, data) => opfs.write(imageId, data);
+            const _mem = new Map(); // in-memory fallback when OPFS is unavailable (e.g. file:// security)
+            const saveImage = async (imageId, data) => { try { await opfs.write(imageId, data); } catch { _mem.set(imageId, data); } };
+            const cacheImage = (imageId, data) => _mem.set(imageId, data);
             const ingestImage = async (input) => {
                 let webpBytes;
                 if (input instanceof Blob) {
@@ -267,9 +269,10 @@
                 }
                 const imageId = `img_${uid()}.webp`;
                 await saveImage(imageId, webpBytes);
+                _mem.set(imageId, webpBytes);
                 return { imageId, base64: uint8ArrayToBase64(webpBytes), webpBytes };
             };
-            const loadImage = async (imageId) => opfs.read(imageId);
+            const loadImage = async (imageId) => { const b = await opfs.read(imageId); return b ?? (_mem.get(imageId) || null); };
             const cleanupOrphanedImages = async (savedConvosList) => {
                 const referenced = new Set();
                 await _pool(savedConvosList || [], async (meta) => {
@@ -284,7 +287,7 @@
                     await _pool(orphaned, f => opfs.remove(f));
                 } catch {}
             };
-            return { saveImage, loadImage, ingestImage, cleanupOrphanedImages };
+            return { saveImage, loadImage, ingestImage, cacheImage, cleanupOrphanedImages };
         });
         const useR2Client = createGlobalState(() => {
             const appStore = useAppStore();
@@ -1366,7 +1369,8 @@ const TagCountBadge={
                             const res = await r2Client.r2Fetch('GET', `conversations/${convoId}/images/${imgId}`);
                             if (res?.status !== 404) {
                                 const data = new Uint8Array(await res.arrayBuffer());
-                                await opfs.write(imgId, data);
+                                imageStore.cacheImage(imgId, data);
+                                await opfs.write(imgId, data).catch(() => {});
                                 pulled.push(imgId);
                             }
                         } catch {}
@@ -1417,7 +1421,7 @@ const TagCountBadge={
                         return;
                     }
                     if (cloudConversations.value[id]) {
-                        await _pullMissingImagesFromR2(convoData, id);
+                        await _pullMissingImagesFromR2(convoData, id).catch(e => console.warn('Failed to pull images from R2:', e));
                     }
                     if (convoData.params) Object.assign(convo.params, convoData.params);
                     convo.messages = await deserializeConversation(convoData);
@@ -1525,7 +1529,10 @@ const TagCountBadge={
             const _syncConversationToR2 = async (id) => {
                 if (!r2Client.getWorkerUrl() || !r2Client.getSecret()) return;
                 const raw = await opfs.read(_convoPath(id));
-                if (!raw) throw new Error('Conversation data not found locally.');
+                if (!raw) {
+                    if (cloudConversations.value[id]) return; // already in R2, nothing to push
+                    throw new Error('Conversation data not found locally.');
+                }
                 let imageIds;
                 try { imageIds = _collectImageIds(JSON.parse(new TextDecoder().decode(raw))); }
                 catch { throw new Error('Conversation data corrupted locally.'); }
