@@ -132,7 +132,7 @@
         const _RETRY_CODES = new Set([429, 500, 502, 503, 504]);
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
-        const _pool = async (arr, fn, n = 5) => { let i = 0; const w = async () => { while (i < arr.length) await fn(arr[i++]); }; await Promise.all(Array.from({length: Math.min(n, arr.length)}, w)); };
+        const _pool = async (arr, fn, n = 5) => { let i = 0; const w = async () => { while (i < arr.length) await fn(arr[i++]); }; await Promise.all([...Array(Math.min(n, arr.length))].map(w)); };
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
         const opfs = (() => {
             let _r, r = async () => _r ??= await navigator.storage.getDirectory();
@@ -254,15 +254,19 @@
                 _mem.set(imageId, webpBytes);
                 return { imageId, base64: uint8ArrayToBase64(webpBytes), webpBytes };
             };
-            const loadImage = async (imageId) => { const b = await opfs.read(imageId); return b ?? _mem.get(imageId) ?? null; };
+            const loadImage = async (imageId) => await opfs.read(imageId) ?? _mem.get(imageId);
             const loadImageAsBase64 = async (imageId) => { const bytes = await loadImage(imageId); return bytes ? uint8ArrayToBase64(bytes) : null; };
-            const collectImageIds = (d) => new Set((d.messages || []).flatMap(m => [
-                ...(m.images||[]).flatMap(i => i.imageId ? [i.imageId] : []),
-                ...(m.variants||[]).flatMap(v => [
-                    ...(v.parts||[]).flatMap(p => p._imageRef ? [p._imageRef] : []),
-                    ...(v._images||[]).flatMap(i => i.imageId ? [i.imageId] : [])
-                ])
-            ]));
+            const collectImageIds = (d) => {
+                const s = new Set;
+                for (const m of d.messages || []) {
+                    for (const i of m.images || []) i.imageId && s.add(i.imageId);
+                    for (const v of m.variants || []) {
+                        for (const p of v.parts || []) p._imageRef && s.add(p._imageRef);
+                        for (const i of v._images || []) i.imageId && s.add(i.imageId);
+                    }
+                }
+                return s;
+            };
             const cleanupOrphanedImages = async (savedConvosList) => {
                 const referenced = new Set();
                 await _pool(savedConvosList || [], async (meta) => {
@@ -273,8 +277,7 @@
                     } catch {}
                 });
                 try {
-                    const orphaned = (await opfs.keys()).filter(f => f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f));
-                    await _pool(orphaned, f => opfs.remove(f));
+                    await _pool((await opfs.keys()).filter(f => f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f)), f => opfs.remove(f));
                 } catch {}
             };
             return { saveImage, loadImage, loadImageAsBase64, ingestImage, cacheImage, cleanupOrphanedImages, collectImageIds };
@@ -976,13 +979,13 @@ const TagCountBadge={
                             _images: (v._images || []).map(img => ({ mimeType: img.mimeType || _WP, imageId: img.imageId || null })),
                             _imageSize: v._imageSize || '1K',
                             _model: v._model || _FM,
-                            _flexInference: !!v._flexInference,
-                            _genTimeMs: v._genTimeMs || null,
-                            _usage: v._usage ? {promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0, ...(v._usage.candidatesTokensDetails && {candidatesTokensDetails: v._usage.candidatesTokensDetails}), ...(v._usage.thoughtsTokenCount && {thoughtsTokenCount: v._usage.thoughtsTokenCount})} : null,
-                            _error: v._error || null,
-                            _blockReason: v._blockReason || null,
-                            _isPromptBlock: !!v._isPromptBlock,
-                            timestamp: v.timestamp || null
+                            _flexInference: v._flexInference,
+                            _genTimeMs: v._genTimeMs,
+                            _usage: v._usage && {promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0, ...(v._usage.candidatesTokensDetails && {candidatesTokensDetails: v._usage.candidatesTokensDetails}), ...(v._usage.thoughtsTokenCount && {thoughtsTokenCount: v._usage.thoughtsTokenCount})},
+                            _error: v._error,
+                            _blockReason: v._blockReason,
+                            _isPromptBlock: v._isPromptBlock,
+                            timestamp: v.timestamp
                         };
                     })), activeVariant: msg.activeVariant || 0, hidden: !!msg.hidden };
                 }
@@ -1019,8 +1022,6 @@ const TagCountBadge={
                             img.imageId ? { ...img, data: await loadCached(img.imageId) } : img
                         ));
                         dV._model = v._model || _FM;
-                        dV._flexInference = !!v._flexInference;
-                        dV._genTimeMs = v._genTimeMs || null;
                         return dV;
                     }));
                 }
@@ -1085,8 +1086,8 @@ const TagCountBadge={
                 const m = params?.bananaModel || _FM, isPro = m === _PM;
                 const gc = {responseModalities: ['TEXT','IMAGE']};
                 if (!isPro) gc.thinkingConfig = {thinkingLevel: params?.thinkingLevel || 'MINIMAL', includeThoughts: true};
-                const ic = {...(params?.aspectRatio && {aspectRatio: params.aspectRatio}), ...(params?.imageSize && {imageSize: params.imageSize === '0.5K' ? '512' : params.imageSize})};
-                if (Object.keys(ic).length) gc.imageConfig = ic;
+                const ar = params?.aspectRatio, sz = params?.imageSize;
+                if (ar || sz) gc.imageConfig = {...(ar && {aspectRatio: ar}), ...(sz && {imageSize: sz === '0.5K' ? '512' : sz})};
                 return {contents, generationConfig: gc, ...(_isFlexEnabled(params) && {service_tier: 'SERVICE_TIER_FLEX'})};
             };
             const _getContents = (msgs, endIdx) => msgs.slice(0, endIdx).filter(m => !m.hidden).map(m => ({role: m.role, parts: getMsgParts(m)}));
@@ -1492,8 +1493,7 @@ const TagCountBadge={
                 try { imageIds = imageStore.collectImageIds(JSON.parse(raw)); }
                 catch { throw new Error('Conversation data corrupted locally.'); }
                 const meta = _findMeta(id);
-                const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
-                await _pushConvoToR2(id, raw, imageIds, metaPick);
+                await _pushConvoToR2(id, raw, imageIds, meta && {title: meta.title, timestamp: meta.timestamp});
             };
 
             const syncConversationNow = async (id) => {
@@ -1632,17 +1632,9 @@ const TagCountBadge={
                             _previewUrl: URL.createObjectURL(f),
                         });
                         img._ingestPromise = imageStore.ingestImage(f)
-                            .then(ingested => {
-                                img.data = ingested.base64;
-                                URL.revokeObjectURL(img._previewUrl);
-                                img._previewUrl = null;
-                            })
-                            .catch(err => {
-                                console.error('Failed to convert image:', err);
-                                URL.revokeObjectURL(img._previewUrl);
-                                img._previewUrl = null;
-                                toast.err('Failed to process image format. Please try another image.');
-                            });
+                            .then(ingested => { img.data = ingested.base64; })
+                            .catch(err => { console.error('Failed to convert image:', err); toast.err('Failed to process image format. Please try another image.'); })
+                            .finally(() => { URL.revokeObjectURL(img._previewUrl); img._previewUrl = null; });
                         return img;
                     });
                     if (forEdit && editState.value) {

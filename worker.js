@@ -136,9 +136,10 @@ async function handleR2(request, env, url) {
       const headers = { ...JSON_HEADERS };
       const cached = etagCheck(obj, request, headers);
       if (cached) return cached;
-      let data;
-      try { data = await obj.json(); } catch {}
-      if (Array.isArray(data)) return new Response(JSON.stringify(data), { headers });
+      try {
+        const text = await obj.text();
+        if (Array.isArray(JSON.parse(text))) return new Response(text, { headers });
+      } catch {}
     }
     return corsJson(await readIndex(env));
   }
