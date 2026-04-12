@@ -242,7 +242,7 @@
         
         const useImageStore = createGlobalState(() => {
             const _mem = new Map(); // in-memory fallback when OPFS is unavailable (e.g. file:// security)
-            const saveImage = async (imageId, data) => { try { await opfs.write(imageId, data); } catch { _mem.set(imageId, data); } };
+            const saveImage = async (imageId, data) => { _mem.set(imageId, data); try { await opfs.write(imageId, data); } catch {} };
             const cacheImage = _mem.set.bind(_mem);
             const blobToWebP = async (blob) => { const bm = await createImageBitmap(blob), c = new OffscreenCanvas(bm.width, bm.height); c.getContext('2d').drawImage(bm, 0, 0); return new Uint8Array(await (await c.convertToBlob({type:_WP,quality:1})).arrayBuffer()); };
             const ingestImage = async (input) => {
@@ -251,18 +251,21 @@
                     : await blobToWebP(await (await fetch(`data:${input.mimeType};base64,${input.data}`)).blob());
                 const imageId = `img_${uid()}.webp`;
                 await saveImage(imageId, webpBytes);
-                _mem.set(imageId, webpBytes);
                 return { imageId, base64: uint8ArrayToBase64(webpBytes), webpBytes };
             };
-            const loadImage = async (imageId) => { const b = await opfs.read(imageId); return b ?? _mem.get(imageId) ?? null; };
+            const loadImage = async (imageId) => await opfs.read(imageId) || _mem.get(imageId) || null;
             const loadImageAsBase64 = async (imageId) => { const bytes = await loadImage(imageId); return bytes ? uint8ArrayToBase64(bytes) : null; };
-            const collectImageIds = (d) => new Set((d.messages || []).flatMap(m => [
-                ...(m.images||[]).flatMap(i => i.imageId ? [i.imageId] : []),
-                ...(m.variants||[]).flatMap(v => [
-                    ...(v.parts||[]).flatMap(p => p._imageRef ? [p._imageRef] : []),
-                    ...(v._images||[]).flatMap(i => i.imageId ? [i.imageId] : [])
-                ])
-            ]));
+            const collectImageIds = (d) => {
+                const s = new Set;
+                for (const m of d.messages || []) {
+                    for (const i of m.images || []) i.imageId && s.add(i.imageId);
+                    for (const v of m.variants || []) {
+                        for (const p of v.parts || []) p._imageRef && s.add(p._imageRef);
+                        for (const i of v._images || []) i.imageId && s.add(i.imageId);
+                    }
+                }
+                return s;
+            };
             const cleanupOrphanedImages = async (savedConvosList) => {
                 const referenced = new Set();
                 await _pool(savedConvosList || [], async (meta) => {
@@ -273,8 +276,7 @@
                     } catch {}
                 });
                 try {
-                    const orphaned = (await opfs.keys()).filter(f => f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f));
-                    await _pool(orphaned, f => opfs.remove(f));
+                    await _pool((await opfs.keys()).filter(f => f.startsWith('img_') && f.endsWith('.webp') && !referenced.has(f)), f => opfs.remove(f));
                 } catch {}
             };
             return { saveImage, loadImage, loadImageAsBase64, ingestImage, cacheImage, cleanupOrphanedImages, collectImageIds };
@@ -973,16 +975,16 @@ const TagCountBadge={
                                 return { text: part.text || '', ..._ts(part) };
                             })),
                             _text: v._text || '',
-                            _images: (v._images || []).map(img => ({ mimeType: img.mimeType || _WP, imageId: img.imageId || null })),
+                            _images: (v._images || []).map(img => ({ mimeType: img.mimeType || _WP, imageId: img.imageId })),
                             _imageSize: v._imageSize || '1K',
                             _model: v._model || _FM,
                             _flexInference: !!v._flexInference,
-                            _genTimeMs: v._genTimeMs || null,
-                            _usage: v._usage ? {promptTokenCount: v._usage.promptTokenCount || 0, candidatesTokenCount: v._usage.candidatesTokenCount || 0, ...(v._usage.candidatesTokensDetails && {candidatesTokensDetails: v._usage.candidatesTokensDetails}), ...(v._usage.thoughtsTokenCount && {thoughtsTokenCount: v._usage.thoughtsTokenCount})} : null,
-                            _error: v._error || null,
-                            _blockReason: v._blockReason || null,
-                            _isPromptBlock: !!v._isPromptBlock,
-                            timestamp: v.timestamp || null
+                            _genTimeMs: v._genTimeMs,
+                            _usage: v._usage && {promptTokenCount: v._usage.promptTokenCount, candidatesTokenCount: v._usage.candidatesTokenCount, ...(v._usage.candidatesTokensDetails && {candidatesTokensDetails: v._usage.candidatesTokensDetails}), ...(v._usage.thoughtsTokenCount && {thoughtsTokenCount: v._usage.thoughtsTokenCount})},
+                            _error: v._error,
+                            _blockReason: v._blockReason,
+                            _isPromptBlock: v._isPromptBlock,
+                            timestamp: v.timestamp
                         };
                     })), activeVariant: msg.activeVariant || 0, hidden: !!msg.hidden };
                 }
@@ -1019,8 +1021,6 @@ const TagCountBadge={
                             img.imageId ? { ...img, data: await loadCached(img.imageId) } : img
                         ));
                         dV._model = v._model || _FM;
-                        dV._flexInference = !!v._flexInference;
-                        dV._genTimeMs = v._genTimeMs || null;
                         return dV;
                     }));
                 }
@@ -1492,8 +1492,7 @@ const TagCountBadge={
                 try { imageIds = imageStore.collectImageIds(JSON.parse(raw)); }
                 catch { throw new Error('Conversation data corrupted locally.'); }
                 const meta = _findMeta(id);
-                const metaPick = meta && _.pick(meta, ['title', 'timestamp']);
-                await _pushConvoToR2(id, raw, imageIds, metaPick);
+                await _pushConvoToR2(id, raw, imageIds, meta && {title: meta.title, timestamp: meta.timestamp});
             };
 
             const syncConversationNow = async (id) => {
