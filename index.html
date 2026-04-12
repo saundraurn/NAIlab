@@ -132,7 +132,7 @@
         const _RETRY_CODES = new Set([429, 500, 502, 503, 504]);
         const getDelay = (attempt) => Math.min(500 * Math.pow(2, attempt) + Math.random() * 1000, 60000);
         const MAX_SEED=9e15;
-        const _pool = async (arr, fn, n = 5) => { let i = 0; const w = async () => { while (i < arr.length) await fn(arr[i++]); }; await Promise.all(Array.from({length: Math.min(n, arr.length)}, w)); };
+        const _pool = async (arr, fn, n = 5) => { let i = 0; const w = async () => { while (i < arr.length) await fn(arr[i++]); }; await Promise.all([...Array(Math.min(n, arr.length))].map(w)); };
         const setVarError = (v, err, extra) => v && (v._error = err, v.timestamp = Date.now(), extra && Object.assign(v, extra));
         const opfs = (() => {
             let _r, r = async () => _r ??= await navigator.storage.getDirectory();
@@ -978,7 +978,7 @@ const TagCountBadge={
                             _images: (v._images || []).map(img => ({ mimeType: img.mimeType || _WP, imageId: img.imageId })),
                             _imageSize: v._imageSize || '1K',
                             _model: v._model || _FM,
-                            _flexInference: !!v._flexInference,
+                            _flexInference: v._flexInference,
                             _genTimeMs: v._genTimeMs,
                             _usage: v._usage && {promptTokenCount: v._usage.promptTokenCount, candidatesTokenCount: v._usage.candidatesTokenCount, ...(v._usage.candidatesTokensDetails && {candidatesTokensDetails: v._usage.candidatesTokensDetails}), ...(v._usage.thoughtsTokenCount && {thoughtsTokenCount: v._usage.thoughtsTokenCount})},
                             _error: v._error,
@@ -1085,8 +1085,8 @@ const TagCountBadge={
                 const m = params?.bananaModel || _FM, isPro = m === _PM;
                 const gc = {responseModalities: ['TEXT','IMAGE']};
                 if (!isPro) gc.thinkingConfig = {thinkingLevel: params?.thinkingLevel || 'MINIMAL', includeThoughts: true};
-                const ic = {...(params?.aspectRatio && {aspectRatio: params.aspectRatio}), ...(params?.imageSize && {imageSize: params.imageSize === '0.5K' ? '512' : params.imageSize})};
-                if (Object.keys(ic).length) gc.imageConfig = ic;
+                const ar = params?.aspectRatio, sz = params?.imageSize;
+                if (ar || sz) gc.imageConfig = {...(ar && {aspectRatio: ar}), ...(sz && {imageSize: sz === '0.5K' ? '512' : sz})};
                 return {contents, generationConfig: gc, ...(_isFlexEnabled(params) && {service_tier: 'SERVICE_TIER_FLEX'})};
             };
             const _getContents = (msgs, endIdx) => msgs.slice(0, endIdx).filter(m => !m.hidden).map(m => ({role: m.role, parts: getMsgParts(m)}));
@@ -1631,17 +1631,9 @@ const TagCountBadge={
                             _previewUrl: URL.createObjectURL(f),
                         });
                         img._ingestPromise = imageStore.ingestImage(f)
-                            .then(ingested => {
-                                img.data = ingested.base64;
-                                URL.revokeObjectURL(img._previewUrl);
-                                img._previewUrl = null;
-                            })
-                            .catch(err => {
-                                console.error('Failed to convert image:', err);
-                                URL.revokeObjectURL(img._previewUrl);
-                                img._previewUrl = null;
-                                toast.err('Failed to process image format. Please try another image.');
-                            });
+                            .then(ingested => { img.data = ingested.base64; })
+                            .catch(err => { console.error('Failed to convert image:', err); toast.err('Failed to process image format. Please try another image.'); })
+                            .finally(() => { if (img._previewUrl) { URL.revokeObjectURL(img._previewUrl); img._previewUrl = null; } });
                         return img;
                     });
                     if (forEdit && editState.value) {
