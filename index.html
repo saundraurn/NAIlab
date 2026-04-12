@@ -84,8 +84,10 @@
         @layer components {
             .bubble-user { background-color: oklch(var(--p)/0.12); border: 1px solid oklch(var(--p)/0.20); color: oklch(var(--bc)); border-radius: 1rem; }
             .bubble-model { background-color: oklch(var(--b2)/0.50); border: 1px solid oklch(1 0 0/0.10); color: oklch(var(--bc)); border-radius: 1rem; }
-            .convo-rename { @apply flex-1 min-w-0 text-xs; background-color:oklch(var(--b1)/0.6); }
-            .convo-rename:focus { background-color:oklch(var(--b1)/0.8); }
+            .inline-edit-input{flex:1 1 0%;min-width:0;height:1.5rem;padding:0 0.5rem;font-size:0.8125rem;line-height:1.5rem;background-color:oklch(var(--b1)/0.65);border:var(--border,0.5px) solid oklch(var(--bc)/0.25);border-radius:var(--radius-box,0.5rem);color:oklch(var(--bc));outline:none;}
+            .inline-edit-input:focus{background-color:oklch(var(--b1)/0.9);border-color:oklch(var(--p)/0.5);box-shadow:0 0 0 2px oklch(var(--p)/0.12);}
+            .inline-edit-label{font-weight:500;font-size:0.875rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:text;text-underline-offset:2px;text-decoration-color:oklch(var(--bc)/0.3);}
+            .inline-edit-label:hover{text-decoration:underline;}
             .btn-wborder { @apply border border-white/10; background-color: transparent; }
             .btn-wborder:hover { background-color: oklch(var(--bc) / 0.1); }
         }
@@ -652,7 +654,10 @@ const TagCountBadge={
                 const cancel=()=>{draft.value=p.label;isEditing.value=false;};
                 return{isEditing,draft,inputRef,startEdit,commit,cancel};
             },
-            template:`<div @click="$emit('click')" class="group relative !p-2 rounded-lg cursor-pointer transition-colors border" :class="active?'glass-nested border-primary/20':'hover:bg-white/5 border-transparent'"><div class="flex items-center gap-1.5 min-w-0 pr-7"><slot name="icon"></slot><input v-if="isEditing" ref="inputRef" v-model="draft" class="input input-xs input-bordered bg-base-100/60 flex-1 min-w-0 text-sm" :placeholder="placeholder" @keydown.enter.prevent="commit" @keydown.escape.prevent="cancel" @blur="commit" @click.stop><span v-else @click.stop="startEdit" class="font-medium text-sm truncate shrink min-w-0 cursor-text hover:underline decoration-neutral-500 underline-offset-2" :class="active?'text-neutral-100':'text-neutral-300'">{{label||placeholder}}</span><span class="flex-1"></span><span v-if="$slots.meta" class="shrink-0 text-xs text-neutral-500 group-hover:invisible"><slot name="meta"></slot></span></div><div class="absolute right-1 inset-y-0 flex items-center gap-0.5" :class="active?'opacity-100':'hover-reveal group-hover:opacity-100'"><slot name="actions"></slot><icon-btn :icon="deleteIcon" @click.stop="$emit('delete')" size="btn-xs" color="btn-ghost text-error/50 hover:text-error"/></div></div>`
+            // Label is sized to its text only; a flex-1 spacer pushes meta+actions right.
+            // Clicking the row emits 'click'; only clicking the label text itself starts editing.
+            // Meta and actions are hidden (v-if) while the input is open.
+            template:`<div @click="$emit('click')" class="group flex items-center gap-1.5 min-w-0 !p-2 rounded-lg cursor-pointer transition-colors border" :class="active?'glass-nested border-primary/20':'hover:bg-white/5 border-transparent'"><slot name="icon"></slot><input v-if="isEditing" ref="inputRef" v-model="draft" class="inline-edit-input" :placeholder="placeholder" @keydown.enter.prevent="commit" @keydown.escape.prevent="cancel" @blur="commit" @click.stop><span v-else @click.stop="startEdit" class="inline-edit-label" :class="active?'text-neutral-100':'text-neutral-300'">{{label||placeholder}}</span><span class="flex-1"></span><span v-if="$slots.meta&&!isEditing" class="shrink-0 text-xs text-neutral-500 group-hover:invisible"><slot name="meta"></slot></span><div v-if="!isEditing" class="shrink-0 flex items-center gap-0.5 transition-opacity" :class="active?'opacity-100':'opacity-0 group-hover:opacity-100'"><slot name="actions"></slot><icon-btn :icon="deleteIcon" @click.stop="$emit('delete')" size="btn-xs" color="btn-ghost text-error/50 hover:text-error"/></div></div>`
         };
         const NavLink={props:['to','icon','notification','label'],template:`<router-link :to="to" custom v-slot="{href,navigate,isActive}"><a :href="href" @click="navigate" :title="label" class="relative flex-center w-14 h-14" :class="{'active':isActive}"><div class="indicator flex-center"><span v-if="notification>0" class="indicator-item badge badge-primary badge-sm">{{notification}}</span><material-icon :icon="icon"/></div></a></router-link>`};
         const AutocompleteField={
