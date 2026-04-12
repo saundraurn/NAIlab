@@ -254,7 +254,7 @@
                 _mem.set(imageId, webpBytes);
                 return { imageId, base64: uint8ArrayToBase64(webpBytes), webpBytes };
             };
-            const loadImage = async (imageId) => await opfs.read(imageId) ?? _mem.get(imageId) ?? null;
+            const loadImage = async (imageId) => await opfs.read(imageId) ?? _mem.get(imageId);
             const loadImageAsBase64 = async (imageId) => { const bytes = await loadImage(imageId); return bytes ? uint8ArrayToBase64(bytes) : null; };
             const collectImageIds = (d) => {
                 const s = new Set;
@@ -1634,7 +1634,7 @@ const TagCountBadge={
                         img._ingestPromise = imageStore.ingestImage(f)
                             .then(ingested => { img.data = ingested.base64; })
                             .catch(err => { console.error('Failed to convert image:', err); toast.err('Failed to process image format. Please try another image.'); })
-                            .finally(() => { if (img._previewUrl) { URL.revokeObjectURL(img._previewUrl); img._previewUrl = null; } });
+                            .finally(() => { URL.revokeObjectURL(img._previewUrl); img._previewUrl = null; });
                         return img;
                     });
                     if (forEdit && editState.value) {
