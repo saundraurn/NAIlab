@@ -1145,6 +1145,7 @@ const TagCountBadge={
                 const v = getV();
                 if (!v?._images?.length) { const reason = finalFinishReason || 'EMPTY'; throw mkErr(_GEN_ERR.OUTPUT_BLOCK, v?._text ? `No image generated (${reason})` : `Empty response (${reason})`, {blockReason:reason}); }
                 if (v) {
+                    convo.generating = false; convo.generatingMsgId = null; convo.generatingVarIdx = null; convo.abortCtrl = null;
                     let idc = 0;
                     for (const part of allParts) {
                         if (part.inlineData) {
