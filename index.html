@@ -1098,14 +1098,16 @@ const TagCountBadge={
             const _getContents = (msgs, endIdx) => msgs.slice(0, endIdx).filter(m => !m.hidden).map(m => ({role: m.role, parts: getMsgParts(m)}));
             async function* parseSSE(res) {
                 const reader = res.body.getReader(), dec = new TextDecoder(); let buf = '';
-                while (true) {
-                    const {done, value} = await reader.read(); if (done) break;
-                    buf += dec.decode(value, {stream: true}); let idx;
-                    while ((idx = buf.indexOf('\n')) !== -1) {
-                        const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 1);
-                        if (line.startsWith('data: ')) { const d = line.substring(6); if (d === '[DONE]') return; try { yield JSON.parse(d); } catch {} }
+                try {
+                    while (true) {
+                        const {done, value} = await reader.read(); if (done) break;
+                        buf += dec.decode(value, {stream: true}); let idx;
+                        while ((idx = buf.indexOf('\n')) !== -1) {
+                            const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 1);
+                            if (line.startsWith('data: ')) { const d = line.substring(6); if (d === '[DONE]') return; try { yield JSON.parse(d); } catch {} }
+                        }
                     }
-                }
+                } finally { reader.cancel().catch(() => {}); }
             }
             const _streamToVariant = async (convo, msgId, varIdx, contents) => {
                 const getV = () => _findMsg(convo, msgId)?.variants[varIdx];
@@ -1139,6 +1141,7 @@ const TagCountBadge={
                     if (cand?.finishReason) finalFinishReason = cand.finishReason;
                     const v = getV();
                     if (v) { v._thinking = _streamThinking; v._text = _streamText; v._images = _streamImages; if (chunk.usageMetadata) v._usage = chunk.usageMetadata; }
+                    if (finalFinishReason) break;
                 }
                 if (_BLOCK_REASONS.has(finalFinishReason)) throw mkErr(_GEN_ERR.OUTPUT_BLOCK, `Output blocked: ${finalFinishReason}`, {blockReason:finalFinishReason});
                 if (_TERMINAL_REASONS.has(finalFinishReason)) throw mkErr(_GEN_ERR.TERMINAL, `Generation stopped: ${finalFinishReason}`, {blockReason:finalFinishReason});
@@ -1197,40 +1200,46 @@ const TagCountBadge={
                 keys.forEach(k => delete states[k]);
             };
             const _runGenerationLoop = async (convo, modelMsg, contents) => {
-                convo.abortCtrl = new AbortController();
+                const ctrl = new AbortController();
+                convo.abortCtrl = ctrl;
                 convo.generating = true;
                 convo.generatingMsgId = modelMsg.id;
                 let genVarIdx = modelMsg.activeVariant;
                 convo.generatingVarIdx = genVarIdx;
                 const retryCount = {value: 0};
-                while (true) {
-                    const v = modelMsg.variants[genVarIdx];
-                    try { await _streamToVariant(convo, modelMsg.id, genVarIdx, contents); break; }
-                    catch (err) { if (!await _handleStreamError(err, v, retryCount, () => { modelMsg.variants.push(createVariant(convo.params)); genVarIdx = modelMsg.variants.length - 1; convo.generatingVarIdx = genVarIdx; modelMsg.activeVariant = genVarIdx; }, convo)) break; }
-                }
-                convo.generating = false; convo.generatingMsgId = null; convo.generatingVarIdx = null; convo.abortCtrl = null;
-                const genVariant = modelMsg.variants[genVarIdx];
-                const didSucceed = genVariant?._images?.length > 0;
-                convo._lastGenStatus = didSucceed ? 'success' : 'error';
-                if (!_findMeta(convo.id)) {
-                    if (didSucceed) {
-                        try {
-                            const title = convo.messages.find(m => m.role === 'user')?.text?.substring(0, 40) || 'Untitled Chat';
-                            convo.title = title; convo.timestamp = Date.now();
-                            const meta = { id: convo.id, title, timestamp: convo.timestamp };
-                            await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params);
-                            savedConversations.value.unshift(meta);
-                        } catch (e) { console.warn('Auto-save new convo failed:', e); }
+                try {
+                    while (true) {
+                        const v = modelMsg.variants[genVarIdx];
+                        try { await _streamToVariant(convo, modelMsg.id, genVarIdx, contents); break; }
+                        catch (err) { if (!await _handleStreamError(err, v, retryCount, () => { modelMsg.variants.push(createVariant(convo.params)); genVarIdx = modelMsg.variants.length - 1; convo.generatingVarIdx = genVarIdx; modelMsg.activeVariant = genVarIdx; }, convo)) break; }
                     }
-                } else {
-                    _saveConvoDirect(convo);
-                }
-                if (didSucceed) {
-                    const isViewingThis = activeConvoId.value === convo.id && window.location.hash.includes('/banana');
-                    if (!isViewingThis) store.incrementNotification('banana');
-                    if (_findMeta(convo.id) && _isSyncReady()) {
-                        _markCloud(convo.id);
-                        useSyncStore().markConvoDirty(convo.id);
+                    const genVariant = modelMsg.variants[genVarIdx];
+                    const didSucceed = genVariant?._images?.length > 0;
+                    convo._lastGenStatus = didSucceed ? 'success' : 'error';
+                    if (!_findMeta(convo.id)) {
+                        if (didSucceed) {
+                            try {
+                                const title = convo.messages.find(m => m.role === 'user')?.text?.substring(0, 40) || 'Untitled Chat';
+                                convo.title = title; convo.timestamp = Date.now();
+                                const meta = { id: convo.id, title, timestamp: convo.timestamp };
+                                await _writeConvo(convo.id, await serializeConversation(convo.messages), convo.params);
+                                savedConversations.value.unshift(meta);
+                            } catch (e) { console.warn('Auto-save new convo failed:', e); }
+                        }
+                    } else {
+                        _saveConvoDirect(convo);
+                    }
+                    if (didSucceed) {
+                        const isViewingThis = activeConvoId.value === convo.id && window.location.hash.includes('/banana');
+                        if (!isViewingThis) store.incrementNotification('banana');
+                        if (_findMeta(convo.id) && _isSyncReady()) {
+                            _markCloud(convo.id);
+                            useSyncStore().markConvoDirty(convo.id);
+                        }
+                    }
+                } finally {
+                    if (convo.abortCtrl === ctrl) {
+                        convo.generating = false; convo.generatingMsgId = null; convo.generatingVarIdx = null; convo.abortCtrl = null;
                     }
                 }
             };
@@ -1441,7 +1450,7 @@ const TagCountBadge={
                 });
                 if (pruned) toast.q(`Removed ${pruned} non-image variant${pruned > 1 ? 's' : ''}`);
             });
-            const abort = () => { const convo = activeConvo.value; if (convo?.abortCtrl) convo.abortCtrl.abort(); };
+            const abort = () => { const convo = activeConvo.value; if (!convo) return; if (convo.abortCtrl) convo.abortCtrl.abort(); convo.generating = false; convo.generatingMsgId = null; convo.generatingVarIdx = null; convo.abortCtrl = null; };
             const _autoSave = useDebounceFn(() => {
                 const c = activeConvo.value;
                 if (!c || !_findMeta(c.id) || c.generating || c.isHydrating) return;
