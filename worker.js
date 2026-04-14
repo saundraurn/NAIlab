@@ -157,12 +157,18 @@ async function handleR2(request, env, url) {
       const cm = obj.customMetadata || {};
       if (cm.title) headers['X-Convo-Title'] = cm.title;
       if (cm.timestamp) headers['X-Convo-Timestamp'] = cm.timestamp;
-      return new Response(obj.body, { headers });
+      const isGzip = obj.httpMetadata?.contentEncoding === 'gzip';
+      if (isGzip) headers['Content-Encoding'] = 'gzip';
+      return new Response(obj.body, {
+        ...(isGzip && { encodeBody: 'manual' }),
+        headers,
+      });
     }
     if (request.method === 'PUT') {
       const titleHeader = request.headers.get('X-Convo-Title');
       const timestampHeader = request.headers.get('X-Convo-Timestamp');
-      const putOptions = { httpMetadata: { contentType: 'application/json' } };
+      const contentEncoding = request.headers.get('Content-Encoding');
+      const putOptions = { httpMetadata: { contentType: 'application/json', ...(contentEncoding && { contentEncoding }) } };
       if (titleHeader || timestampHeader) {
         putOptions.customMetadata = {
           ...(titleHeader && {title: titleHeader}),
