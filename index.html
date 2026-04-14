@@ -301,6 +301,7 @@
                 const headers = {
                     'Authorization': `Bearer ${secret}`,
                     ...(options.contentType && {'Content-Type': options.contentType}),
+                    ...(options.contentEncoding && {'Content-Encoding': options.contentEncoding}),
                     ...(options.ifNoneMatch && {'If-None-Match': options.ifNoneMatch}),
                     ...Object.fromEntries(Object.entries(options.customHeaders || {}).filter(([k]) => /^x-convo-/i.test(k)))
                 };
@@ -1467,7 +1468,7 @@ const TagCountBadge={
                 return tracked;
             };
             const _doPushConvoToR2 = async (convoId, convoJson, imageIds, meta) => {
-                await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json', customHeaders: {
+                await r2Client.r2Fetch('PUT', `conversations/${convoId}`, convoJson, { contentType: 'application/json', contentEncoding: 'gzip', customHeaders: {
                     ...(meta?.title && {'X-Convo-Title': encodeURIComponent(meta.title)}),
                     ...(meta?.timestamp && {'X-Convo-Timestamp': String(meta.timestamp)})
                 }});
@@ -1498,8 +1499,9 @@ const TagCountBadge={
                 let imageIds;
                 try { imageIds = imageStore.collectImageIds(JSON.parse(raw)); }
                 catch { throw new Error('Conversation data corrupted locally.'); }
+                const compressed = fflate.gzipSync(fflate.strToU8(raw));
                 const meta = _findMeta(id);
-                await _pushConvoToR2(id, raw, imageIds, meta && {title: meta.title, timestamp: meta.timestamp});
+                await _pushConvoToR2(id, compressed, imageIds, meta && {title: meta.title, timestamp: meta.timestamp});
             };
 
             const syncConversationNow = async (id) => {
